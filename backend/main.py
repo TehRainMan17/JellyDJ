@@ -1,0 +1,125 @@
+"""
+JellyDJ — FastAPI application entry point.
+
+Startup sequence (managed by the FastAPI lifespan context):
+  1. SQLAlchemy creates all tables that don't exist yet (create_all)
+  2. _run_migrations() safely adds new columns to existing tables so upgrades
+     don't require wiping the database
+  3. The APScheduler background scheduler starts and registers the four
+     periodic jobs: index, discovery refresh, playlist regen, auto-download
+
+All API routes are split across routers in the /routers directory.
+The CORS middleware allows all origins so the React frontend (served by
+a separate Nginx container) can communicate with the backend on any port.
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from database import engine, Base, SessionLocal
+import models  # noqa: F401 — imported so SQLAlchemy registers all table definitions
+from routers import (
+    connections, external_apis, indexer, recommender,
+    webhooks, discovery, playlists, insights, automation,
+)
+
+
+def _run_migrations():
+    """
+    Safe column-level migrations for SQLite.
+
+    SQLite does not support IF NOT EXISTS on ALTER TABLE, so we attempt
+    each ALTER and silently swallow the error when the column already
+    exists. This lets the app upgrade cleanly without requiring users
+    to drop and recreate their database.
+
+    Add a new row here whenever you introduce a nullable/defaulted column
+    to an existing model. Columns defined in the initial schema are handled
+    by create_all() above and do not need to be listed here.
+    """
+    from sqlalchemy import text
+    new_columns = [
+        # (table_name,          column_name,                   sql_type,   default)
+        ("automation_settings", "auto_download_enabled",       "BOOLEAN",  "0"),
+        ("automation_settings", "auto_download_max_per_run",   "INTEGER",  "1"),
+        ("automation_settings", "auto_download_cooldown_days", "INTEGER",  "7"),
+        ("automation_settings", "last_auto_download",          "DATETIME", "NULL"),
+        ("discovery_queue",     "auto_queued",                 "BOOLEAN",  "0"),
+        ("discovery_queue",     "auto_skip",                   "BOOLEAN",  "0"),
+    ]
+    with engine.connect() as conn:
+        for table, col, typ, default in new_columns:
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {typ} DEFAULT {default}"
+                ))
+                conn.commit()
+            except Exception:
+                pass  # column already exists — expected on every startup after the first
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan: runs setup before the first request, teardown on shutdown.
+
+    Using lifespan instead of the older on_event("startup") / on_event("shutdown")
+    pattern because it's the current FastAPI recommendation and gives us clean
+    shutdown behaviour via the yield boundary.
+    """
+    # Create all tables defined in models.py (no-ops if they already exist)
+    Base.metadata.create_all(bind=engine)
+
+    # Add any new columns that appeared since the user's last install
+    _run_migrations()
+
+    # Start the APScheduler background job scheduler
+    from scheduler import start_scheduler
+    start_scheduler(SessionLocal)
+
+    yield  # application handles requests here
+
+    # Graceful shutdown: stop the scheduler without blocking on running jobs
+    from scheduler import scheduler
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(
+    title="JellyDJ",
+    version="0.1.0",
+    description="Self-hosted music recommendation engine for Jellyfin",
+    lifespan=lifespan,
+)
+
+# Open CORS policy — the React frontend is served by a separate Nginx container
+# and may run on a different port. For self-hosted deployments this is safe.
+# If you expose JellyDJ to the internet, restrict allow_origins to your domain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount all routers — each module owns its own URL prefix
+app.include_router(connections.router)     # /api/connections   — Jellyfin + Lidarr credentials
+app.include_router(external_apis.router)  # /api/external-apis — Spotify, Last.fm, MusicBrainz
+app.include_router(indexer.router)        # /api/indexer        — play history sync + library scan
+app.include_router(recommender.router)    # /api/recommender    — taste profile inspection
+app.include_router(webhooks.router)       # /api/webhooks       — Jellyfin playback events
+app.include_router(discovery.router)      # /api/discovery      — new album recommendation queue
+app.include_router(playlists.router)      # /api/playlists      — playlist generation + history
+app.include_router(insights.router)       # /api/insights       — listening stats + charts
+app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
+
+
+@app.get("/api/health")
+async def health_check():
+    """
+    Lightweight health check polled by the Docker Compose healthcheck.
+    Returns 200 as soon as the app is running — no DB or external calls.
+    The frontend container waits for this to pass before starting.
+    """
+    return {"status": "ok", "service": "JellyDJ", "version": "0.1.0"}

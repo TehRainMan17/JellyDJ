@@ -1,0 +1,61 @@
+# ── Secrets — NEVER commit these ─────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+pip-log.txt
+
+# ── Node / Frontend ──────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/build/
+.npm/
+
+# ── Database — contains your personal data ───────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Docker volumes / local data ──────────────────────────────
+data/
+config/
+jellydj-config/
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS junk ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+Desktop.ini
+
+# ── Editor / IDE ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Backup files (from our session) ──────────────────────────
+*.bak
+
+# ── Test artifacts ───────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/

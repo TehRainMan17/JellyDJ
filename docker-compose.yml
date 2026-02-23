@@ -1,0 +1,56 @@
+
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jellydj-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite:////config/jellydj.db
+      - TZ=${TZ:-UTC}
+    volumes:
+      - jellydj-config:/config
+    networks:
+      - jellydj-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jellydj-frontend
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+    ports:
+      - "${JELLYDJ_PORT:-7879}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - jellydj-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  jellydj-config:
+    name: jellydj-config
+
+networks:
+  jellydj-net:
+    name: jellydj-net
+    driver: bridge
