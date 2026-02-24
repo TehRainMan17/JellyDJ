@@ -6,6 +6,11 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # Explicitly giving the runner permission to read the repo
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -13,7 +18,8 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          # We use 562ray directly to eliminate one variable
+          username: 562ray
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & Push Backend
@@ -21,11 +27,11 @@ jobs:
         with:
           context: ./backend
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/jellydj-backend:latest
+          tags: 562ray/jellydj-backend:latest
 
       - name: Build & Push Frontend
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/jellydj-frontend:latest
+          tags: 562ray/jellydj-frontend:latest
