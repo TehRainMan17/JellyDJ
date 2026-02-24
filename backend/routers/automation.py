@@ -339,6 +339,35 @@ async def _run_auto_download(bypass_cooldown: bool = False):
             log.error(f"Auto-download: Lidarr not configured — {e}")
             return
 
+        # Gate 2b: refresh discovery queue before picking candidates.
+        # Auto-download should always work from fresh recommendations so it
+        # doesn't re-attempt items that were recently rejected or already sent.
+        # Skip the refresh if discovery ran within the last 6 hours to avoid
+        # hammering external APIs unnecessarily.
+        refresh_stale_after_hours = 6
+        needs_refresh = True
+        if s.last_discovery_refresh:
+            hours_since = (datetime.utcnow() - s.last_discovery_refresh).total_seconds() / 3600
+            if hours_since < refresh_stale_after_hours:
+                needs_refresh = False
+                log.info(f"Auto-download: discovery refreshed {hours_since:.1f}h ago, skipping pre-refresh")
+
+        if needs_refresh:
+            log.info("Auto-download: running discovery refresh before picking candidates...")
+            try:
+                users_for_refresh = db.query(ManagedUser).filter_by(is_enabled=True).all()
+                from routers.discovery import _populate_queue_for_user
+                for u in users_for_refresh:
+                    try:
+                        added = await _populate_queue_for_user(u.jellyfin_user_id, db, limit=s.discovery_items_per_run)
+                        log.info(f"  Pre-refresh: +{added} items for {u.username}")
+                    except Exception as e:
+                        log.warning(f"  Pre-refresh failed for {u.username}: {e}")
+                s.last_discovery_refresh = datetime.utcnow()
+                db.commit()
+            except Exception as e:
+                log.warning(f"Auto-download: pre-refresh failed, proceeding with existing queue — {e}")
+
         # Gate 3: two-pass candidate selection
         # Pass 1 — send pinned items for ALL users unconditionally.
         #   Pinned = explicit user request. The cap must never block these.

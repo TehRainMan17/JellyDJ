@@ -236,13 +236,25 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
 
         action = "already in" if artist_already_exists else "added to"
         msg = f"'{artist_name_found}' {action} Lidarr"
+
         if album_searched:
+            # Album was found and AlbumSearch command was sent — genuine success
             msg += f" — search triggered for '{album_searched}'"
+            return {"ok": True, "message": msg}
         elif album_error:
-            msg += f" — WARNING: {album_error}"
+            # Artist was added/found but Lidarr returned no albums at all.
+            # Return ok=False so the item is NOT marked lidarr_sent and can
+            # be retried on the next auto-download run.
+            msg += f" — could not trigger download: {album_error}"
+            return {"ok": False, "message": msg}
         elif album_name:
-            msg += f" — WARNING: could not find album '{album_name}'"
-        return {"ok": True, "message": msg}
+            # Artist exists in Lidarr but the specific album couldn't be matched.
+            # Same — don't mark sent, let it retry.
+            msg += f" — could not find album '{album_name}' in Lidarr"
+            return {"ok": False, "message": msg}
+        else:
+            # No album name specified — artist-only add succeeded
+            return {"ok": True, "message": msg}
 
 
 # ── Queue population ──────────────────────────────────────────────────────────

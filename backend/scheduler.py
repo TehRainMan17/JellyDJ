@@ -211,11 +211,14 @@ def reschedule_automation_jobs(db):
     auto_dl_enabled = getattr(s, "auto_download_enabled", False)
     cooldown_days   = getattr(s, "auto_download_cooldown_days", 7) or 1
     if auto_dl_enabled:
+        from datetime import timedelta as _td
         scheduler.reschedule_job(
             AUTO_DOWNLOAD_JOB_ID,
             trigger=IntervalTrigger(
                 days=cooldown_days,
-                start_date=datetime.now(timezone.utc),
+                # Start one full interval from now so the job never fires
+                # immediately on container startup or settings save.
+                start_date=datetime.now(timezone.utc) + _td(days=cooldown_days),
             ),
         )
         try:
