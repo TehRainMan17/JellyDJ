@@ -9,7 +9,7 @@ import { useJobStatus } from '../hooks/useJobStatus.js'
 import JobProgress from '../components/JobProgress.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-const utc = s => { if (!s) return s; if (s.endsWith('Z')) return s; return s.replace(/\+00:00$/, 'Z').replace(/(T[\d:.]+)(?:[+-]\d{2}:\d{2})$/, '$1Z') }
+const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
 function timeAgo(dateStr) {
   if (!dateStr) return ''
   const diff = (Date.now() - new Date(utc(dateStr))) / 1000

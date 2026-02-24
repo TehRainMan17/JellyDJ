@@ -41,10 +41,28 @@ W_FAVORITE     = 0.20   # explicit favorite flag (legacy path — scoring_engine
 
 # ── In-memory job state tracker ──────────────────────────────────────────────
 # Lightweight: no DB writes, just lets the frontend poll while a run is in progress.
-import threading as _threading
+#
+# Why asyncio.Lock instead of threading.Lock?
+# run_full_index() is an async coroutine running on the asyncio event loop.
+# asyncio.ensure_future() (used by the API endpoints) queues multiple coroutines
+# on the same event loop. Between the guard check and the state update, the
+# event loop can yield and let another queued coroutine past the guard — a
+# classic TOCTOU race. asyncio.Lock prevents this: the lock is held across
+# both the check AND the set, so only one coroutine can enter at a time.
+# (threading.Lock would deadlock here because async code can't block threads.)
+import asyncio as _asyncio
 from datetime import datetime as _dt
 
-_job_lock = _threading.Lock()
+# Module-level lock — created once, reused for every run_full_index call
+_index_lock: _asyncio.Lock | None = None
+
+def _get_index_lock() -> _asyncio.Lock:
+    """Lazily create the lock on first access (must be on the event loop)."""
+    global _index_lock
+    if _index_lock is None:
+        _index_lock = _asyncio.Lock()
+    return _index_lock
+
 _job_state: dict = {
     "running":    False,
     "phase":      "",
@@ -56,23 +74,22 @@ _job_state: dict = {
 }
 
 def get_job_state() -> dict:
-    with _job_lock:
-        return dict(_job_state)
+    """Safe to call from any context — just a dict copy, no lock needed."""
+    return dict(_job_state)
 
 def _set_job(running: bool, phase: str = "", detail: str = "",
              percent: int = 0, error: str = None):
-    with _job_lock:
-        _job_state["running"]  = running
-        _job_state["phase"]    = phase
-        _job_state["detail"]   = detail
-        _job_state["percent"]  = percent
-        _job_state["error"]    = error
-        if running and not _job_state["started_at"]:
-            _job_state["started_at"]  = _dt.utcnow().isoformat()
-            _job_state["finished_at"] = None
-        if not running:
-            _job_state["finished_at"] = _dt.utcnow().isoformat()
-            _job_state["started_at"]  = None
+    _job_state["running"]  = running
+    _job_state["phase"]    = phase
+    _job_state["detail"]   = detail
+    _job_state["percent"]  = percent
+    _job_state["error"]    = error
+    if running and not _job_state["started_at"]:
+        _job_state["started_at"]  = _dt.utcnow().isoformat()
+        _job_state["finished_at"] = None
+    if not running:
+        _job_state["finished_at"] = _dt.utcnow().isoformat()
+        _job_state["started_at"]  = None
 
 
 
@@ -399,21 +416,26 @@ async def run_full_index():
     Opens its own DB session (scheduler runs in a thread pool).
     Runs library scan first, then per-user play history + scoring.
     """
-    # Guard: don't stack concurrent runs
-    if get_job_state()["running"]:
+    # Atomic acquire — only one coroutine can pass this at a time.
+    # asyncio.Lock.acquire() is a coroutine: it yields to the event loop
+    # while waiting, so other requests stay responsive. Once acquired,
+    # no other call to run_full_index() can enter until we release below.
+    lock = _get_index_lock()
+    if lock.locked():
         log.warning("Index already running — skipping duplicate trigger.")
         return
-
-    _set_job(True, "Starting", "Connecting to Jellyfin…", 0)
-    db = SessionLocal()
+    await lock.acquire()
+    db = None
     try:
+        _set_job(True, "Starting", "Connecting to Jellyfin…", 0)
+        db = SessionLocal()
         base_url, api_key = _get_jellyfin_creds(db)
         users = db.query(ManagedUser).filter_by(is_enabled=True).all()
 
         if not users:
             log.info("No managed users enabled — skipping index.")
             _set_job(False, "Done", "No enabled users", 100)
-            return
+            return  # finally block will release the lock
 
         n_users = len(users)
 
@@ -484,6 +506,7 @@ async def run_full_index():
     finally:
         if db is not None:
             db.close()
+        lock.release()  # always release so the next run can proceed
 
 
 async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):

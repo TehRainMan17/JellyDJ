@@ -10,7 +10,7 @@ const TYPE_CFG = {
   recently_played: { label:'Recently Played', icon:History,    color:'#8899b5',        desc:"What you've been listening to lately" },
 }
 
-const utc = s => s && !s.endsWith('Z') ? s+'Z' : s
+const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
 
 function UserCard({ username, playlists }) {
   const [open, setOpen] = useState(true)

@@ -1,7 +1,17 @@
 import { useState, useEffect } from 'react'
 import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight } from 'lucide-react'
 
-const utc = s => s && !s.endsWith('Z') ? s+'Z' : s
+// Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
+// Python's datetime.utcnow().isoformat() produces "2026-02-24T14:30:00" with no
+// timezone suffix — new Date() treats that as local time in most browsers, which
+// gives wrong results or "Invalid Date" on Safari. We strip any existing offset
+// and always append Z so the string is unambiguously UTC.
+const utc = s => {
+  if (!s) return s
+  // Remove any existing timezone offset (+HH:MM, -HH:MM, or Z)
+  const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, '')
+  return bare + 'Z'
+}
 
 function Toggle({ enabled, onChange }) {
   return (
@@ -122,7 +132,7 @@ export default function AutomationPanel() {
       setAutoMax(d.auto_download_max_per_run ?? 1)
       setAutoCooldown(d.auto_download_cooldown_days ?? 7)
     }).catch(() => {})
-    fetch('/api/scheduler/status').then(r=>r.json()).then(setJobStatus).catch(() => {})
+    fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
   }, [])
 
   const save = async () => {
@@ -144,7 +154,12 @@ export default function AutomationPanel() {
       })
       setSaveMsg(r.ok ? '✓ Saved' : '✗ Save failed')
     } catch { setSaveMsg('✗ Network error') }
-    finally { setSaving(false); setTimeout(() => setSaveMsg(''), 4000) }
+    finally {
+      setSaving(false)
+      setTimeout(() => setSaveMsg(''), 4000)
+      // Re-fetch scheduler state so next-run times reflect the new intervals
+      fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
+    }
   }
 
   const trigger = async (path, setLoading) => {
@@ -163,7 +178,7 @@ export default function AutomationPanel() {
                 description="Scans Jellyfin, imports play history, rebuilds scores"
                 lastRun={s?.last_index} nextRun={jobStatus.play_history_index}
                 triggerLabel="Index Now" triggering={trigIndex}
-                onTrigger={() => trigger('/api/indexer/run', setTrigIndex)}>
+                onTrigger={() => trigger('/api/indexer/full-scan', setTrigIndex)}>
         <Slider label="Run every" value={indexInterval} onChange={setIndexInterval}
                 min={1} max={168} unit="h" markers={['1h','24h','1w']} />
       </TaskCard>
@@ -198,6 +213,7 @@ export default function AutomationPanel() {
       <TaskCard icon={Download} color="#d29922" title="Auto-Download"
                 description="Automatically sends top-scored discoveries to Lidarr"
                 lastRun={s?.last_auto_download}
+                nextRun={autoEnabled ? jobStatus.auto_download : null}
                 enabled={autoEnabled} onToggle={setAutoEnabled}
                 triggerLabel="Run Now" triggering={trigAuto}
                 onTrigger={() => trigger('/api/automation/trigger/auto-download', setTrigAuto)}>
@@ -213,6 +229,36 @@ export default function AutomationPanel() {
                       min={1} max={5} unit="" markers={['1 cautious','3','5 aggressive']} />
               <Slider label="Cooldown between runs" value={autoCooldown} onChange={setAutoCooldown}
                       min={1} max={30} unit=" days" markers={['1 day','7 days','30 days']} />
+              {/* Next scheduled run — computed from last run + cooldown */}
+              {(() => {
+                const lastRan = s?.last_auto_download
+                const nextJob = jobStatus.auto_download
+                // Prefer the live scheduler next_run; fall back to computing from last_auto_download
+                let nextRunDisplay = null
+                if (nextJob && !nextJob.paused && nextJob.next_run) {
+                  nextRunDisplay = new Date(utc(nextJob.next_run)).toLocaleString()
+                } else if (lastRan) {
+                  const next = new Date(new Date(utc(lastRan)).getTime() + autoCooldown * 86400000)
+                  nextRunDisplay = next.toLocaleString()
+                }
+                return nextRunDisplay ? (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl"
+                       style={{ background:'rgba(212,153,34,0.06)', border:'1px solid rgba(212,153,34,0.15)' }}>
+                    <Clock size={11} style={{ color:'#d29922', flexShrink:0 }} />
+                    <span className="text-[11px]" style={{ color:'var(--text-secondary)' }}>
+                      Next auto-download: <strong style={{ color:'#d29922' }}>{nextRunDisplay}</strong>
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl"
+                       style={{ background:'rgba(212,153,34,0.04)', border:'1px solid rgba(212,153,34,0.12)' }}>
+                    <Clock size={11} style={{ color:'var(--text-muted)', flexShrink:0 }} />
+                    <span className="text-[11px]" style={{ color:'var(--text-muted)' }}>
+                      Next auto-download: will run within {autoCooldown} day{autoCooldown !== 1 ? 's' : ''} of first enabling
+                    </span>
+                  </div>
+                )
+              })()}
               <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl"
                    style={{ background:'rgba(212,153,34,0.06)', border:'1px solid rgba(212,153,34,0.2)' }}>
                 <ShieldAlert size={13} style={{ color:'#d29922', flexShrink:0, marginTop:1 }} />

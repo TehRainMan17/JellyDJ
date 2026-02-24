@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -136,7 +137,10 @@ def reschedule_index_job(db):
     s = _get_settings(db)
     scheduler.reschedule_job(
         INDEX_JOB_ID,
-        trigger=IntervalTrigger(hours=s.index_interval_hours),
+        trigger=IntervalTrigger(
+            hours=s.index_interval_hours,
+            start_date=datetime.now(timezone.utc),  # always schedule forward from now
+        ),
     )
     log.info(f"Index job rescheduled: every {s.index_interval_hours}h")
 
@@ -158,14 +162,20 @@ def reschedule_automation_jobs(db):
     # Indexer always runs — only the interval changes
     scheduler.reschedule_job(
         INDEX_JOB_ID,
-        trigger=IntervalTrigger(hours=s.index_interval_hours),
+        trigger=IntervalTrigger(
+            hours=s.index_interval_hours,
+            start_date=datetime.now(timezone.utc),
+        ),
     )
 
     # Discovery refresh — can be fully disabled
     if s.discovery_refresh_enabled:
         scheduler.reschedule_job(
             DISCOVERY_JOB_ID,
-            trigger=IntervalTrigger(hours=s.discovery_refresh_interval_hours),
+            trigger=IntervalTrigger(
+                hours=s.discovery_refresh_interval_hours,
+                start_date=datetime.now(timezone.utc),
+            ),
         )
         try:
             scheduler.resume_job(DISCOVERY_JOB_ID)
@@ -181,7 +191,10 @@ def reschedule_automation_jobs(db):
     if s.playlist_regen_enabled:
         scheduler.reschedule_job(
             PLAYLIST_JOB_ID,
-            trigger=IntervalTrigger(hours=s.playlist_regen_interval_hours),
+            trigger=IntervalTrigger(
+                hours=s.playlist_regen_interval_hours,
+                start_date=datetime.now(timezone.utc),
+            ),
         )
         try:
             scheduler.resume_job(PLAYLIST_JOB_ID)
@@ -200,7 +213,10 @@ def reschedule_automation_jobs(db):
     if auto_dl_enabled:
         scheduler.reschedule_job(
             AUTO_DOWNLOAD_JOB_ID,
-            trigger=IntervalTrigger(days=cooldown_days),
+            trigger=IntervalTrigger(
+                days=cooldown_days,
+                start_date=datetime.now(timezone.utc),
+            ),
         )
         try:
             scheduler.resume_job(AUTO_DOWNLOAD_JOB_ID)

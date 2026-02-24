@@ -421,12 +421,15 @@ async def _run_auto_download(bypass_cooldown: bool = False):
             else:
                 log.info(f"Auto-download [{user.username}]: no fallback candidate")
 
+        # Always stamp last_auto_download so the cooldown advances regardless of
+        # whether anything was sent. Without this, an empty queue causes the job
+        # to fire every interval forever (cooldown never starts).
+        s.last_auto_download = datetime.utcnow()
+        db.commit()
         if total_sent > 0:
-            s.last_auto_download = datetime.utcnow()
-            db.commit()
             log.info(f"Auto-download complete: {total_sent} album(s) sent to Lidarr")
         else:
-            log.info("Auto-download: no albums sent this run")
+            log.info("Auto-download: ran, no albums sent this run (queue empty or all filtered)")
 
 
     except Exception as e:

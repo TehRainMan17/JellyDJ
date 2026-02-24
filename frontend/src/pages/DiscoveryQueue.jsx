@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-const utc = s => s && !s.endsWith('Z') ? s+'Z' : s
+const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
 
 const STATUS_TABS = [
   { key:'pending',  label:'Pending',  color:'#fbbf24' },
