@@ -147,4 +147,4 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 (AGPL-3.0)
