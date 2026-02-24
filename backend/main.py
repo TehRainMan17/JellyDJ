@@ -73,6 +73,9 @@ async def lifespan(app: FastAPI):
     # Add any new columns that appeared since the user's last install
     _run_migrations()
 
+    # Backfill any stale popularity cache entries (one-time, safe to repeat)
+    _backfill_top_album_cache()
+
     # Start the APScheduler background job scheduler
     from scheduler import start_scheduler
     start_scheduler(SessionLocal)
@@ -123,3 +126,38 @@ async def health_check():
     The frontend container waits for this to pass before starting.
     """
     return {"status": "ok", "service": "JellyDJ", "version": "0.1.0"}
+
+
+def _backfill_top_album_cache():
+    """
+    One-time migration: add 'album' key to top_album cache entries that only
+    have 'name' (written by the Last.fm adapter before the key was normalised).
+    Safe to run on every startup — skips rows that already have 'album'.
+    """
+    import json
+    db = SessionLocal()
+    try:
+        from models import PopularityCache
+        rows = db.query(PopularityCache).filter(
+            PopularityCache.cache_key.like("top_album:%")
+        ).all()
+        fixed = 0
+        for row in rows:
+            try:
+                d = json.loads(row.payload)
+                if "name" in d and "album" not in d:
+                    d["album"] = d["name"]
+                    row.payload = json.dumps(d)
+                    fixed += 1
+            except Exception:
+                pass
+        if fixed:
+            db.commit()
+            import logging
+            logging.getLogger(__name__).info(
+                f"Backfilled 'album' key in {fixed} top_album cache entries"
+            )
+    except Exception:
+        pass
+    finally:
+        db.close()

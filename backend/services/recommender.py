@@ -330,7 +330,8 @@ def _get_top_album_from_cache(artist_name: str, db) -> tuple[str, Optional[int],
     if row:
         try:
             d = json.loads(row.payload)
-            return d.get("album", ""), d.get("year"), d.get("image_url")
+            # Last.fm adapter stores the album name under "name", not "album"
+            return d.get("name") or d.get("album", ""), d.get("year"), d.get("image_url")
         except Exception:
             pass
     return "", None, None

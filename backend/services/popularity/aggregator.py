@@ -362,5 +362,11 @@ class PopularityAggregator:
 
         result = adapter.get_artist_top_album(artist_name)
         if db and result:
-            self._cache_set(db, cache_key, result)
+            # Normalise to always store under "album" key so readers are consistent.
+            # Last.fm adapter uses "name"; we add "album" as a canonical alias.
+            normalised = dict(result)
+            if "name" in normalised and "album" not in normalised:
+                normalised["album"] = normalised["name"]
+            self._cache_set(db, cache_key, normalised)
+            result = normalised
         return result

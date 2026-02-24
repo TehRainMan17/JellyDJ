@@ -399,8 +399,17 @@ async def _run_auto_download(bypass_cooldown: bool = False):
                     users_sent_this_run.add(user.jellyfin_user_id)
                     log.info(f"  ✓ {result['message']}")
                     from services.events import log_event
+                    # Use the album name Lidarr actually searched for (from result["message"]),
+                    # not candidate.album_name which may be blank for artist-only recommendations.
+                    display_album = candidate.album_name or ""
+                    if not display_album:
+                        # Parse from result message: "'Artist' added to Lidarr — search triggered for 'Album'"
+                        import re as _re
+                        m = _re.search(r"search triggered for '([^']+)'", result["message"])
+                        if m:
+                            display_album = m.group(1)
                     log_event(db, "auto_download",
-                              f"Auto-downloaded: {candidate.artist_name} — {candidate.album_name or 'album'}")
+                              f"Auto-downloaded: {candidate.artist_name} — {display_album or 'unknown album'}")
                 else:
                     log.warning(f"  ✗ Failed: {result['message']}")
                 db.commit()

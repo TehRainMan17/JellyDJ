@@ -295,8 +295,11 @@ async def validate_album_in_lidarr(
                 best_score = scored[0][1] if scored else 0.0
                 best_album = scored[0][0] if best_score > 0.55 else None
             else:
-                # No album name specified — pick most popular (first result usually)
-                best_album = search_pool[0] if search_pool else None
+                # No album name specified — don't silently pick a random album.
+                # Return found=False so the caller queues the artist without
+                # a specific album target. _send_to_lidarr handles artist-only adds.
+                log.debug(f"  Lidarr validation: no album_name for '{artist_name}', skipping album match")
+                return result
 
             if not best_album:
                 log.debug(f"  Lidarr validation: no album match for '{album_name}' by '{artist_name}'")
