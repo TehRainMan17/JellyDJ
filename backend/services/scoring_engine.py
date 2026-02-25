@@ -48,23 +48,50 @@ log = logging.getLogger(__name__)
 #   FAVORITE_FLOOR — raise to push liked songs even higher in all playlists
 
 # Played track formula weights (must sum to 1.0)
-# These combine into a 0–100 base score before skip penalty is applied.
-W_PLAY      = 0.45   # raw play frequency (log-scaled to reduce dominance of single obsessive plays)
+# These combine into a 0–100 raw base, then compressed before bonus is applied.
+W_PLAY      = 0.45   # raw play frequency (log-scaled against your personal max)
 W_RECENCY   = 0.25   # how recently played (decays linearly from 30 → 365 days)
-W_ARTIST    = 0.20   # artist-level affinity pulls tracks from loved artists up
+W_ARTIST    = 0.20   # artist-level affinity (scaled by AFFINITY_SCALE before use)
 W_GENRE     = 0.10   # genre affinity as a softer signal
+
+# Affinity scaling: caps how much loved-artist status can inflate a score.
+# 0.70 limits max artist+genre contribution to 14+7=21pts — meaningful pull
+# toward liked artists without carrying a track on its own.
+AFFINITY_SCALE        = 0.70
+
+# Score rescaling ceiling.
+# The raw formula tops out at ~88 (all inputs maxed simultaneously), so without
+# rescaling the best track in your library only compresses to ~90 before any bonus.
+# SCORE_RESCALE_MAX stretches the formula output so the practical ceiling maps to
+# 100 before the power curve is applied — this lets your top tracks use the full
+# scale rather than topping out at ~90 due to formula arithmetic.
+# Value = W_PLAY*100 + W_RECENCY*100 + W_ARTIST*(100*0.70) + W_GENRE*(100*0.70) = 91.
+# (Was 88 — wrong; used 0.70*70 instead of 0.70*100 for the affinity terms.)
+SCORE_RESCALE_MAX     = 91.0  # true formula max: 0.45*100+0.25*100+0.20*(100*0.70)+0.10*(100*0.70)
+
+# Score compression exponent. Applied as: 100 * (rescaled/100)^EXP.
+# EXP=0.75 produces the target feel:
+#   scaled 100→100,  95→96,  90→93,  85→89,  80→85,  75→81,  70→76,  60→66,  50→56
+# Target score bands:
+#   55–68  = casual listens, rarely played, low-affinity artists
+#   70–79  = good songs you genuinely like (solid play history)
+#   80–88  = great songs — well-played OR favourited
+#   89–94  = lifelong songs — well-played AND recent AND hearted
+#   95+    = only reachable as rounding on truly exceptional tracks
+# Was 0.80 — that over-compressed so even 150-play favourited anthems only scored
+# ~79, destroying granularity at the top end. 0.75 restores separation.
+COMPRESSION_EXP       = 0.75
 
 # Unplayed track scoring
 # Unplayed tracks use a separate formula so they can appear in playlists
 # without crowding out tracks the user genuinely loves.
-# The score range (~38–72) sits deliberately below the played-track mean (~60–85)
-# so "for you" playlists stay anchored to known favourites while still
-# introducing new music in the minority discovery slots.
-UNPLAYED_BASE         = 38.0   # floor for any unplayed track from any artist
+# Scores sit below the played-track range (~42–65) so unplayed tracks
+# appear as discovery without displacing genuinely loved songs.
+UNPLAYED_BASE         = 35.0   # floor for any unplayed track from any artist
 UNPLAYED_ARTIST_W     = 0.20   # max +20pts from artist affinity (beloved artist = 58 base)
 UNPLAYED_GENRE_W      = 0.14   # max +14pts from genre affinity
 UNPLAYED_NOVELTY      = 2.0    # small constant bump to prefer genuinely new tracks over stale ones
-UNPLAYED_CAP          = 72.0   # hard ceiling — keeps unplayed below a well-loved played track
+UNPLAYED_CAP          = 65.0   # hard ceiling — keeps unplayed below a well-loved played track
 
 # Recency decay parameters
 # A track played within GRACE days gets maximum recency score (100).
@@ -76,37 +103,35 @@ RECENCY_DECAY_DAYS    = 365
 # Minimum skip events before the penalty is applied.
 # Set to 1 so that any recorded skip contributes, but the penalty itself
 # scales gradually (calc in _calc_penalty in webhooks.py) so a single
-# accidental skip doesn't crater a track's score.
+# accidental skip doesn't permanently suppress a track.
 SKIP_MIN_EVENTS       = 1
 
 # Favorite / heart / like signal
 # This is the strongest explicit signal a user can give. Design decisions:
 #
-#   FAVORITE_FLOOR:
-#     A hearted track scores at LEAST 82/100 regardless of play count, recency,
-#     or skip history. This ensures liked songs always appear near the top of
-#     every playlist type. 82 was chosen to sit above the UNPLAYED_CAP (72)
-#     and just above the typical ceiling for a heavily-played non-favourite (~81).
+#   FAVORITE_FLOOR (67):
+#     A hearted track scores at LEAST 67 regardless of play count or recency.
+#     Sits just above UNPLAYED_CAP (65) so liked-but-rarely-played songs always
+#     clear the discovery/unplayed band and appear in "songs you like" playlists.
 #
-#   FAVORITE_BONUS:
-#     Additive bonus applied before the floor check. For a frequently-played
-#     and recently-heard favourite this pushes the score into the 95–100 range.
+#   FAVORITE_BONUS (6):
+#     Additive bonus applied after compression. Creates clear separation between
+#     a hearted track and an equally-played unloved one (~6 point lift), without
+#     being large enough to vault low-play songs into the 90s.
+#     With SCORE_RESCALE_MAX+EXP=0.75, the practical ceiling before bonus is ~93,
+#     so +6 can reach ~99 only for your absolute most-played recent favourites.
 #
-#   FAVORITE_SKIP_SHIELD:
-#     Caps the effective skip penalty for a liked track at 0.25 (25%).
-#     Rationale: if you hearted a song you probably still like it even if you
-#     sometimes skip it (wrong mood, phone in pocket, etc.). Without the shield,
-#     a 0.8 skip rate would multiply the score by 0.2 and drop it to ~16/100
-#     even on a hearted track. With the shield, the penalty is capped at 0.25.
+#   FAVORITE_SKIP_SHIELD (0.35):
+#     Max skip penalty applied to a favourited track.
+#     If you've liked a song, one or two mood-driven skips shouldn't crater it.
 #
-#   FAVORITE_ARTIST_BOOST:
-#     When any track by an artist is favourited, the artist's overall affinity
-#     score gets +20. This elevates the artist's OTHER tracks in discovery and
-#     playlists — the "I love this artist" signal matters beyond the single track.
-FAVORITE_FLOOR        = 82.0
-FAVORITE_BONUS        = 18.0
-FAVORITE_SKIP_SHIELD  = 0.25
-FAVORITE_ARTIST_BOOST = 20.0
+#   FAVORITE_ARTIST_BOOST (15):
+#     Additive bonus to ArtistProfile affinity if user has any favourite by that artist.
+#     Applied before normalisation so it raises the artist's relative standing.
+FAVORITE_FLOOR        = 67.0
+FAVORITE_BONUS        =  6.0
+FAVORITE_SKIP_SHIELD  = 0.35
+FAVORITE_ARTIST_BOOST = 15.0
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -134,6 +159,23 @@ def _recency_score(last_played: Optional[datetime]) -> float:
 def _skip_multiplier(penalty: float) -> float:
     """Convert 0–1 skip penalty into a score multiplier (1.0 = no penalty)."""
     return max(0.1, 1.0 - float(penalty))
+
+
+def _compress(raw: float) -> float:
+    """
+    Two-step compression:
+    1. Rescale: the raw formula tops out at ~88 (SCORE_RESCALE_MAX), not 100.
+       We stretch it so raw=88 → scaled=100, meaning your most-played recent
+       favourite from a loved artist can actually approach 100 rather than
+       being hard-capped at ~90 before the bonus is applied.
+    2. Power curve: 100 * (scaled/100)^0.75 spreads the distribution.
+       scaled 100→100, 90→93, 80→85, 70→76, 60→66, 50→56.
+    Combined effect: the 70–93 range is wide and meaningful. 95+ is rare.
+    """
+    if raw <= 0:
+        return 0.0
+    scaled = min(100.0, (raw / SCORE_RESCALE_MAX) * 100.0)
+    return round(100.0 * ((scaled / 100.0) ** COMPRESSION_EXP), 2)
 
 
 # ── Phase 1: Build ArtistProfile ─────────────────────────────────────────────
@@ -380,29 +422,42 @@ def rebuild_track_scores(
             ps = _play_score(play.play_count, max_plays)
             rs = _recency_score(play.last_played)
 
-            base = (
+            # Scale affinity so even top-artist tracks need real play/recency
+            # data to score well. Without scaling, W_ARTIST * 100 = 20 free
+            # points push all tracks by loved artists into 90+ regardless of
+            # whether you've actually played them much.
+            a_scaled = a_aff * AFFINITY_SCALE
+            g_scaled = g_aff * AFFINITY_SCALE
+
+            raw_base = (
                 W_PLAY    * ps +
                 W_RECENCY * rs +
-                W_ARTIST  * a_aff +
-                W_GENRE   * g_aff
+                W_ARTIST  * a_scaled +
+                W_GENRE   * g_scaled
             )
 
-            # Apply skip multiplier — but favorites are shielded:
-            # an actively liked track's skip penalty is capped so accidental
-            # or mood-driven skips can't crater a song the user has hearted.
+            # Compress: spreads the 70–95 band so play count and recency
+            # create meaningful score differences instead of all clustering at 98–100.
+            compressed = _compress(raw_base)
+
+            # Skip multiplier — favourites are shielded from the worst of it
             if play.is_favorite:
                 shielded_pen = min(skip_pen, FAVORITE_SKIP_SHIELD)
                 multiplier = _skip_multiplier(shielded_pen)
             else:
                 multiplier = _skip_multiplier(skip_pen)
 
-            final = round(min(100.0, base * multiplier), 2)
+            final = round(compressed * multiplier, 2)
 
-            # Favorites: additive bonus AND a floor so liked tracks always
-            # surface near the top regardless of play count or recency.
+            # Favourites: modest bonus + floor.
+            # 7pts bonus is intentional — enough to matter, not a free pass to 100.
+            # Floor (65) just clears the unplayed cap so liked-but-rarely-played
+            # songs don't sink below discovery tracks.
             if play.is_favorite:
-                final = round(min(100.0, final + FAVORITE_BONUS), 2)
-                final = max(final, FAVORITE_FLOOR)  # floor: liked = always near top
+                # Cap at 99 so 100 is structurally unreachable.
+                # 100 appearing in the UI always means a stale pre-migration row.
+                final = round(min(99.0, final + FAVORITE_BONUS), 2)
+                final = max(final, FAVORITE_FLOOR)
 
             db.add(TrackScore(
                 user_id=user_id,
@@ -426,16 +481,16 @@ def rebuild_track_scores(
             ))
         else:
             # ── Unplayed track scoring ────────────────────────────────────────
-            # Base + affinity pulls, capped at UNPLAYED_CAP
+            # Affinity also scaled for consistency — top-artist unplayed tracks
+            # should sit noticeably below moderately-played tracks of the same artist.
             unplayed_score = (
                 UNPLAYED_BASE
-                + UNPLAYED_ARTIST_W * a_aff
-                + UNPLAYED_GENRE_W  * g_aff
+                + UNPLAYED_ARTIST_W * (a_aff * AFFINITY_SCALE)
+                + UNPLAYED_GENRE_W  * (g_aff * AFFINITY_SCALE)
                 + UNPLAYED_NOVELTY
             )
 
             # Artist skip suppression carries over to unplayed tracks
-            # (if you always skip an artist, don't surface their unplayed stuff)
             if skip_pen > 0.3:
                 unplayed_score *= (1.0 - skip_pen * 0.3)
 

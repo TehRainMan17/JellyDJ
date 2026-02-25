@@ -170,11 +170,18 @@ class PopularityAggregator:
                 return cached.get("artists", [])
 
         seen: dict[str, int] = {}
+        # Skip MusicBrainz when better adapters are available — its similar-artist
+        # data is weak (only "member of band" relations) and its blocking calls
+        # cause SSL-hang slowdowns. Last.fm covers this far better.
+        primary_sim = {k: v for k, v in self.adapters.items()
+                       if k != "musicbrainz" and v.is_configured()}
+        adapters_for_sim = primary_sim if primary_sim else {
+            k: v for k, v in self.adapters.items() if v.is_configured()
+        }
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
                 pool.submit(adapter.get_similar_artists, artist_name): adapter_name
-                for adapter_name, adapter in self.adapters.items()
-                if adapter.is_configured()
+                for adapter_name, adapter in adapters_for_sim.items()
             }
             for future, adapter_name in futures.items():
                 try:

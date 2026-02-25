@@ -96,6 +96,9 @@ def _parse_body(body: dict) -> Optional[dict]:
     user_id = session.get("UserId") or body.get("UserId")
     if not item_id or not user_id:
         return None
+    # Normalise user_id: strip hyphens, lowercase — Jellyfin clients send UUIDs
+    # in inconsistent formats (with/without hyphens, mixed case).
+    user_id = user_id.replace("-", "").lower()
 
     runtime = int(item.get("RunTimeTicks") or body.get("RunTimeTicks") or 0)
 
@@ -134,17 +137,43 @@ def _parse_body(body: dict) -> Optional[dict]:
 
 
 def _is_managed(user_id: str, db: Session) -> bool:
+    # Normalise: strip hyphens and lowercase so UUID format differences
+    # (e.g. "16c9f81b-15e5-4486-be11-b2a4bb4f9290" vs "16c9f81b15e54486be11b2a4bb4f9290")
+    # and casing differences between Jellyfin clients don't cause silent drops.
+    normalised = user_id.replace("-", "").lower()
+
+    # Try exact match first, then normalised match
     result = db.query(ManagedUser).filter_by(
         jellyfin_user_id=user_id, is_enabled=True
     ).first()
+
     if not result:
-        # Check if user exists but is disabled, vs completely unknown
-        exists = db.query(ManagedUser).filter_by(jellyfin_user_id=user_id).first()
+        # Normalised fallback — catches hyphenated or differently-cased UUIDs
+        all_enabled = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        result = next(
+            (u for u in all_enabled
+             if u.jellyfin_user_id.replace("-", "").lower() == normalised),
+            None
+        )
+        if result:
+            log.warning(
+                f"Webhook user_id='{user_id}' matched '{result.username}' via normalisation "                f"(stored: '{result.jellyfin_user_id}'). Consider updating the stored ID to match."
+            )
+
+    if not result:
+        # Check if user exists but is disabled
+        all_users = db.query(ManagedUser).all()
+        exists = next(
+            (u for u in all_users
+             if u.jellyfin_user_id.replace("-", "").lower() == normalised),
+            None
+        )
         if exists:
             log.warning(f"Webhook from known user '{exists.username}' (id={user_id}) but is_enabled=False — skipping")
         else:
-            log.warning(f"Webhook from UNKNOWN user_id='{user_id}' — not in ManagedUser table. "
-                       f"Check that this user is added and enabled in JellyDJ settings.")
+            log.warning(
+                f"Webhook from UNKNOWN user_id='{user_id}' (normalised: '{normalised}') "                f"— not in ManagedUser table. "                f"Stored IDs: {[u.jellyfin_user_id for u in db.query(ManagedUser).all()]}"
+            )
         return False
     return True
 
@@ -214,16 +243,26 @@ def handle_stop(body: dict, db: Session):
     start_entry    = _playback_starts.pop(key, None)
     progress_entry = _playback_progress.pop(key, None)
 
-    if start_entry and p["runtime_ticks"] > 0:
+    # Use runtime from Stop event if present, else fall back to what Start/Progress stored.
+    # Mobile clients (Android, iOS) often omit RunTimeTicks from PlaybackStop payloads,
+    # which caused all completion branches to be skipped → method="ambiguous" → skips never
+    # recorded for users on those clients. Start and Progress always include RunTimeTicks.
+    runtime_ticks = (
+        p["runtime_ticks"]
+        or (start_entry[1] if start_entry else 0)
+        or (progress_entry[2] if progress_entry else 0)
+    )
+
+    if start_entry and runtime_ticks > 0:
         # Best: wall-clock elapsed since start
-        start_wall, runtime_ticks, _ = start_entry
+        start_wall, _rt, _ = start_entry
         elapsed_ticks = (now - start_wall) * 10_000_000
         completion = min(1.0, elapsed_ticks / runtime_ticks)
         method = "server_timing"
 
-    elif progress_entry and p["runtime_ticks"] > 0:
+    elif progress_entry and runtime_ticks > 0:
         # Good: last known position from Progress heartbeat
-        _wall, last_pos, runtime_ticks, _ = progress_entry
+        _wall, last_pos, _rt, _ = progress_entry
         # Add time since last heartbeat (song kept playing after it)
         extra_ticks = (now - _wall) * 10_000_000
         effective_pos = min(runtime_ticks, last_pos + extra_ticks)
@@ -447,10 +486,11 @@ def managed_users_diagnostic(db: Session = Depends(get_db)):
             "diagnosis": (
                 "No events in DB — webhook user_id mismatch or events not reaching server"
                 if total_events == 0 else
-                f"Events in DB but {ambiguous} ambiguous (no start/progress data — "
-                "PlaybackStart events may not be reaching server, or container restarted between start+stop)"
-                if ambiguous > 0 and skip_events == 0 else
-                "OK — events and skips recording normally"
+                f"{total_events} events, {skip_events} skips. "
+                f"{ambiguous} ambiguous (runtime missing in Stop — mobile client likely). "
+                "Skips may be under-counted before this fix."
+                if ambiguous > total_events * 0.3 and skip_events == 0 else
+                f"{total_events} events in DB, {skip_events} skips recorded — OK"
             ),
         })
 

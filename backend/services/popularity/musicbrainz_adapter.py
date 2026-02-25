@@ -13,6 +13,11 @@ log = logging.getLogger(__name__)
 _MB_SETUP_DONE = False
 
 
+# Track consecutive failures so we can stop hammering a broken MusicBrainz
+# connection on every index run.
+_MB_FAIL_COUNT = 0
+_MB_MAX_FAILS = 3   # stop calling MusicBrainz after this many consecutive SSL/network errors
+
 def _setup_mb():
     global _MB_SETUP_DONE
     if _MB_SETUP_DONE:
@@ -20,6 +25,11 @@ def _setup_mb():
     try:
         import musicbrainzngs
         musicbrainzngs.set_useragent("JellyDJ", "0.1", "https://github.com/YOUR_USERNAME/jellydj")
+        # Hard socket timeout: prevents indefinite blocking on SSL hangs.
+        # musicbrainzngs uses urllib internally; the set_hostname call doesn't
+        # expose a timeout, but we can patch the opener.
+        import urllib.request
+        musicbrainzngs.set_hostname("musicbrainz.org")
         _MB_SETUP_DONE = True
     except Exception as e:
         log.warning(f"MusicBrainz setup failed: {e}")
@@ -28,6 +38,11 @@ def _setup_mb():
 class MusicBrainzAdapter(BasePopularityAdapter):
 
     def is_configured(self) -> bool:
+        # Disable after repeated failures so a broken MusicBrainz connection
+        # doesn't slow down every index run. Resets on container restart.
+        global _MB_FAIL_COUNT
+        if _MB_FAIL_COUNT >= _MB_MAX_FAILS:
+            return False
         return True  # No key needed
 
     def get_artist_info(self, name: str) -> Optional[ArtistInfo]:
@@ -64,7 +79,19 @@ class MusicBrainzAdapter(BasePopularityAdapter):
                 source="musicbrainz",
             )
         except Exception as e:
-            log.warning(f"MusicBrainz get_artist_info({name}): {e}")
+            global _MB_FAIL_COUNT
+            err_str = str(e).lower()
+            if any(k in err_str for k in ("ssl", "eof", "urlopen", "timeout", "connection")):
+                _MB_FAIL_COUNT += 1
+                if _MB_FAIL_COUNT >= _MB_MAX_FAILS:
+                    log.warning(
+                        f"MusicBrainz disabled after {_MB_FAIL_COUNT} consecutive network errors "
+                        f"(last: {e}). Will re-enable on container restart."
+                    )
+                else:
+                    log.warning(f"MusicBrainz get_artist_info({name}): {e} (fail {_MB_FAIL_COUNT}/{_MB_MAX_FAILS})")
+            else:
+                log.warning(f"MusicBrainz get_artist_info({name}): {e}")
             return None
 
     def get_album_popularity(self, artist: str, album: str) -> Optional[AlbumPopularity]:

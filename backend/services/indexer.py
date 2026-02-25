@@ -509,14 +509,25 @@ async def run_full_index():
         lock.release()  # always release so the next run can proceed
 
 
-async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):
+async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 10):
     """
-    After building the taste profile, pre-warm the popularity cache for the
-    user's top artists. Runs blocking pylast/HTTP calls in a thread pool
-    so they don't block the FastAPI async event loop.
+    Pre-warm the popularity cache for the user's top artists after indexing.
+    Only warms stale entries — skips artists whose cache is still fresh.
+
+    Uses Last.fm only (not MusicBrainz) because:
+    - MusicBrainz has no play counts or real popularity data
+    - musicbrainzngs makes blocking HTTPS calls with no socket timeout; SSL
+      errors cause each call to hang for the full ADAPTER_TIMEOUT_SECS (12s),
+      making 20-artist warm-ups take minutes when MusicBrainz is having issues.
+    - Last.fm provides everything needed for recommendations (similar artists,
+      tags, top albums) and is already the primary popularity source.
+
+    top_n reduced from 20 to 10: the top 10 artists account for the vast
+    majority of recommendations; warming 20 doubles the I/O for diminishing gain.
     """
     import asyncio
-    from models import UserTasteProfile
+    from datetime import datetime, timedelta
+    from models import UserTasteProfile, PopularityCache
     from services.popularity import get_aggregator
 
     top = (
@@ -533,27 +544,61 @@ async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):
         return
 
     aggregator = get_aggregator(db)
-    configured = [k for k, v in aggregator.adapter_status().items() if v]
-    if not configured:
-        log.info("  No external APIs configured — skipping cache warm-up")
+    # Only use Last.fm — explicitly exclude MusicBrainz to avoid SSL-hang slowdowns.
+    # If Last.fm isn't configured, skip entirely.
+    lastfm_adapter = aggregator.adapters.get("lastfm")
+    if not lastfm_adapter or not lastfm_adapter.is_configured():
+        log.info("  Last.fm not configured — skipping cache warm-up")
         return
 
-    log.info(f"  Warming popularity cache for {len(top)} artists (using: {', '.join(configured)})")
+    # Only warm artists whose cache is actually stale (>20h old or missing).
+    # This way a second index run in the same day is nearly instant.
+    stale_cutoff = datetime.utcnow() - timedelta(hours=20)
+    top_artist_names = []
+    for row in top:
+        artist = row.artist_name
+        cache_key = f"artist:{artist.lower()}"
+        existing = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
+        if existing and existing.updated_at and existing.updated_at > stale_cutoff:
+            log.debug(f"    Cache fresh, skipping: {artist}")
+            continue
+        top_artist_names.append(artist)
+
+    if not top_artist_names:
+        log.info(f"  Popularity cache already warm — skipping warm-up")
+        return
+
+    log.info(f"  Warming popularity cache for {len(top_artist_names)} stale artists (Last.fm only)")
 
     loop = asyncio.get_event_loop()
-    # Capture artist names before entering thread — avoids passing SQLAlchemy
-    # objects across thread boundaries (sessions are not thread-safe)
-    top_artist_names = [row.artist_name for row in top]
 
     def _do_warmup():
-        """All blocking I/O in one function — runs in thread pool with its own session."""
+        """Blocking Last.fm calls in a thread pool with its own DB session."""
         thread_db = SessionLocal()
         try:
             thread_aggregator = get_aggregator(thread_db)
+            # Only call Last.fm — bypass MusicBrainz entirely
+            lastfm = thread_aggregator.adapters.get("lastfm")
+            if not lastfm or not lastfm.is_configured():
+                return
             for artist in top_artist_names:
                 try:
-                    thread_aggregator.get_artist_info(artist, db=thread_db)
-                    thread_aggregator.get_similar_artists(artist, db=thread_db)
+                    # get_artist_info goes through full aggregator (incl. MusicBrainz).
+                    # Call Last.fm directly to avoid that.
+                    info = lastfm.get_artist_info(artist)
+                    if info:
+                        from services.popularity.aggregator import PopularityAggregator
+                        thread_aggregator._cache_set(
+                            thread_db,
+                            f"artist:{artist.lower()}",
+                            {
+                                "tags": info.tags,
+                                "similar_artists": info.similar_artists,
+                                "image_url": getattr(info, "image_url", None),
+                                "popularity": getattr(info, "popularity", 0),
+                            },
+                        )
+                    lastfm.get_similar_artists(artist)
                     _cache_artist_discography(artist, thread_db)
                     log.debug(f"    Cached: {artist}")
                 except Exception as e:
