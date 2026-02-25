@@ -1,18 +1,35 @@
-
 """
 JellyDJ Webhook receiver
 
-Skip detection strategy:
-  1. SERVER-SIDE TIMING via PlaybackStart (most accurate)
-  2. PlaybackProgress heartbeats — Jellyfin sends these every ~10s while playing.
-     Last progress position before stop = where user actually was.
-  3. PlayedToCompletion flag (fallback, unreliable on Android ~50%)
-  4. Ambiguous — no data, don't penalise
+Skip detection strategy — designed to work across ALL Jellyfin clients:
+
+  STANDARD clients (Android, web, Jellyfin iOS, Swiftfin):
+    Send PlaybackStart → PlaybackProgress → PlaybackStop.
+    Completion measured via server-side wall-clock timing (most accurate).
+    
+  PROGRESS-ONLY clients (Manet on iOS, some others):
+    Send only PlaybackProgress heartbeats (~1s interval, IsAutomated=True).
+    No PlaybackStart or PlaybackStop.
+    Track transition detected when ItemId changes for the same user.
+    Completion measured via max position reached on previous track.
+    Session end (last song) detected by silence — NOT penalized.
+
+  SKIP CONFIRMATION (all clients):
+    A stop that looks like a skip (completion < 80%) is NOT immediately recorded.
+    It's held as PENDING for SKIP_CONFIRM_SECS (10s). If the user's next
+    PlaybackStart arrives within that window, it's confirmed as a genuine skip.
+    If silence follows (session ended), it's discarded — not penalized.
+    This fixes the "last song of a session always counts as a skip" bug.
+
+  MAX-POSITION tracking:
+    Both paths track the PEAK position reached, not the last reported position.
+    Protects against false skips when users seek backward.
 
 Jellyfin sends Content-Type: text/plain with JSON body.
 PlaybackStop fires 2-3x per action (one per connected session) — deduped.
 
 SETUP: Enable PlaybackStart, PlaybackProgress, AND PlaybackStop in webhook config.
+Progress-only clients work without Start/Stop but Start+Stop improves accuracy.
 """
 from __future__ import annotations
 
@@ -32,49 +49,61 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 # ── Skip detection thresholds ────────────────────────────────────────────────
-#
-# SKIP_THRESHOLD: a track is counted as "completed" if the user listened to
-# at least this fraction of it. Below 80% = skip. This is deliberately high
-# because Jellyfin users often let tracks play to near the end before skipping.
-# Lower this (e.g. 0.60) if you want to be more aggressive about skip detection.
+
+# A track is "completed" if the user reached at least this fraction of it.
+# 80% is deliberately high — users often listen near the end before skipping.
 SKIP_THRESHOLD = 0.80
 
-# MAX_PENALTY: the highest penalty multiplier a track can accumulate.
-# 0.60 means a heavily-skipped track scores at most 40% of its base score.
-# Kept below 1.0 so even a much-skipped track still has a chance to appear
-# if the user's taste profile strongly suggests it.
-MAX_PENALTY    = 0.60
+# Maximum skip penalty a track can accumulate. 0.60 = scores at most 40% of base.
+# Kept below 1.0 so even a heavily-skipped track can still surface occasionally.
+MAX_PENALTY = 0.60
 
-# A single skip event is enough to start accumulating penalty, but the penalty
-# itself scales gradually via _calc_penalty() so one accidental skip doesn't
-# permanently suppress a track.
 MIN_EVENTS_FOR_PENALTY = 1
 
-# Jellyfin sometimes fires PlaybackStop 2-3 times for a single stop action
-# (one per connected client session). We deduplicate within this window.
-DEDUP_WINDOW_SECONDS   = 10
+# Jellyfin fires PlaybackStop 2-3x for one action (one per connected session).
+DEDUP_WINDOW_SECONDS = 10
+
+# How long to hold a potential skip before confirming or discarding it.
+# Real skips: next PlaybackStart fires within ~100ms–2s.
+# Session ends: no next Start. After this window, the pending skip is discarded.
+# 10s is safe: longer than any real network delay, shorter than a deliberate pause.
+SKIP_CONFIRM_SECS = 10
+
+# Progress-only client: if no progress event arrives for this long, the user
+# ended their session. The last tracked song is NOT penalized.
+SESSION_END_SECS = 60
+
+# Progress-only: minimum position advance (in ticks) to count as "actually played".
+# Filters out the burst of pos=0 progress events some clients emit on track start.
+MIN_POSITION_TICKS = 5_000_000  # 0.5 seconds
+
 
 # ── In-memory state ───────────────────────────────────────────────────────────
-# These dicts are keyed by "user_id::jellyfin_item_id".
-# They live in memory (not the DB) because they're working state for a single
-# playback session — they're only persisted once PlaybackStop fires.
+#
+# All dicts keyed by "user_id::item_id" or just "user_id".
+# Module-level globals — safe with single uvicorn worker (as deployed).
 
-# Populated by PlaybackStart: stores when playback began and the total runtime
-# so we can calculate elapsed time even if position_ticks is missing in Stop.
-# Format: { key: (wall_time_float, runtime_ticks, track_name) }
+# PlaybackStart state: { "user::item": (wall_time, runtime_ticks, track_name) }
 _playback_starts: dict = {}
 
-# Populated by PlaybackProgress heartbeats (~every 10s while playing).
-# The LAST entry before PlaybackStop gives us the actual position, which is
-# more reliable than the position_ticks in the Stop event itself on some clients.
-# Format: { key: (last_wall_time_float, last_position_ticks, runtime_ticks, track_name) }
+# Progress state (all clients): { "user::item": (wall_time, max_pos, runtime, track_data) }
+# max_pos = peak position reached (protects against seek-backward false skips)
+# track_data = dict with all fields needed to write a PlaybackEvent
 _playback_progress: dict = {}
 
-# Tracks the last PlaybackStop wall time per key for deduplication
+# Per-user: which item_id is currently active (for progress-only client tracking)
+# { user_id: item_id }
+_active_item: dict = {}
+
+# Pending skip confirmation: { user_id: {fields...} }
+# Holds a potential skip until the next PlaybackStart confirms it, or
+# SESSION_END_SECS passes and it's discarded as a session end.
+_pending_skips: dict = {}
+
+# Dedup: { "user::item": wall_time_of_last_stop }
 _recent_stops: dict = {}
 
-# Circular buffer of the last 20 DB write errors — surfaced by the /diagnostic endpoint
-# so admins can see if webhooks are being received but failing to persist
+# Recent DB errors for the /diagnostic endpoint
 _recent_errors: list = []
 
 
@@ -96,20 +125,19 @@ def _parse_body(body: dict) -> Optional[dict]:
     user_id = session.get("UserId") or body.get("UserId")
     if not item_id or not user_id:
         return None
-    # Normalise user_id: strip hyphens, lowercase — Jellyfin clients send UUIDs
-    # in inconsistent formats (with/without hyphens, mixed case).
+
+    # Normalise user_id: strip hyphens and lowercase so UUID format differences
+    # between Jellyfin clients don't cause silent event drops.
     user_id = user_id.replace("-", "").lower()
 
     runtime = int(item.get("RunTimeTicks") or body.get("RunTimeTicks") or 0)
-
-    # Position — present in Progress events, always 0 in Stop events
     position = int(
         body.get("PlaybackPositionTicks") or
         session.get("PlayState", {}).get("PositionTicks") or 0
     )
 
     artists = item.get("Artists") or []
-    artist  = (
+    artist = (
         body.get("Artist") or
         item.get("AlbumArtist") or
         (artists[0] if artists else "") or ""
@@ -133,22 +161,25 @@ def _parse_body(body: dict) -> Optional[dict]:
         "runtime_ticks":  runtime,
         "position_ticks": position,
         "played_to_completion": bool(body.get("PlayedToCompletion") or False),
+        "is_automated": bool(body.get("IsAutomated") or False),
     }
 
 
 def _is_managed(user_id: str, db: Session) -> bool:
-    # Normalise: strip hyphens and lowercase so UUID format differences
-    # (e.g. "16c9f81b-15e5-4486-be11-b2a4bb4f9290" vs "16c9f81b15e54486be11b2a4bb4f9290")
-    # and casing differences between Jellyfin clients don't cause silent drops.
+    """
+    Check if user_id belongs to a managed, enabled user.
+    Normalises UUID format (with/without hyphens, any case) before matching
+    so clients that send differently-formatted UUIDs are handled correctly.
+    """
+    # user_id is already normalised by _parse_body, but guard here too
     normalised = user_id.replace("-", "").lower()
 
-    # Try exact match first, then normalised match
     result = db.query(ManagedUser).filter_by(
-        jellyfin_user_id=user_id, is_enabled=True
+        jellyfin_user_id=normalised, is_enabled=True
     ).first()
 
     if not result:
-        # Normalised fallback — catches hyphenated or differently-cased UUIDs
+        # Normalised fallback for UUIDs stored with hyphens or different casing
         all_enabled = db.query(ManagedUser).filter_by(is_enabled=True).all()
         result = next(
             (u for u in all_enabled
@@ -157,11 +188,11 @@ def _is_managed(user_id: str, db: Session) -> bool:
         )
         if result:
             log.warning(
-                f"Webhook user_id='{user_id}' matched '{result.username}' via normalisation "                f"(stored: '{result.jellyfin_user_id}'). Consider updating the stored ID to match."
+                f"Webhook user_id='{user_id}' matched '{result.username}' via normalisation "
+                f"(stored: '{result.jellyfin_user_id}'). Consider updating the stored ID."
             )
 
     if not result:
-        # Check if user exists but is disabled
         all_users = db.query(ManagedUser).all()
         exists = next(
             (u for u in all_users
@@ -172,121 +203,27 @@ def _is_managed(user_id: str, db: Session) -> bool:
             log.warning(f"Webhook from known user '{exists.username}' (id={user_id}) but is_enabled=False — skipping")
         else:
             log.warning(
-                f"Webhook from UNKNOWN user_id='{user_id}' (normalised: '{normalised}') "                f"— not in ManagedUser table. "                f"Stored IDs: {[u.jellyfin_user_id for u in db.query(ManagedUser).all()]}"
+                f"Webhook from UNKNOWN user_id='{user_id}' — not in ManagedUser table. "
+                f"Stored IDs: {[u.jellyfin_user_id for u in db.query(ManagedUser).all()]}"
             )
         return False
     return True
 
 
 def _prune(d: dict, max_age: float = 3600):
+    """Remove stale entries from an in-memory dict keyed on wall time in v[0]."""
     cutoff = time.time() - max_age
-    dead = []
-    for k, v in d.items():
-        ts = v[0] if isinstance(v, tuple) else v
-        if isinstance(ts, (int, float)) and ts < cutoff:
-            dead.append(k)
+    dead = [k for k, v in d.items()
+            if isinstance(v, tuple) and isinstance(v[0], float) and v[0] < cutoff]
     for k in dead:
         del d[k]
 
 
-# ── Event handlers ────────────────────────────────────────────────────────────
-
-def handle_start(body: dict, db: Session):
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-    key = f"{p['user_id']}::{p['item_id']}"
-    _playback_starts[key]   = (time.time(), p["runtime_ticks"], p["track_name"])
-    _playback_progress[key] = (time.time(), 0, p["runtime_ticks"], p["track_name"])
-    _prune(_playback_starts)
-    _prune(_playback_progress)
-    log.info(f"Playback START  user={p['user_id'][:8]}  track='{p['track_name']}'  runtime={p['runtime_ticks']//10_000_000}s")
-
-
-def handle_progress(body: dict, db: Session):
+def _write_event(db: Session, p: dict, completion: float, method: str, is_skip: bool):
     """
-    PlaybackProgress fires every ~10s with actual PositionTicks.
-    We store the last known position so Stop can use it.
+    Persist a PlaybackEvent and update the SkipPenalty row.
+    Called from both the Stop path and the Progress-transition path.
     """
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-    if p["position_ticks"] <= 0:
-        return  # ignore zero-position progress (shouldn't happen but guard it)
-    key = f"{p['user_id']}::{p['item_id']}"
-    _playback_progress[key] = (time.time(), p["position_ticks"], p["runtime_ticks"], p["track_name"])
-    _prune(_playback_progress)
-    log.debug(
-        f"Progress: '{p['track_name']}' "
-        f"{p['position_ticks']//10_000_000}s / {p['runtime_ticks']//10_000_000}s"
-    )
-
-
-def handle_stop(body: dict, db: Session):
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-
-    # Dedup — Jellyfin fires stop once per connected session
-    key = f"{p['user_id']}::{p['item_id']}"
-    now = time.time()
-    if now - _recent_stops.get(key, 0) < DEDUP_WINDOW_SECONDS:
-        log.debug(f"Dedup: dropping duplicate stop  user={p['user_id'][:8]}  track='{p['track_name']}'")
-        return
-    _recent_stops[key] = now
-    _prune(_recent_stops)
-
-    # ── Determine completion ──────────────────────────────────────────────────
-    completion: float
-    method: str
-
-    start_entry    = _playback_starts.pop(key, None)
-    progress_entry = _playback_progress.pop(key, None)
-
-    # Use runtime from Stop event if present, else fall back to what Start/Progress stored.
-    # Mobile clients (Android, iOS) often omit RunTimeTicks from PlaybackStop payloads,
-    # which caused all completion branches to be skipped → method="ambiguous" → skips never
-    # recorded for users on those clients. Start and Progress always include RunTimeTicks.
-    runtime_ticks = (
-        p["runtime_ticks"]
-        or (start_entry[1] if start_entry else 0)
-        or (progress_entry[2] if progress_entry else 0)
-    )
-
-    if start_entry and runtime_ticks > 0:
-        # Best: wall-clock elapsed since start
-        start_wall, _rt, _ = start_entry
-        elapsed_ticks = (now - start_wall) * 10_000_000
-        completion = min(1.0, elapsed_ticks / runtime_ticks)
-        method = "server_timing"
-
-    elif progress_entry and runtime_ticks > 0:
-        # Good: last known position from Progress heartbeat
-        _wall, last_pos, _rt, _ = progress_entry
-        # Add time since last heartbeat (song kept playing after it)
-        extra_ticks = (now - _wall) * 10_000_000
-        effective_pos = min(runtime_ticks, last_pos + extra_ticks)
-        completion = effective_pos / runtime_ticks
-        method = "progress_heartbeat"
-
-    elif p["played_to_completion"]:
-        # Fallback: Jellyfin flag (unreliable on Android but better than nothing)
-        completion = 1.0
-        method = "played_to_completion_flag"
-
-    else:
-        # No data — ambiguous, don't penalise
-        completion = 0.0
-        method = "ambiguous"
-
-    is_skip = (method != "ambiguous") and (completion < SKIP_THRESHOLD)
-
-    log.info(
-        f"Playback STOP  user={p['user_id'][:8]}  track='{p['track_name']}' by '{p['artist_name']}' "
-        f"— {completion:.0%} via {method} → {'SKIP' if is_skip else 'PLAYED'}"
-    )
-
-    # Record event
     import traceback as _tb
     try:
         db.add(PlaybackEvent(
@@ -303,7 +240,6 @@ def handle_stop(body: dict, db: Session):
             received_at=datetime.utcnow(),
         ))
 
-        # Update penalty
         row = db.query(SkipPenalty).filter_by(
             user_id=p["user_id"], jellyfin_item_id=p["item_id"]
         ).first()
@@ -319,25 +255,29 @@ def handle_stop(body: dict, db: Session):
         row.total_events = (row.total_events or 0) + 1
         if is_skip:
             row.skip_count = (row.skip_count or 0) + 1
-        skip_rate     = (row.skip_count or 0) / row.total_events
+        skip_rate = (row.skip_count or 0) / row.total_events
         row.skip_rate = str(round(skip_rate, 4))
         row.penalty   = str(_calc_penalty(row.skip_count, row.total_events))
         row.updated_at = datetime.utcnow()
         db.commit()
-        log.info(f"  ✓ DB commit OK  user={p['user_id'][:8]}  skip={is_skip}")
+        log.info(
+            f"  ✓ Recorded  user={p['user_id'][:8]}  '{p['track_name']}'  "
+            f"{completion:.0%} via {method}  → {'SKIP' if is_skip else 'PLAYED'}"
+        )
     except Exception as exc:
         err_msg = (
             f"user={p['user_id'][:8]} track='{p['track_name']}' "
             f"{type(exc).__name__}: {exc}"
         )
         log.error(f"  ✗ DB WRITE FAILED  {err_msg}")
-        log.error(_tb.format_exc())
+        import traceback
+        log.error(traceback.format_exc())
         _recent_errors.append({
             "at": datetime.utcnow().isoformat(),
             "user_id": p["user_id"],
             "track": p["track_name"],
             "error": f"{type(exc).__name__}: {exc}",
-            "traceback": _tb.format_exc(),
+            "traceback": traceback.format_exc(),
         })
         if len(_recent_errors) > 20:
             _recent_errors.pop(0)
@@ -345,6 +285,222 @@ def handle_stop(body: dict, db: Session):
             db.rollback()
         except Exception:
             pass
+
+
+def _expire_pending_skips(db: Session):
+    """
+    Called at the start of every webhook event.
+    Pending skips older than SKIP_CONFIRM_SECS are discarded — they represent
+    session ends (user stopped listening), not genuine skips. Not penalized.
+    """
+    now = time.time()
+    expired = [
+        uid for uid, entry in _pending_skips.items()
+        if now - entry["wall_time"] > SKIP_CONFIRM_SECS
+    ]
+    for uid in expired:
+        entry = _pending_skips.pop(uid)
+        log.info(
+            f"  Session end (no next track within {SKIP_CONFIRM_SECS}s) — "
+            f"NOT penalizing  user={uid[:8]}  '{entry['p']['track_name']}'"
+        )
+
+
+def _finalize_progress_track(user_id: str, old_item_id: str, db: Session):
+    """
+    Called when a progress-only client switches to a new track.
+    Finalizes the previous track using max position reached.
+    """
+    key = f"{user_id}::{old_item_id}"
+    entry = _playback_progress.pop(key, None)
+    if not entry:
+        return
+
+    _wall, max_pos, runtime, p = entry
+    if runtime <= 0 or max_pos < MIN_POSITION_TICKS:
+        log.debug(f"  Progress finalize: skipping '{p['track_name']}' — insufficient data")
+        return
+
+    completion = min(1.0, max_pos / runtime)
+    is_skip = completion < SKIP_THRESHOLD
+
+    log.info(
+        f"Playback TRANSITION (progress-only)  user={user_id[:8]}  "
+        f"'{p['track_name']}'  max_pos={max_pos//10_000_000}s / {runtime//10_000_000}s "
+        f"= {completion:.0%}  → {'SKIP' if is_skip else 'PLAYED'}"
+    )
+    _write_event(db, p, completion, "progress_transition", is_skip)
+
+
+# ── Event handlers ────────────────────────────────────────────────────────────
+
+def handle_start(body: dict, db: Session):
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+
+    # Confirm any pending skip for this user — they started a new track,
+    # which proves the previous stop was a genuine skip not a session end.
+    if uid in _pending_skips:
+        entry = _pending_skips.pop(uid)
+        log.info(
+            f"  Skip CONFIRMED by next PlaybackStart  user={uid[:8]}  "
+            f"'{entry['p']['track_name']}'"
+        )
+        _write_event(db, entry["p"], entry["completion"], entry["method"], is_skip=True)
+
+    _playback_starts[key]   = (time.time(), p["runtime_ticks"], p["track_name"])
+    # Seed progress entry so Stop can fall back to progress_heartbeat path
+    _playback_progress[key] = (time.time(), 0, p["runtime_ticks"], p)
+    _active_item[uid]       = p["item_id"]
+
+    _prune(_playback_starts)
+    _prune(_playback_progress)
+    log.info(
+        f"Playback START  user={uid[:8]}  '{p['track_name']}'  "
+        f"runtime={p['runtime_ticks']//10_000_000}s"
+    )
+
+
+def handle_progress(body: dict, db: Session):
+    """
+    PlaybackProgress fires ~every 1-10s with actual PositionTicks.
+
+    For standard clients: updates the progress fallback used by Stop.
+    For progress-only clients (Manet): this IS the primary skip detection path.
+      When the ItemId changes for a user, the previous track is finalized.
+    """
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+    now = time.time()
+
+    # ── Progress-only client: track transition detection ──────────────────────
+    # If this user was previously playing a different item, finalize it now.
+    prev_item_id = _active_item.get(uid)
+    if prev_item_id and prev_item_id != p["item_id"]:
+        log.debug(f"  Track transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
+        _finalize_progress_track(uid, prev_item_id, db)
+
+    _active_item[uid] = p["item_id"]
+
+    # Update progress entry, tracking max position reached (seek-backward protection)
+    existing = _playback_progress.get(key)
+    current_max = existing[1] if existing else 0
+
+    # Only update max_pos if position is meaningful (filters pos=0 startup bursts)
+    new_max = max(current_max, p["position_ticks"]) if p["position_ticks"] >= MIN_POSITION_TICKS else current_max
+
+    _playback_progress[key] = (now, new_max, p["runtime_ticks"] or (existing[2] if existing else 0), p)
+    _prune(_playback_progress)
+
+    log.debug(
+        f"Progress: '{p['track_name']}'  "
+        f"{p['position_ticks']//10_000_000}s / {p['runtime_ticks']//10_000_000}s  "
+        f"max={new_max//10_000_000}s"
+    )
+
+
+def handle_stop(body: dict, db: Session):
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+    now = time.time()
+
+    # Dedup — Jellyfin fires Stop once per connected client session
+    if now - _recent_stops.get(key, 0) < DEDUP_WINDOW_SECONDS:
+        log.debug(f"Dedup: dropping duplicate stop  user={uid[:8]}  '{p['track_name']}'")
+        return
+    _recent_stops[key] = now
+    _prune(_recent_stops)
+
+    # Clear active item tracking
+    if _active_item.get(uid) == p["item_id"]:
+        del _active_item[uid]
+
+    # ── Determine completion ──────────────────────────────────────────────────
+
+    start_entry    = _playback_starts.pop(key, None)
+    progress_entry = _playback_progress.pop(key, None)
+
+    # Use runtime from Stop if present; fall back to what Start/Progress stored.
+    # Mobile clients often omit RunTimeTicks from Stop payloads.
+    runtime_ticks = (
+        p["runtime_ticks"]
+        or (start_entry[1] if start_entry else 0)
+        or (progress_entry[2] if progress_entry else 0)
+    )
+
+    if p["played_to_completion"]:
+        # Explicit completion flag — finalize immediately as PLAYED
+        completion = 1.0
+        method = "played_to_completion_flag"
+        is_skip = False
+        log.info(f"Playback STOP  user={uid[:8]}  '{p['track_name']}' — 100% (completion flag) → PLAYED")
+        _write_event(db, p, completion, method, is_skip)
+        return
+
+    if start_entry and runtime_ticks > 0:
+        start_wall, _rt, _ = start_entry
+        elapsed_ticks = (now - start_wall) * 10_000_000
+        completion = min(1.0, elapsed_ticks / runtime_ticks)
+        method = "server_timing"
+
+    elif progress_entry and runtime_ticks > 0:
+        _wall, max_pos, _rt, _ = progress_entry
+        # Use max_pos (peak position) for seek-backward protection
+        # Also add elapsed time since last heartbeat (song kept playing after it)
+        extra_ticks = (now - _wall) * 10_000_000
+        effective_pos = min(runtime_ticks, max_pos + extra_ticks)
+        completion = effective_pos / runtime_ticks
+        method = "progress_heartbeat"
+
+    else:
+        completion = 0.0
+        method = "ambiguous"
+
+    is_skip = (method != "ambiguous") and (completion < SKIP_THRESHOLD)
+
+    log.info(
+        f"Playback STOP  user={uid[:8]}  '{p['track_name']}'  "
+        f"{completion:.0%} via {method}  → {'pending skip confirmation' if is_skip else 'PLAYED'}"
+    )
+
+    if not is_skip or method == "ambiguous":
+        # Completed or ambiguous — finalize immediately
+        _write_event(db, p, completion, method, is_skip=False if method == "ambiguous" else is_skip)
+        return
+
+    # ── Pending skip confirmation ─────────────────────────────────────────────
+    # Don't record the skip yet. Wait for the next PlaybackStart to confirm it
+    # was a real skip and not a session end (user closing the app).
+    # handle_start() will confirm it; _expire_pending_skips() will discard it
+    # if no Start arrives within SKIP_CONFIRM_SECS.
+    _pending_skips[uid] = {
+        "p":          p,
+        "completion": completion,
+        "method":     method,
+        "wall_time":  now,
+    }
+    log.info(
+        f"  Skip PENDING confirmation  user={uid[:8]}  '{p['track_name']}'  "
+        f"{completion:.0%} — waiting {SKIP_CONFIRM_SECS}s for next PlaybackStart"
+    )
 
 
 # ── API endpoint ──────────────────────────────────────────────────────────────
@@ -399,7 +555,6 @@ async def debug_capture(request: Request):
         "NotificationType":      body.get("NotificationType"),
         "Name":                  body.get("Name"),
         "Artist":                body.get("Artist"),
-        # All the places Jellyfin might send a user ID
         "UserId_body":           body.get("UserId"),
         "UserId_session":        session.get("UserId"),
         "Username_session":      session.get("UserName") or session.get("Username"),
@@ -408,6 +563,9 @@ async def debug_capture(request: Request):
         "PlaybackPositionTicks": body.get("PlaybackPositionTicks"),
         "RunTimeTicks":          body.get("RunTimeTicks"),
         "PlayedToCompletion":    body.get("PlayedToCompletion"),
+        "IsAutomated":           body.get("IsAutomated"),
+        "ClientName":            body.get("ClientName") or body.get("Client"),
+        "DeviceName":            body.get("DeviceName"),
         "raw_text": raw.decode("utf-8", errors="replace")[:2000],
     }
     _debug_captures.append(capture)
@@ -436,18 +594,33 @@ def pending_starts():
     }
 
 
+@router.get("/pending-skips")
+def pending_skips_diagnostic():
+    """Show skips currently awaiting confirmation — for debugging."""
+    now = time.time()
+    return {
+        uid: {
+            "track_name": entry["p"]["track_name"],
+            "completion": f"{entry['completion']:.0%}",
+            "method": entry["method"],
+            "waiting_secs": round(now - entry["wall_time"], 1),
+            "expires_in_secs": round(SKIP_CONFIRM_SECS - (now - entry["wall_time"]), 1),
+        }
+        for uid, entry in _pending_skips.items()
+    }
+
+
 @router.get("/managed-users")
 def managed_users_diagnostic(db: Session = Depends(get_db)):
     """
-    Full webhook diagnostic — shows registered users AND what's actually in the DB.
-    This tells you immediately whether events are arriving and being recorded.
+    Full webhook diagnostic — shows registered users AND what's in the DB.
     """
     from models import PlaybackEvent, SkipPenalty
-    from sqlalchemy import func
+    from sqlalchemy import desc
 
     users = db.query(ManagedUser).all()
-
     result = []
+
     for u in users:
         uid = u.jellyfin_user_id
 
@@ -457,7 +630,6 @@ def managed_users_diagnostic(db: Session = Depends(get_db)):
             PlaybackEvent.completion_pct == "0.0"
         ).count()
 
-        # Most recent event
         last_event = (
             db.query(PlaybackEvent)
             .filter_by(user_id=uid)
@@ -465,46 +637,46 @@ def managed_users_diagnostic(db: Session = Depends(get_db)):
             .first()
         )
 
-        # Check in-memory state (what's currently tracked)
-        pending_starts = [k for k in _playback_starts if k.startswith(uid)]
-        pending_progress = [k for k in _playback_progress if k.startswith(uid)]
+        pending_start_keys   = [k for k in _playback_starts    if k.startswith(uid)]
+        pending_progress_keys = [k for k in _playback_progress if k.startswith(uid)]
+        pending_skip         = _pending_skips.get(uid)
+
+        if total_events == 0:
+            diagnosis = "No events in DB — webhook user_id mismatch or events not reaching server"
+        elif skip_events == 0 and total_events > 5:
+            diagnosis = f"{total_events} events but 0 skips — client may not send Start/Stop (progress-only client like Manet)"
+        else:
+            diagnosis = f"{total_events} events, {skip_events} skips ({100*skip_events//total_events if total_events else 0}%) — OK"
 
         result.append({
-            "username":           u.username,
-            "jellyfin_user_id":   uid,
-            "is_enabled":         u.is_enabled,
-            "db_total_events":    total_events,
-            "db_skip_events":     skip_events,
+            "username":            u.username,
+            "jellyfin_user_id":    uid,
+            "is_enabled":          u.is_enabled,
+            "db_total_events":     total_events,
+            "db_skip_events":      skip_events,
             "db_ambiguous_events": ambiguous,
             "db_completion_events": total_events - ambiguous,
-            "last_event_track":   last_event.track_name if last_event else None,
+            "last_event_track":    last_event.track_name if last_event else None,
             "last_event_was_skip": last_event.was_skip if last_event else None,
             "last_event_completion": last_event.completion_pct if last_event else None,
-            "last_event_at":      last_event.received_at.isoformat() if last_event else None,
-            "in_memory_pending_starts":   len(pending_starts),
-            "in_memory_pending_progress": len(pending_progress),
-            "diagnosis": (
-                "No events in DB — webhook user_id mismatch or events not reaching server"
-                if total_events == 0 else
-                f"{total_events} events, {skip_events} skips. "
-                f"{ambiguous} ambiguous (runtime missing in Stop — mobile client likely). "
-                "Skips may be under-counted before this fix."
-                if ambiguous > total_events * 0.3 and skip_events == 0 else
-                f"{total_events} events in DB, {skip_events} skips recorded — OK"
-            ),
+            "last_event_at":       last_event.received_at.isoformat() if last_event else None,
+            "in_memory_pending_starts":   len(pending_start_keys),
+            "in_memory_pending_progress": len(pending_progress_keys),
+            "in_memory_pending_skip":     bool(pending_skip),
+            "diagnosis": diagnosis,
         })
 
     return {
         "managed_users": result,
-        "in_memory_active_starts": len(_playback_starts),
-        "recent_db_errors": _recent_errors[-5:],   # last 5 errors with full traceback
+        "in_memory_active_starts":   len(_playback_starts),
+        "in_memory_pending_skips":   len(_pending_skips),
+        "recent_db_errors": _recent_errors[-5:],
         "hint": (
             "If db_total_events=0: webhook user_id not matching. "
-            "If db_total_events>0 but db_skip_events=0: PlaybackStart events missing — "
-            "check Jellyfin webhook config has PlaybackStart enabled. "
-            "If db_ambiguous_events is high: container may have restarted losing in-memory state. "
-            "Check recent_db_errors for exact failure reason."
-        )
+            "If db_skip_events=0 with many events: client is progress-only (Manet) — "
+            "skips detected via track transitions, not Stop events. "
+            "Use /pending-skips to see confirmations in flight."
+        ),
     }
 
 
@@ -522,10 +694,11 @@ def setup_guide(request: Request):
             "5. Notification Types: enable 'Playback Start', 'Playback Progress', AND 'Playback Stop'",
             "6. Item Type: Songs",
             "7. Send all fields — Save",
-            "NOTE: All three event types are required for accurate skip detection.",
-            "Start + Progress track position; Stop calculates how much was played.",
+            "NOTE: Progress-only clients (Manet on iOS) work without Start/Stop.",
+            "Skips are detected when the track changes in the progress stream.",
         ],
         "skip_threshold": f"{SKIP_THRESHOLD:.0%}",
+        "skip_confirm_window_secs": SKIP_CONFIRM_SECS,
     }
 
 
