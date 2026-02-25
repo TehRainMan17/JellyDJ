@@ -1,125 +1,154 @@
-Markdown
 # JellyDJ
 
-A self-hosted music recommendation engine for [Jellyfin](https://jellyfin.org).
+A self-hosted music recommendation engine for Jellyfin.
 
-JellyDJ analyses your Jellyfin play history, builds personalised taste profiles per user, generates smart playlists directly in Jellyfin, and surfaces new album recommendations that can be automatically sent to [Lidarr](https://lidarr.audio) for download.
+JellyDJ analyzes your Jellyfin play history, builds personalized taste
+profiles per user, generates smart playlists directly in Jellyfin, and
+surfaces new album recommendations that can optionally be sent to Lidarr
+for download.
 
----
+------------------------------------------------------------------------
 
-## What it does
+## Features
 
-* **Smart playlists** — "For You", "Discover Weekly", "Most Played", and "Recently Played" playlists regenerated on a schedule and written directly into Jellyfin.
-* **Skip-aware scoring** — Listens to Jellyfin playback webhooks; songs you skip stop appearing, songs you favorite get boosted.
-* **Discovery queue** — Finds new artists and missing albums based on your listening habits for review before downloading.
-* **Auto-download** — Optionally sends approved discovery items to Lidarr automatically on a configurable schedule.
-* **Insights** — Per-user listening statistics, top artists, genre breakdowns, and skip rate analysis.
+-   **Smart playlists** --- "For You", "Discover Weekly", and more
+    generated automatically
+-   **Skip-aware scoring** --- playback webhooks improve recommendation
+    accuracy
+-   **Discovery queue** --- find new artists and albums based on
+    listening habits
+-   **Auto-download** --- optionally send approved discoveries to Lidarr
+-   **Insights** --- listening stats, genre breakdowns, and user taste
+    profiles
 
----
+------------------------------------------------------------------------
 
-## Quick Start (Recommended)
+# Quick Start (Recommended)
 
-The fastest way to get JellyDJ running is to use the pre-built images from Docker Hub.
+The primary deployment method is using the **pre-built Docker images**
+with the included `docker-compose.yml`.
 
-### 1. Create a `docker-compose.yml`
-Create a new directory and save the following as `docker-compose.yml`:
+No building required.
 
-```yaml
+## 1. Clone the repository
+
+``` bash
+git clone https://github.com/YOUR_USERNAME/jellydj.git
+cd jellydj
+```
+
+## 2. Create your environment file
+
+``` bash
+cp .env.example .env
+```
+
+Generate a secret key:
+
+``` bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Add it to `.env`:
+
+    SECRET_KEY=your_generated_key_here
+
+Optional settings:
+
+    JELLYDJ_PORT=7879
+    TZ=UTC
+
+Everything else can be configured in the web UI after launch.
+
+------------------------------------------------------------------------
+
+## 3. Start JellyDJ
+
+``` bash
+docker compose up -d
+```
+
+Docker will automatically pull the latest JellyDJ images.
+
+Startup usually takes **30--90 seconds**.
+
+------------------------------------------------------------------------
+
+## 4. Open the Web UI
+
+Open:
+
+    http://localhost:7879
+
+Then complete setup in the **Connections** page.
+
+------------------------------------------------------------------------
+
+# Docker Compose (Sanitized Reference)
+
+``` yaml
 version: "3.9"
 
 services:
   backend:
-    image: 562ray/jellydj-backend:latest
-    container_name: jellydj-backend
+    image: yourdockerhub/jellydj-backend:latest
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - SECRET_KEY=change-me-generate-a-real-secret
-      - TZ=UTC
       - DATABASE_URL=sqlite:////config/jellydj.db
+      - TZ=${TZ:-UTC}
     volumes:
-      - ./jellydj-config:/config
+      - jellydj-config:/config
     networks:
-      - jellydj-net
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+      - jellydj
 
   frontend:
-    image: 562ray/jellydj-frontend:latest
-    container_name: jellydj-frontend
+    image: yourdockerhub/jellydj-frontend:latest
     restart: unless-stopped
     ports:
-      - "7879:3000"
+      - "${JELLYDJ_PORT:-7879}:3000"
     depends_on:
-      backend:
-        condition: service_healthy
+      - backend
     networks:
-      - jellydj-net
+      - jellydj
 
 volumes:
   jellydj-config:
-    name: jellydj-config
 
 networks:
-  jellydj-net:
-    name: jellydj-net
-    driver: bridge
-2. Start JellyDJ
-Run the following command in your terminal:
+  jellydj:
+```
 
-Bash
+------------------------------------------------------------------------
+
+# Updating
+
+``` bash
+docker compose pull
 docker compose up -d
-3. Open the UI
-Navigate to http://localhost:7879 and follow the setup steps in the Connections page.
+```
 
-Advanced: Build from Source
-Use this method if you want to modify the code or contribute to the project.
+Your data is stored in the Docker volume and will persist.
 
-1. Clone the repository
-Bash
-git clone [https://github.com/YOUR_USERNAME/jellydj.git](https://github.com/YOUR_USERNAME/jellydj.git)
-cd jellydj
-2. Create your .env file
-Bash
-cp .env.example .env
-Generate a SECRET_KEY and add it to your .env:
+------------------------------------------------------------------------
 
-Bash
-python -c "import secrets; print(secrets.token_hex(32))"
-3. Build and Start
-Building locally will use the source code in the /backend and /frontend directories:
+# Troubleshooting
 
-Bash
-docker compose up -d --build
-Configuration
-Connecting to Jellyfin
-Open the Connections page in JellyDJ.
+### View logs
 
-Enter your Jellyfin URL and an API key.
+``` bash
+docker compose logs -f
+```
 
-Click Test — JellyDJ needs read access to your library and write access to create playlists.
+### Reset all data
 
-Setting up webhooks (enables skip detection)
-Install the Webhook plugin in Jellyfin (Dashboard → Plugins → Catalogue).
+``` bash
+docker compose down -v
+```
 
-Create a new webhook pointing to http://jellydj-backend:8000/api/webhooks/jellyfin.
+------------------------------------------------------------------------
 
-Enable: PlaybackStart, PlaybackProgress, and PlaybackStop.
+# License
 
-External APIs (Optional)
-Adding Last.fm or Spotify keys in the UI significantly improves discovery quality by providing artist similarity and popularity scores.
-
-Troubleshooting
-Page won't load: Wait 30 seconds for the backend health check to pass.
-
-Port in use: Change the host port in your docker-compose.yml (e.g., 8080:3000).
-
-Empty Discovery: Run "Index Now" first to build your taste profile.
-
-Logs: Run docker compose logs -f to see detailed error messages.
-
-License
 GNU Affero General Public License v3.0 (AGPL-3.0)
