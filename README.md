@@ -1,26 +1,30 @@
-JellyDJ
-A self-hosted music recommendation engine for Jellyfin.
+Markdown
+# JellyDJ
 
-JellyDJ analyses your Jellyfin play history, builds personalised taste profiles per user, generates smart playlists directly in Jellyfin, and surfaces new album recommendations that can be automatically sent to Lidarr for download.
+A self-hosted music recommendation engine for [Jellyfin](https://jellyfin.org).
 
-What it does
-Smart playlists — "For You", "Discover Weekly", "Most Played", and "Recently Played" playlists regenerated on a schedule and written directly into Jellyfin.
+JellyDJ analyses your Jellyfin play history, builds personalised taste profiles per user, generates smart playlists directly in Jellyfin, and surfaces new album recommendations that can be automatically sent to [Lidarr](https://lidarr.audio) for download.
 
-Skip-aware scoring — Listens to Jellyfin playback webhooks; songs you skip stop appearing, songs you favorite get boosted.
+---
 
-Discovery queue — Finds new artists and missing albums based on your listening habits for review before downloading.
+## What it does
 
-Auto-download — Optionally sends approved discovery items to Lidarr automatically on a configurable schedule.
+* **Smart playlists** — "For You", "Discover Weekly", "Most Played", and "Recently Played" playlists regenerated on a schedule and written directly into Jellyfin.
+* **Skip-aware scoring** — Listens to Jellyfin playback webhooks; songs you skip stop appearing, songs you favorite get boosted.
+* **Discovery queue** — Finds new artists and missing albums based on your listening habits for review before downloading.
+* **Auto-download** — Optionally sends approved discovery items to Lidarr automatically on a configurable schedule.
+* **Insights** — Per-user listening statistics, top artists, genre breakdowns, and skip rate analysis.
 
-Insights — Per-user listening statistics, top artists, genre breakdowns, and skip rate analysis.
+---
 
-Quick Start (Recommended)
+## Quick Start (Recommended)
+
 The fastest way to get JellyDJ running is to use the pre-built images from Docker Hub.
 
-1. Create a docker-compose.yml
-Create a new directory and save the following as docker-compose.yml:
+### 1. Create a `docker-compose.yml`
+Create a new directory and save the following as `docker-compose.yml`:
 
-YAML
+```yaml
 version: "3.9"
 
 services:
@@ -76,7 +80,7 @@ Use this method if you want to modify the code or contribute to the project.
 
 1. Clone the repository
 Bash
-git clone https://github.com/YOUR_USERNAME/jellydj.git
+git clone [https://github.com/YOUR_USERNAME/jellydj.git](https://github.com/YOUR_USERNAME/jellydj.git)
 cd jellydj
 2. Create your .env file
 Bash
@@ -86,7 +90,7 @@ Generate a SECRET_KEY and add it to your .env:
 Bash
 python -c "import secrets; print(secrets.token_hex(32))"
 3. Build and Start
-This will build the local containers from the /backend and /frontend directories:
+Building locally will use the source code in the /backend and /frontend directories:
 
 Bash
 docker compose up -d --build
@@ -111,11 +115,11 @@ Adding Last.fm or Spotify keys in the UI significantly improves discovery qualit
 Troubleshooting
 Page won't load: Wait 30 seconds for the backend health check to pass.
 
-Port in use: Change JELLYDJ_PORT in your .env or the host port in your docker-compose.yml.
+Port in use: Change the host port in your docker-compose.yml (e.g., 8080:3000).
 
 Empty Discovery: Run "Index Now" first to build your taste profile.
 
-Logs: Run docker compose logs -f to see what's happening under the hood.
+Logs: Run docker compose logs -f to see detailed error messages.
 
 License
 GNU Affero General Public License v3.0 (AGPL-3.0)
