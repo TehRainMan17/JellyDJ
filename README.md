@@ -91,7 +91,7 @@ version: "3.9"
 
 services:
   backend:
-    image: yourdockerhub/jellydj-backend:latest
+    image: 562ray/jellydj-backend:latest
     restart: unless-stopped
     env_file:
       - .env
@@ -104,7 +104,7 @@ services:
       - jellydj
 
   frontend:
-    image: yourdockerhub/jellydj-frontend:latest
+    image: 562ray/jellydj-frontend:latest
     restart: unless-stopped
     ports:
       - "${JELLYDJ_PORT:-7879}:3000"
