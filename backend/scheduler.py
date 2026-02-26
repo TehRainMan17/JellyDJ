@@ -170,11 +170,23 @@ def reschedule_automation_jobs(db):
 
     # Discovery refresh — can be fully disabled
     if s.discovery_refresh_enabled:
+        from datetime import timedelta as _td
+        _disc_interval = _td(hours=s.discovery_refresh_interval_hours)
+        _disc_last     = getattr(s, "last_discovery_refresh", None)
+        _now           = datetime.now(timezone.utc)
+        if _disc_last is None:
+            _disc_next = _now + _disc_interval
+        else:
+            if _disc_last.tzinfo is None:
+                _disc_last = _disc_last.replace(tzinfo=timezone.utc)
+            _disc_next = _disc_last + _disc_interval
+            if _disc_next < _now:
+                _disc_next = _now + _td(minutes=2)
         scheduler.reschedule_job(
             DISCOVERY_JOB_ID,
             trigger=IntervalTrigger(
                 hours=s.discovery_refresh_interval_hours,
-                start_date=datetime.now(timezone.utc),
+                start_date=_disc_next,
             ),
         )
         try:
@@ -189,11 +201,23 @@ def reschedule_automation_jobs(db):
 
     # Playlist regen — can be fully disabled
     if s.playlist_regen_enabled:
+        from datetime import timedelta as _td
+        _pl_interval = _td(hours=s.playlist_regen_interval_hours)
+        _pl_last     = getattr(s, "last_playlist_regen", None)
+        _now         = datetime.now(timezone.utc)
+        if _pl_last is None:
+            _pl_next = _now + _pl_interval
+        else:
+            if _pl_last.tzinfo is None:
+                _pl_last = _pl_last.replace(tzinfo=timezone.utc)
+            _pl_next = _pl_last + _pl_interval
+            if _pl_next < _now:
+                _pl_next = _now + _td(minutes=3)
         scheduler.reschedule_job(
             PLAYLIST_JOB_ID,
             trigger=IntervalTrigger(
                 hours=s.playlist_regen_interval_hours,
-                start_date=datetime.now(timezone.utc),
+                start_date=_pl_next,
             ),
         )
         try:
@@ -207,24 +231,42 @@ def reschedule_automation_jobs(db):
             pass
 
     # Auto-download — disabled by default; interval = cooldown_days
-    # The job itself also enforces the cooldown internally as a safety net
+    # The job itself also enforces the cooldown internally as a safety net.
     auto_dl_enabled = getattr(s, "auto_download_enabled", False)
     cooldown_days   = getattr(s, "auto_download_cooldown_days", 7) or 1
     if auto_dl_enabled:
         from datetime import timedelta as _td
+        interval = _td(days=cooldown_days)
+        now      = datetime.now(timezone.utc)
+        last_run = getattr(s, "last_auto_download", None)
+
+        if last_run is None:
+            # Never run — schedule one interval from now so it doesn't fire immediately
+            next_run = now + interval
+        else:
+            # Base next run on last_run + interval, not on now + interval.
+            # This way container restarts and settings saves don't reset the clock —
+            # if the job ran 3 days ago with a 7-day cooldown it stays due in 4 days,
+            # not pushed back to 7 days from now.
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+            next_run = last_run + interval
+            # If overdue (next_run in the past), run shortly after startup
+            if next_run < now:
+                next_run = now + _td(minutes=5)
+
         scheduler.reschedule_job(
             AUTO_DOWNLOAD_JOB_ID,
-            trigger=IntervalTrigger(
-                days=cooldown_days,
-                # Start one full interval from now so the job never fires
-                # immediately on container startup or settings save.
-                start_date=datetime.now(timezone.utc) + _td(days=cooldown_days),
-            ),
+            trigger=IntervalTrigger(days=cooldown_days, start_date=next_run),
         )
         try:
             scheduler.resume_job(AUTO_DOWNLOAD_JOB_ID)
         except Exception:
             pass
+        log.info(
+            f"Auto-download scheduled: every {cooldown_days}d, "
+            f"next run {next_run.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
     else:
         try:
             scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)

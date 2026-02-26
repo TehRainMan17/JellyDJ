@@ -246,7 +246,11 @@ def recommend_library_tracks(
         recency_inv = _recency_score(t.last_played)
 
         # ── Novelty ───────────────────────────────────────────────────────
-        novelty = 1.0 if (t.play_count == 0) else 0.0
+        # Gradual decay rather than binary — a track played once or twice
+        # still gets meaningful novelty credit. Fully decays at 10+ plays.
+        # This prevents played-once tracks from immediately competing on
+        # pure affinity (which re-anchors to familiar artists).
+        novelty = max(0.0, 1.0 - (t.play_count or 0) / 10.0)
 
         # ── Weighted sum ──────────────────────────────────────────────────
         score = (
@@ -313,6 +317,25 @@ def recommend_library_tracks(
 
     # Combine: top first (stable), then jittered mid, then low as fallback
     combined = top_tier + mid_tier + low_tier
+
+    # ── Per-artist cap for discover playlist ─────────────────────────────────
+    # Prevents the feedback loop where high-affinity artists (Adele, Cher)
+    # dominate every generated playlist just because they have the most tracks.
+    # Cap: max 3 tracks per artist in a discover playlist, 5 for for_you/favourites.
+    if playlist_type in ("discover", "popular"):
+        per_artist_cap = 3
+    else:
+        per_artist_cap = 5
+
+    artist_counts: dict[str, int] = {}
+    capped: list[TrackResult] = []
+    for r in combined:
+        key = r.artist_name.lower()
+        if artist_counts.get(key, 0) < per_artist_cap:
+            capped.append(r)
+            artist_counts[key] = artist_counts.get(key, 0) + 1
+    combined = capped
+
     return combined[:limit]
 
 
@@ -387,22 +410,38 @@ def recommend_new_albums(
         for r in top_artists_rows
     }
 
-    # ── Weighted-random seed selection from top 30 ────────────────────────────
-    # Affinity-weighted sampling means top artists appear often but not always.
-    # This is the key change vs. always seeding from rank 1–5.
-    seed_weights = [float(r.affinity_score) ** 0.6 for r in top_artists_rows]  # soften dominance
-    total_w = sum(seed_weights) or 1.0
-    seed_probs = [w / total_w for w in seed_weights]
-    n_seeds = min(len(top_artists_rows), 15)
-    chosen_indices = list(np.random.choice(
-        len(top_artists_rows), size=n_seeds, replace=False, p=seed_probs
-    ))
-    # Always include at least 3 top-5 artists so quality stays high
-    for i in range(min(3, len(top_artists_rows))):
-        if i not in chosen_indices:
-            chosen_indices[-(i+1)] = i
-    seed_rows = [top_artists_rows[i] for i in sorted(set(chosen_indices))]
-    log.info(f"  Discovery seeds ({len(seed_rows)}): {[r.artist_name for r in seed_rows[:5]]}...")
+    # ── Structured seed selection — break top-artist dominance ───────────────
+    # Pure affinity-weighted sampling always picks Adele/Cher as seeds, which
+    # means PATH B candidates are always "similar to Adele/Cher". Instead,
+    # divide seeds into three tiers with guaranteed minimum slots per tier.
+    #
+    #   Tier 1 (rank 1-5):   max 4 seeds  — your absolute favorites, always present
+    #   Tier 2 (rank 6-15):  min 6 seeds  — mid-range artists, generate variety
+    #   Tier 3 (rank 16-30): min 4 seeds  — long-tail artists, unexpected finds
+    #
+    tier1 = top_artists_rows[:5]
+    tier2 = top_artists_rows[5:15]
+    tier3 = top_artists_rows[15:30]
+
+    def _weighted_sample(rows, n):
+        if not rows: return []
+        n = min(n, len(rows))
+        weights = [float(r.affinity_score) ** 0.5 for r in rows]
+        total = sum(weights) or 1.0
+        probs = [w / total for w in weights]
+        indices = list(np.random.choice(len(rows), size=n, replace=False, p=probs))
+        return [rows[i] for i in indices]
+
+    seed_rows = (
+        _weighted_sample(tier1, min(4, len(tier1))) +
+        _weighted_sample(tier2, min(6, len(tier2))) +
+        _weighted_sample(tier3, min(4, len(tier3)))
+    )
+    # Deduplicate (weighted_sample per tier, no overlap possible, but guard anyway)
+    seen_seeds = set()
+    seed_rows = [r for r in seed_rows if not (r.artist_name in seen_seeds or seen_seeds.add(r.artist_name))]
+
+    log.info(f"  Discovery seeds ({len(seed_rows)}): {[r.artist_name for r in seed_rows[:6]]}...")
 
     # ── Build known library sets ─────────────────────────────────────────────
     from models import LibraryTrack
@@ -439,23 +478,29 @@ def recommend_new_albums(
         if row.track_name and row.artist_name:
             known_track_names.add(f"{row.artist_name.lower()}::{row.track_name.lower()}")
 
-    # ── Already-queued with 45-day artist suppression ────────────────────────
-    # Albums deduped for all time; artists suppressed for 45 days to avoid
-    # recommending the same artist every single refresh.
+    # ── Already-queued suppression ────────────────────────────────────────────
+    # Albums: deduplicated for all time (never re-recommend the same album)
+    # Artists: suppressed for 90 days after any queue appearance
+    # Rejected artists: suppressed for 180 days — user explicitly said no
     from datetime import timedelta
-    cutoff_45d = datetime.utcnow() - timedelta(days=45)
+    cutoff_90d  = datetime.utcnow() - timedelta(days=90)
+    cutoff_180d = datetime.utcnow() - timedelta(days=180)
 
     queued: set[str] = set()
     recently_queued_artists: set[str] = set()
+    rejected_artists: set[str] = set()
 
     for row in db.query(
         DiscoveryQueueItem.artist_name,
         DiscoveryQueueItem.album_name,
         DiscoveryQueueItem.added_at,
+        DiscoveryQueueItem.status,
     ).filter_by(user_id=user_id).all():
         key = f"{row.artist_name.lower()}::{(row.album_name or '').lower()}"
         queued.add(key)
-        if row.added_at and row.added_at >= cutoff_45d:
+        if row.status == "rejected" and row.added_at and row.added_at >= cutoff_180d:
+            rejected_artists.add(row.artist_name.lower())
+        elif row.added_at and row.added_at >= cutoff_90d:
             recently_queued_artists.add(row.artist_name.lower())
 
     # ── Collect user's top genres for wildcard adjacency ─────────────────────
@@ -483,9 +528,12 @@ def recommend_new_albums(
         if dedup in seen or dedup in queued:
             return
 
-        # Suppress artists queued recently (45-day window)
+        # Suppress artists queued recently (90-day window) or rejected (180-day)
+        if artist.lower() in rejected_artists:
+            log.debug(f"  Suppressing '{artist}' — rejected within last 180 days")
+            return
         if artist.lower() in recently_queued_artists:
-            log.debug(f"  Suppressing '{artist}' — queued within last 45 days")
+            log.debug(f"  Suppressing '{artist}' — queued within last 90 days")
             return
 
         if album:
@@ -504,22 +552,29 @@ def recommend_new_albums(
         seen.add(dedup)
 
         # ── Scoring ───────────────────────────────────────────────────────────
-        #   40% source_affinity  — how much user loves the seed artist
-        #   35% lastfm_listeners — global fame / reach
-        #   25% album pop_score  — popularity of this specific album
+        # For discovery, POPULARITY leads — we want to surface music the world
+        # loves, not just music adjacent to what you already love.
+        #
+        #   50% lastfm_listeners  — global reach / how many people actually listen
+        #   30% pop_score         — album/artist-level popularity signal
+        #   20% source_affinity   — tiebreaker: prefer recs from artists you love
+        #
+        # Previously this was 40/25/35 (affinity-led), which caused familiar
+        # artist similarities to always outrank genuinely popular new artists.
         blended = (
-            (source_affinity * 0.40) +
-            (lastfm_listeners * 0.35) +
-            (pop_score * 0.25)
+            (lastfm_listeners * 0.50) +
+            (pop_score        * 0.30) +
+            (source_affinity  * 0.20)
         )
 
-        # "New but popular" boost: artist not in library at all + high listeners
-        # Surfaces rising/established artists the user simply hasn't found yet
+        # "New but popular" boost: artist not in library at all + high listeners.
+        # Boosted by 15pts (was 8) so genuinely popular unknowns can compete with
+        # mid-tier similarity results.
         never_heard = artist.lower() not in known_artists
         if never_heard and lastfm_listeners >= 60:
-            blended = min(100.0, blended + 8.0)
+            blended = min(100.0, blended + 15.0)
 
-        # Wildcard bonus: small boost so adjacent-genre picks aren't buried
+        # Wildcard bonus: pure popularity ranking, no affinity component
         if is_wildcard:
             blended = min(100.0, blended + 5.0)
 
@@ -660,7 +715,83 @@ def recommend_new_albums(
                 rec_type="new_artist",
             )
 
-    # ── PATH C: Wildcard — genre-adjacent artists (~20% of target) ───────────
+    # ── PATH D: Globally popular — no seed required ───────────────────────────
+    # Pull the most-listened-to artists from the full popularity cache regardless
+    # of similarity to any seed. This is the "what's huge right now that I haven't
+    # heard" path. It breaks the similarity-chain feedback loop entirely.
+    # Target: 25% of the final output comes from this path.
+    path_d_target = max(3, limit // 4)
+    path_d_added = 0
+
+    try:
+        from models import PopularityCache as PC
+        # Fetch all artist cache entries, sort by listener_count descending
+        all_artist_cache = (
+            db.query(PC)
+            .filter(PC.cache_key.like("artist:%"))
+            .all()
+        )
+        # Parse and sort by raw listener count
+        scored_global = []
+        for row in all_artist_cache:
+            try:
+                pd = json.loads(row.payload)
+                raw_listeners = float(pd.get("listener_count", 0))
+                if raw_listeners < 500_000:   # filter micro-artists
+                    continue
+                artist_name_g = pd.get("name") or row.cache_key.replace("artist:", "")
+                if not artist_name_g:
+                    continue
+                if artist_name_g.lower() in known_artists:
+                    continue
+                if artist_name_g.lower() in recently_queued_artists:
+                    continue
+                if artist_name_g.lower() in rejected_artists:
+                    continue
+                listeners_score = min(100.0, (math.log1p(raw_listeners) / math.log1p(10_000_000)) * 100)
+                pop_score_g = float(pd.get("popularity_score", 40))
+                scored_global.append((artist_name_g, listeners_score, pop_score_g, pd))
+            except Exception:
+                continue
+
+        scored_global.sort(key=lambda x: x[1], reverse=True)
+
+        for artist_name_g, listeners_score, pop_score_g, pd in scored_global:
+            if path_d_added >= path_d_target:
+                break
+
+            tags = pd.get("tags", [])
+            image_url_g = pd.get("image_url")
+            album_name_g, release_year_g, album_image_g = _get_top_album_from_cache(artist_name_g, db)
+            use_image_g = album_image_g or image_url_g
+            genre_hint_g = f" ({', '.join(tags[:2])})" if tags else ""
+
+            why_g = (
+                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score. "
+                f"{'Album: ' + album_name_g + '. ' if album_name_g else ''}"
+                f"Not yet in your library."
+            )
+
+            before = len(candidates)
+            _add_candidate(
+                artist=artist_name_g,
+                album=album_name_g,
+                release_year=release_year_g,
+                pop_score=pop_score_g,
+                image_url=use_image_g,
+                source_artist="global_popular",
+                source_affinity=0.0,    # no affinity component — pure popularity
+                lastfm_listeners=listeners_score,
+                why=why_g,
+                rec_type="new_artist",
+            )
+            if len(candidates) > before:
+                path_d_added += 1
+
+    except Exception as e:
+        log.warning(f"  PATH D (global popular) failed: {e}")
+
+    log.info(f"  PATH D: {path_d_added} globally popular artists added")
     # Find artists that share tags with your top genres but aren't similar to
     # any of your known artists. This is the "one genre step out" expansion.
     # We scan the popularity cache for artists tagged with adjacent genres.
