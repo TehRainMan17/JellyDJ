@@ -354,6 +354,16 @@ def handle_start(body: dict, db: Session):
         )
         _write_event(db, entry["p"], entry["completion"], entry["method"], is_skip=True)
 
+    # If user was playing a different track, finalize it now.
+    # This handles progress-only clients (Manet) where PlaybackStart fires
+    # for the new track before any Progress event does — without this,
+    # _active_item gets updated here and the Progress transition check never
+    # fires because prev_item_id already equals the new item_id.
+    prev_item_id = _active_item.get(uid)
+    if prev_item_id and prev_item_id != p["item_id"]:
+        log.debug(f"  Start-triggered transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
+        _finalize_progress_track(uid, prev_item_id, db)
+
     _playback_starts[key]   = (time.time(), p["runtime_ticks"], p["track_name"])
     # Seed progress entry so Stop can fall back to progress_heartbeat path
     _playback_progress[key] = (time.time(), 0, p["runtime_ticks"], p)
