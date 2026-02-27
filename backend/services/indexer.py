@@ -509,106 +509,355 @@ async def run_full_index():
         lock.release()  # always release so the next run can proceed
 
 
-async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 10):
-    """
-    Pre-warm the popularity cache for the user's top artists after indexing.
-    Only warms stale entries — skips artists whose cache is still fresh.
+# ── Global cache refresh state (for progress polling) ─────────────────────────
+_cache_refresh_state: dict = {
+    "running": False,
+    "phase": "",
+    "done": 0,
+    "total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
 
-    Uses Last.fm only (not MusicBrainz) because:
-    - MusicBrainz has no play counts or real popularity data
-    - musicbrainzngs makes blocking HTTPS calls with no socket timeout; SSL
-      errors cause each call to hang for the full ADAPTER_TIMEOUT_SECS (12s),
-      making 20-artist warm-ups take minutes when MusicBrainz is having issues.
-    - Last.fm provides everything needed for recommendations (similar artists,
-      tags, top albums) and is already the primary popularity source.
+def get_cache_refresh_state() -> dict:
+    return dict(_cache_refresh_state)
 
-    top_n reduced from 20 to 10: the top 10 artists account for the vast
-    majority of recommendations; warming 20 doubles the I/O for diminishing gain.
+def _set_cache_state(**kwargs):
+    _cache_refresh_state.update(kwargs)
+
+
+async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):
     """
-    import asyncio
+    Shim kept for call-site compatibility.
+    Fires the full library cache refresh as a non-blocking background thread.
+    Returns immediately — index continues, dashboard stays responsive.
+    """
+    if _cache_refresh_state.get("running"):
+        log.info("  Cache refresh already running — skipping duplicate trigger")
+        return
+    # Fire and forget — don't await, don't block
+    import threading
+    t = threading.Thread(
+        target=_run_cache_refresh_sync,
+        args=(db,),
+        daemon=True,
+        name="popularity-cache-refresh",
+    )
+    t.start()
+    log.info("  Cache refresh started in background thread — index continuing immediately")
+
+
+async def refresh_library_popularity_cache(db: Session):
+    """
+    Async entry point for the manual trigger endpoint.
+    Fires the refresh in a background thread and returns immediately.
+    """
+    if _cache_refresh_state.get("running"):
+        log.info("  Cache refresh already running")
+        return
+    import threading
+    t = threading.Thread(
+        target=_run_cache_refresh_sync,
+        args=(db,),
+        daemon=True,
+        name="popularity-cache-refresh",
+    )
+    t.start()
+
+
+def _run_cache_refresh_sync(caller_db: Session):
+    """
+    Blocking cache refresh — runs entirely in its own daemon thread.
+    Opens its own DB session; never touches the caller's session.
+
+    Design decisions:
+    - 5 concurrent workers with a shared token-bucket rate limiter
+      → 5× throughput while staying under Last.fm's 5 req/s limit
+    - _cache_artist_discography replaced by direct REST call (1 API call,
+      not the 32 that pylast lazy-evaluation makes per artist)
+    - Pass 2 capped at top 5 similar per library artist, deduplicated
+      → bounds the total to ~1,000-2,000 similar artists max
+    - Progress state written to _cache_refresh_state for UI polling
+    """
+    import math
+    import time
+    import threading
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime, timedelta
-    from models import UserTasteProfile, PopularityCache
-    from services.popularity import get_aggregator
+    from models import LibraryTrack, PopularityCache
 
-    top = (
-        db.query(UserTasteProfile)
-        .filter_by(user_id=user_id)
-        .filter(UserTasteProfile.artist_name.isnot(None))
-        .order_by(UserTasteProfile.affinity_score.desc())
-        .limit(top_n)
-        .all()
+    _set_cache_state(
+        running=True,
+        phase="Starting",
+        done=0,
+        total=0,
+        started_at=datetime.utcnow().isoformat(),
+        finished_at=None,
+        error=None,
     )
 
-    if not top:
-        log.info(f"  No taste profile yet for {user_id} — skipping cache warm-up")
-        return
+    thread_db = SessionLocal()
+    try:
+        from services.popularity import get_aggregator
+        agg = get_aggregator(thread_db)
+        lfm = agg.adapters.get("lastfm")
+        if not lfm or not lfm.is_configured():
+            _set_cache_state(running=False, phase="Skipped — Last.fm not configured", error="No Last.fm API key")
+            return
 
-    aggregator = get_aggregator(db)
-    # Only use Last.fm — explicitly exclude MusicBrainz to avoid SSL-hang slowdowns.
-    # If Last.fm isn't configured, skip entirely.
-    lastfm_adapter = aggregator.adapters.get("lastfm")
-    if not lastfm_adapter or not lastfm_adapter.is_configured():
-        log.info("  Last.fm not configured — skipping cache warm-up")
-        return
+        api_key = lfm._api_key
 
-    # Only warm artists whose cache is actually stale (>20h old or missing).
-    # This way a second index run in the same day is nearly instant.
-    stale_cutoff = datetime.utcnow() - timedelta(hours=20)
-    top_artist_names = []
-    for row in top:
-        artist = row.artist_name
-        cache_key = f"artist:{artist.lower()}"
-        existing = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
-        if existing and existing.updated_at and existing.updated_at > stale_cutoff:
-            log.debug(f"    Cache fresh, skipping: {artist}")
-            continue
-        top_artist_names.append(artist)
+        # ── Rate limiter: 4.5 req/s across all workers ───────────────────────
+        # Token bucket: refill 4.5 tokens/sec, max burst of 5
+        _rate_lock = threading.Lock()
+        _tokens = [4.5]
+        _last_refill = [time.monotonic()]
 
-    if not top_artist_names:
-        log.info(f"  Popularity cache already warm — skipping warm-up")
-        return
+        def _rate_wait():
+            while True:
+                with _rate_lock:
+                    now = time.monotonic()
+                    elapsed = now - _last_refill[0]
+                    _tokens[0] = min(5.0, _tokens[0] + elapsed * 4.5)
+                    _last_refill[0] = now
+                    if _tokens[0] >= 1.0:
+                        _tokens[0] -= 1.0
+                        return
+                time.sleep(0.05)
 
-    log.info(f"  Warming popularity cache for {len(top_artist_names)} stale artists (Last.fm only)")
+        # ── Direct Last.fm REST helper (bypasses pylast lazy evaluation) ─────
+        LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 
-    loop = asyncio.get_event_loop()
+        def _lastfm_get(method: str, params: dict) -> dict:
+            _rate_wait()
+            try:
+                r = requests.get(
+                    LASTFM_BASE,
+                    params={"method": method, "api_key": api_key, "format": "json", **params},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                pass
+            return {}
 
-    def _do_warmup():
-        """Blocking Last.fm calls in a thread pool with its own DB session."""
-        thread_db = SessionLocal()
-        try:
-            thread_aggregator = get_aggregator(thread_db)
-            # Only call Last.fm — bypass MusicBrainz entirely
-            lastfm = thread_aggregator.adapters.get("lastfm")
-            if not lastfm or not lastfm.is_configured():
-                return
-            for artist in top_artist_names:
+        def _fetch_artist(artist: str) -> dict | None:
+            """Fetch artist info + similar + top albums in 3 REST calls."""
+            # Call 1: artist.getInfo
+            data = _lastfm_get("artist.getInfo", {"artist": artist, "autocorrect": 1})
+            artist_data = data.get("artist", {})
+            if not artist_data:
+                return None
+
+            stats = artist_data.get("stats", {})
+            listeners = int(stats.get("listeners", 0) or 0)
+            pop_score = (
+                min(100.0, (math.log1p(listeners) / math.log1p(10_000_000)) * 100)
+                if listeners > 0 else 0.0
+            )
+            tags = [t["name"] for t in (artist_data.get("tags") or {}).get("tag", [])[:10]]
+            similar_raw = artist_data.get("similar", {}).get("artist", [])
+            similar = [s["name"] for s in similar_raw[:15]]
+            image_url = next(
+                (img["#text"] for img in reversed(artist_data.get("image", []))
+                 if img.get("#text")),
+                None,
+            )
+            canonical_name = artist_data.get("name", artist)
+
+            # Call 2: artist.getTopAlbums (replaces _cache_artist_discography's 32 calls)
+            alb_data = _lastfm_get("artist.getTopAlbums", {"artist": artist, "autocorrect": 1, "limit": 10})
+            albums = []
+            for alb in (alb_data.get("topalbums", {}).get("album", []) or []):
+                name = alb.get("name", "")
+                if not name or name.lower() in ("(null)", ""):
+                    continue
+                pc = int(alb.get("playcount", 0) or 0)
+                score = min(100.0, (math.log1p(pc) / math.log1p(5_000_000)) * 100)
+                img = next(
+                    (i["#text"] for i in reversed(alb.get("image", []))
+                     if i.get("#text")), None
+                )
+                albums.append({
+                    "name": name,
+                    "popularity_score": round(score, 1),
+                    "release_year": None,
+                    "image_url": img,
+                })
+            top_album = albums[0] if albums else None
+
+            # Call 3: artist.getSimilar (more complete than getInfo's similar field)
+            sim_data = _lastfm_get("artist.getSimilar", {"artist": artist, "autocorrect": 1, "limit": 20})
+            similar_full = [
+                s["name"]
+                for s in (sim_data.get("similarartists", {}).get("artist", []) or [])[:20]
+            ]
+            if similar_full:
+                similar = similar_full
+
+            return {
+                "name": canonical_name,
+                "popularity_score": round(pop_score, 1),
+                "listener_count": listeners,
+                "tags": tags,
+                "similar_artists": similar,
+                "image_url": image_url,
+                "albums": albums,
+                "top_album": top_album,
+            }
+
+        def _cache_artist_result(result: dict, artist: str):
+            """Write all fetched data to the DB cache."""
+            agg._cache_set(thread_db, f"artist:{artist.lower()}", {
+                "name": result["name"],
+                "tags": result["tags"],
+                "similar_artists": result["similar_artists"],
+                "image_url": result["image_url"],
+                "popularity_score": result["popularity_score"],
+                "listener_count": result["listener_count"],
+            })
+            if result["similar_artists"]:
+                agg._cache_set(thread_db, f"similar:{artist.lower()}", {
+                    "artists": result["similar_artists"]
+                })
+            if result["albums"]:
+                agg._cache_set(thread_db, f"discography:{artist.lower()}", {
+                    "albums": result["albums"]
+                })
+            if result["top_album"]:
+                top = dict(result["top_album"])
+                top["album"] = top.get("name", "")
+                agg._cache_set(thread_db, f"top_album:{artist.lower()}", top)
+
+        # ── Collect library artists ───────────────────────────────────────────
+        raw: set[str] = set()
+        for row in thread_db.query(LibraryTrack.artist_name).filter(
+            LibraryTrack.missing_since.is_(None),
+            LibraryTrack.artist_name.isnot(None),
+            LibraryTrack.artist_name != "",
+        ).distinct().all():
+            if row[0] and row[0].strip():
+                raw.add(row[0].strip())
+
+        for row in thread_db.query(LibraryTrack.album_artist).filter(
+            LibraryTrack.missing_since.is_(None),
+            LibraryTrack.album_artist.isnot(None),
+            LibraryTrack.album_artist != "",
+        ).distinct().all():
+            if row[0] and row[0].strip():
+                raw.add(row[0].strip())
+
+        all_library_artists = list(raw)
+        if not all_library_artists:
+            _set_cache_state(running=False, phase="Done — no library artists found")
+            return
+
+        # Determine which are stale
+        stale_cutoff = datetime.utcnow() - timedelta(hours=20)
+        fresh = {
+            row[0].replace("artist:", "")
+            for row in thread_db.query(PopularityCache.cache_key)
+            .filter(PopularityCache.cache_key.like("artist:%"))
+            .filter(PopularityCache.updated_at > stale_cutoff)
+            .all()
+        }
+        stale_library = [a for a in all_library_artists if a.lower() not in fresh]
+
+        log.info(
+            f"  Cache refresh: {len(all_library_artists)} library artists, "
+            f"{len(stale_library)} stale, {len(fresh)} fresh"
+        )
+
+        if not stale_library:
+            _set_cache_state(running=False, phase="Done — all artists fresh")
+            return
+
+        # ── Pass 1: library artists, 5 concurrent workers ────────────────────
+        _set_cache_state(phase="Pass 1: library artists", total=len(stale_library), done=0)
+        similar_collected: dict[str, list[str]] = {}  # artist → their similar list
+        done_count = [0]
+        write_lock = threading.Lock()
+
+        def _process_library_artist(artist: str):
+            result = _fetch_artist(artist)
+            with write_lock:
+                done_count[0] += 1
+                _set_cache_state(done=done_count[0])
+                if done_count[0] % 25 == 0:
+                    log.info(f"    Pass 1: {done_count[0]}/{len(stale_library)}")
+            if result:
+                _cache_artist_result(result, artist)
+                # Cap at top 5 similar per artist to bound Pass 2 size
+                return artist, result["similar_artists"][:5]
+            return artist, []
+
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="lfm") as pool:
+            futures = {pool.submit(_process_library_artist, a): a for a in stale_library}
+            for future in as_completed(futures):
                 try:
-                    # get_artist_info goes through full aggregator (incl. MusicBrainz).
-                    # Call Last.fm directly to avoid that.
-                    info = lastfm.get_artist_info(artist)
-                    if info:
-                        from services.popularity.aggregator import PopularityAggregator
-                        thread_aggregator._cache_set(
-                            thread_db,
-                            f"artist:{artist.lower()}",
-                            {
-                                "tags": info.tags,
-                                "similar_artists": info.similar_artists,
-                                "image_url": getattr(info, "image_url", None),
-                                "popularity": getattr(info, "popularity", 0),
-                            },
-                        )
-                    lastfm.get_similar_artists(artist)
-                    _cache_artist_discography(artist, thread_db)
-                    log.debug(f"    Cached: {artist}")
+                    artist, similars = future.result()
+                    similar_collected[artist] = similars
                 except Exception as e:
-                    log.warning(f"    Cache warm-up failed for '{artist}': {e}")
-            _warm_similar_artist_top_albums_names(top_artist_names, thread_db)
-        finally:
-            thread_db.close()
+                    log.warning(f"    Worker error: {e}")
 
-    await loop.run_in_executor(None, _do_warmup)
-    log.info(f"  Cache warm-up complete.")
+        # ── Pass 2: similar artists (discovery candidates) ────────────────────
+        # Collect unique similar artists, skip any already in the library
+        library_lower = {a.lower() for a in all_library_artists}
+        similar_all: set[str] = set()
+        for similars in similar_collected.values():
+            similar_all.update(s for s in similars if s.lower() not in library_lower)
+
+        # Filter to only stale ones
+        stale_similar = [
+            s for s in similar_all
+            if s.lower() not in fresh
+        ]
+
+        log.info(
+            f"  Pass 2: {len(similar_all)} unique similar artists, "
+            f"{len(stale_similar)} stale"
+        )
+        _set_cache_state(phase="Pass 2: similar artists", total=len(stale_similar), done=0)
+        done_count[0] = 0
+
+        def _process_similar_artist(artist: str):
+            result = _fetch_artist(artist)
+            with write_lock:
+                done_count[0] += 1
+                _set_cache_state(done=done_count[0])
+                if done_count[0] % 50 == 0:
+                    log.info(f"    Pass 2: {done_count[0]}/{len(stale_similar)}")
+            if result:
+                _cache_artist_result(result, artist)
+
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="lfm") as pool:
+            futures = {pool.submit(_process_similar_artist, a): a for a in stale_similar}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    log.warning(f"    Worker error: {e}")
+
+        log.info(
+            f"  Cache refresh complete: {len(stale_library)} library + "
+            f"{len(stale_similar)} similar artists cached"
+        )
+        _set_cache_state(
+            running=False,
+            phase="Complete",
+            finished_at=datetime.utcnow().isoformat(),
+        )
+
+    except Exception as e:
+        log.error(f"Cache refresh failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        _set_cache_state(running=False, phase="Error", error=str(e))
+    finally:
+        thread_db.close()
 
 
 def _cache_artist_discography(artist_name: str, db):

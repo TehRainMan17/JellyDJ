@@ -136,24 +136,47 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
 async def trigger_index(db: Session = Depends(get_db)):
     """Manually trigger a full index run immediately."""
     from scheduler import trigger_index_now
-    import asyncio
-    asyncio.ensure_future(trigger_index_now())
+    asyncio.create_task(trigger_index_now())
     return {"ok": True, "message": "Index started in background"}
+
+
+@router.post("/trigger/popularity-cache")
+async def trigger_popularity_cache(db: Session = Depends(get_db)):
+    """
+    Trigger a full library popularity cache refresh.
+    Runs in a background thread — returns immediately, dashboard stays responsive.
+    Poll GET /trigger/popularity-cache/status for progress.
+    """
+    from services.indexer import get_cache_refresh_state, refresh_library_popularity_cache
+    state = get_cache_refresh_state()
+    if state.get("running"):
+        return {"ok": False, "message": "Cache refresh already running", "state": state}
+    asyncio.create_task(refresh_library_popularity_cache(db))
+    return {"ok": True, "message": "Cache refresh started in background — poll /status for progress"}
+
+
+@router.get("/trigger/popularity-cache/status")
+def cache_refresh_status():
+    """Poll this to get live progress of the cache refresh."""
+    from services.indexer import get_cache_refresh_state
+    state = get_cache_refresh_state()
+    done = state.get("done", 0)
+    total = state.get("total", 0)
+    pct = round(100 * done / total) if total > 0 else 0
+    return {**state, "progress_pct": pct}
 
 
 @router.post("/trigger/discovery")
 async def trigger_discovery(db: Session = Depends(get_db)):
     """Manually trigger a discovery queue refresh for all enabled users."""
-    import asyncio
-    asyncio.ensure_future(_run_discovery_refresh())
+    asyncio.create_task(_run_discovery_refresh())
     return {"ok": True, "message": "Discovery refresh started in background"}
 
 
 @router.post("/trigger/playlists")
 async def trigger_playlists(db: Session = Depends(get_db)):
     """Manually trigger playlist regeneration for all enabled users."""
-    import asyncio
-    asyncio.ensure_future(_run_playlist_regen())
+    asyncio.create_task(_run_playlist_regen())
     return {"ok": True, "message": "Playlist regeneration started in background"}
 
 
@@ -163,8 +186,7 @@ async def trigger_auto_download(db: Session = Depends(get_db)):
     s = _get_or_create_settings(db)
     if not s.auto_download_enabled:
         raise HTTPException(400, "Auto-download is disabled. Enable it in settings first.")
-    import asyncio
-    asyncio.ensure_future(_run_auto_download(bypass_cooldown=True))
+    asyncio.create_task(_run_auto_download(bypass_cooldown=True))
     return {"ok": True, "message": "Auto-download check started"}
 
 
