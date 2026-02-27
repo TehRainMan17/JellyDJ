@@ -427,35 +427,36 @@ async def run_full_index():
     await lock.acquire()
     db = None
     try:
-        _set_job(True, "Starting", "Connecting to Jellyfin…", 0)
+        _set_job(True, "Connecting", "Reaching Jellyfin server…", 2)
         db = SessionLocal()
         base_url, api_key = _get_jellyfin_creds(db)
         users = db.query(ManagedUser).filter_by(is_enabled=True).all()
 
         if not users:
             log.info("No managed users enabled — skipping index.")
-            _set_job(False, "Done", "No enabled users", 100)
+            _set_job(False, "Done", "No enabled users configured", 100)
             return  # finally block will release the lock
 
         n_users = len(users)
 
         # Step 1: Full library scan (all tracks, played or not)
-        _set_job(True, "Library scan", "Scanning Jellyfin library…", 10)
+        _set_job(True, "Scanning library", "Fetching all tracks from Jellyfin…", 8)
         log.info("Step 1: Running full library scan...")
         scan_result = await run_library_scan(db)
         if scan_result.get("ok"):
-            n_tracks = scan_result.get("total_in_db", 0)
-            log.info(
-                f"  Library scan: {n_tracks} tracks "
-                f"(+{scan_result.get('added')} new)"
-            )
-            _set_job(True, "Library scan", f"{n_tracks:,} tracks found", 20)
+            n_tracks  = scan_result.get("total_in_db", 0)
+            n_added   = scan_result.get("added", 0)
+            n_missing = scan_result.get("marked_missing", 0)
+            log.info(f"  Library scan: {n_tracks} tracks (+{n_added} new, {n_missing} missing)")
+            _set_job(True, "Library scanned",
+                     f"{n_tracks:,} tracks (+{n_added} new{f', {n_missing} removed' if n_missing else ''})",
+                     18)
         else:
-            log.warning(f"  Library scan failed: {scan_result.get('error')} — continuing with play index")
-            _set_job(True, "Library scan", "Scan failed — continuing", 20)
+            log.warning(f"  Library scan failed: {scan_result.get('error')} — continuing")
+            _set_job(True, "Library scan failed", "Continuing with play history…", 18)
 
         # Step 1.5: Sync usernames from Jellyfin
-        _set_job(True, "Syncing users", "Fetching Jellyfin usernames…", 25)
+        _set_job(True, "Syncing users", f"Checking {n_users} user account(s)…", 22)
         try:
             await _sync_usernames(base_url, api_key, db)
         except Exception as e:
@@ -468,8 +469,9 @@ async def run_full_index():
         db = None
 
         for i, (uid, uname, user) in enumerate(user_ids):
-            pct = 30 + int((i / n_users) * 60)
-            _set_job(True, "Play history", f"Indexing {uname} ({i+1}/{n_users})…", pct)
+            pct = 28 + int((i / n_users) * 40)
+            _set_job(True, f"Play history — {uname}",
+                     f"Fetching listened tracks ({i+1} of {n_users} users)…", pct)
             user_db = SessionLocal()
             try:
                 from models import ManagedUser as MU
@@ -481,7 +483,8 @@ async def run_full_index():
             finally:
                 user_db.close()
 
-        _set_job(True, "Rebuilding scores", "Updating affinity scores…", 92)
+        _set_job(True, "Rebuilding taste profiles",
+                 "Calculating affinity scores for all users…", 72)
 
         # Update last_index timestamp on AutomationSettings
         ts_db = SessionLocal()
@@ -499,7 +502,7 @@ async def run_full_index():
             ts_db.close()
 
         log.info("Full index complete.")
-        _set_job(False, "Complete", f"Indexed {n_users} user(s)", 100)
+        _set_job(False, "Complete", f"Indexed {n_users} user(s) · popularity cache refreshing in background", 100)
     except Exception as e:
         log.error(f"Full index run failed: {e}")
         _set_job(False, "Error", str(e)[:120], 0, error=str(e))
@@ -776,7 +779,10 @@ def _run_cache_refresh_sync(caller_db: Session):
             return
 
         # ── Pass 1: library artists, 5 concurrent workers ────────────────────
-        _set_cache_state(phase="Pass 1: library artists", total=len(stale_library), done=0)
+        _set_cache_state(
+            phase=f"Fetching your {len(stale_library)} library artists from Last.fm…",
+            total=len(stale_library), done=0,
+        )
         similar_collected: dict[str, list[str]] = {}  # artist → their similar list
         done_count = [0]
         write_lock = threading.Lock()
@@ -785,7 +791,10 @@ def _run_cache_refresh_sync(caller_db: Session):
             result = _fetch_artist(artist)
             with write_lock:
                 done_count[0] += 1
-                _set_cache_state(done=done_count[0])
+                _set_cache_state(
+                    done=done_count[0],
+                    phase=f"Library artists: {done_count[0]} / {len(stale_library)} fetched",
+                )
                 if done_count[0] % 25 == 0:
                     log.info(f"    Pass 1: {done_count[0]}/{len(stale_library)}")
             if result:
@@ -820,14 +829,20 @@ def _run_cache_refresh_sync(caller_db: Session):
             f"  Pass 2: {len(similar_all)} unique similar artists, "
             f"{len(stale_similar)} stale"
         )
-        _set_cache_state(phase="Pass 2: similar artists", total=len(stale_similar), done=0)
+        _set_cache_state(
+            phase=f"Fetching {len(stale_similar)} related artists (discovery candidates)…",
+            total=len(stale_similar), done=0,
+        )
         done_count[0] = 0
 
         def _process_similar_artist(artist: str):
             result = _fetch_artist(artist)
             with write_lock:
                 done_count[0] += 1
-                _set_cache_state(done=done_count[0])
+                _set_cache_state(
+                    done=done_count[0],
+                    phase=f"Related artists: {done_count[0]} / {len(stale_similar)} fetched",
+                )
                 if done_count[0] % 50 == 0:
                     log.info(f"    Pass 2: {done_count[0]}/{len(stale_similar)}")
             if result:

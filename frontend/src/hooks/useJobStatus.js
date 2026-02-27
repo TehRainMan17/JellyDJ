@@ -1,37 +1,32 @@
 /**
- * useJobStatus — React hook for polling a background job's progress.
+ * useJobStatus — polls both the indexer job and the popularity cache refresh.
  *
- * The indexer runs as a fire-and-forget background task on the server, so the
- * frontend has no way to know when it finishes without polling. This hook
- * handles that cleanly: call startPolling() immediately after triggering a job,
- * and the hook will poll /api/indexer/job-status every 2 seconds until the
- * server reports running=false, then call onComplete() once and stop itself.
+ * Two separate background processes run on the server:
+ *   1. Indexer  → /api/indexer/job-status
+ *      Fields: { running, phase, detail, percent, error, started_at, finished_at }
  *
- * The endpoint is a pure in-memory read (no DB queries) so 2s polling is safe
- * even on low-powered hardware.
+ *   2. Cache refresh → /api/automation/trigger/popularity-cache/status
+ *      Fields: { running, phase, done, total, progress_pct, error, started_at, finished_at }
  *
- * Usage:
- *   const { jobStatus, startPolling } = useJobStatus((finalState) => {
- *     // called once when job finishes — refresh your data here
- *     refetchDashboardData()
- *   })
- *
- *   // After triggering a job:
- *   await fetch('/api/indexer/full-scan', { method: 'POST' })
- *   startPolling()
+ * Key behaviours:
+ *   - Polling starts immediately on mount so a job already running when you
+ *     navigate to the dashboard is visible right away — no button click needed.
+ *   - startPolling() resets and restarts (called after manually triggering).
+ *   - onComplete fires once when the INDEX job transitions running→false.
  */
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-/**
- * Polls /api/indexer/job-status every 2s while a job appears to be running.
- * Call startPolling() after firing off a background job.
- * onComplete(jobState) is called once when running flips false.
- */
+const INDEX_URL  = '/api/indexer/job-status'
+const CACHE_URL  = '/api/automation/trigger/popularity-cache/status'
+const INTERVAL_MS = 2000
+
 export function useJobStatus(onComplete) {
-  const [jobStatus, setJobStatus] = useState(null)
-  const timerRef       = useRef(null)
-  const wasRunningRef  = useRef(false)
-  const onCompleteRef  = useRef(onComplete)
+  const [indexStatus, setIndexStatus] = useState(null)
+  const [cacheStatus, setCacheStatus] = useState(null)
+
+  const timerRef        = useRef(null)
+  const indexWasRunning = useRef(false)
+  const onCompleteRef   = useRef(onComplete)
   onCompleteRef.current = onComplete
 
   const stopPolling = useCallback(() => {
@@ -40,28 +35,40 @@ export function useJobStatus(onComplete) {
 
   const poll = useCallback(async () => {
     try {
-      const r = await fetch('/api/indexer/job-status')
-      if (!r.ok) return
-      const d = await r.json()
-      setJobStatus(d)
-      if (d.running) {
-        wasRunningRef.current = true
-      } else if (wasRunningRef.current) {
-        wasRunningRef.current = false
-        stopPolling()
-        onCompleteRef.current?.(d)
+      const [ir, cr] = await Promise.allSettled([
+        fetch(INDEX_URL).then(r => r.ok ? r.json() : null),
+        fetch(CACHE_URL).then(r => r.ok ? r.json() : null),
+      ])
+
+      const idx   = ir.status === 'fulfilled' ? ir.value : null
+      const cache = cr.status === 'fulfilled' ? cr.value : null
+
+      if (idx)   setIndexStatus(idx)
+      if (cache) setCacheStatus(cache)
+
+      // Fire onComplete when index transitions running → idle
+      if (idx?.running) {
+        indexWasRunning.current = true
+      } else if (indexWasRunning.current && idx && !idx.running) {
+        indexWasRunning.current = false
+        onCompleteRef.current?.(idx)
       }
     } catch { /* network blip */ }
-  }, [stopPolling])
+  }, [])
 
-  const startPolling = useCallback(() => {
-    wasRunningRef.current = false
-    stopPolling()
+  // Start polling immediately on mount — catches jobs already running
+  useEffect(() => {
     poll()
-    timerRef.current = setInterval(poll, 2000)
+    timerRef.current = setInterval(poll, INTERVAL_MS)
+    return () => stopPolling()
   }, [poll, stopPolling])
 
-  useEffect(() => () => stopPolling(), [stopPolling])
+  const startPolling = useCallback(() => {
+    indexWasRunning.current = false
+    stopPolling()
+    poll()
+    timerRef.current = setInterval(poll, INTERVAL_MS)
+  }, [poll, stopPolling])
 
-  return { jobStatus, startPolling, stopPolling }
+  return { indexStatus, cacheStatus, startPolling, stopPolling }
 }

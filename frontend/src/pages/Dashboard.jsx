@@ -35,7 +35,6 @@ const EVENT_META = {
 function ConnectionStatus({ service, label }) {
   const [data, setData] = useState(null)
   useEffect(() => {
-    // lastfm lives under external-apis, not connections
     const url = service === 'lastfm'
       ? '/api/external-apis/status'
       : `/api/connections/${service}`
@@ -171,6 +170,12 @@ export default function Dashboard() {
   const [activity, setActivity]     = useState([])
   const [indexing, setIndexing]     = useState(false)
 
+  // Hook must come before any derived values that reference its output
+  const { indexStatus, cacheStatus, startPolling } = useJobStatus((finalState) => {
+    setIndexing(false)
+    fetchAll()
+  })
+
   const fetchAll = useCallback(() => {
     fetch('/api/indexer/status').then(r => r.json()).then(setUsers).catch(() => {})
     fetch('/api/indexer/library-stats').then(r => r.json()).then(setLib).catch(() => {})
@@ -179,11 +184,6 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => { fetchAll() }, [fetchAll])
-
-  const { jobStatus, startPolling } = useJobStatus((finalState) => {
-    setIndexing(false)
-    fetchAll()
-  })
 
   const handleIndex = async () => {
     setIndexing(true)
@@ -195,8 +195,10 @@ export default function Dashboard() {
     }
   }
 
-  const nextIndex = schedulerStatus?.play_history_index?.next_run
-  const totalTracks = Array.isArray(users) ? users.reduce((s, u) => s + (u.tracks_indexed || 0), 0) : 0
+  // Derived values — safe here, after all hook calls
+  const isIndexRunning = indexing || !!indexStatus?.running
+  const nextIndex      = schedulerStatus?.play_history_index?.next_run
+  const totalTracks    = Array.isArray(users) ? users.reduce((s, u) => s + (u.tracks_indexed || 0), 0) : 0
 
   return (
     <div className="space-y-6 max-w-6xl">
@@ -211,26 +213,24 @@ export default function Dashboard() {
             System overview and recent activity
           </p>
         </div>
-        <button onClick={handleIndex} disabled={indexing}
+        <button onClick={handleIndex} disabled={isIndexRunning}
                 className="btn-primary">
-          {indexing
+          {isIndexRunning
             ? <><Loader2 size={14} className="animate-spin" />Indexing…</>
             : <><RefreshCw size={14} />Index Now</>
           }
         </button>
       </div>
 
-      {/* Live index progress */}
-      {(indexing || (jobStatus && (jobStatus.running || jobStatus.finished_at))) && (
-        <JobProgress job={jobStatus} label="Index" />
-      )}
+      {/* Live index + cache progress — visible immediately if a job is already running */}
+      <JobProgress indexStatus={indexStatus} cacheStatus={cacheStatus} />
 
       {/* Top stat row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 stagger">
-        <StatCard icon={Music2}    label="Total tracks"   value={totalTracks > 0 ? totalTracks.toLocaleString() : '—'} color="var(--accent)"   delay={0} />
-        <StatCard icon={Users}     label="Active users"   value={users.filter(u=>u.status==='ok').length || '—'}        color="#60a5fa"           delay={50} />
-        <StatCard icon={TrendingUp} label="Library tracks" value={libraryStats?.total_tracks?.toLocaleString() ?? '—'} color="var(--purple)"    delay={100} />
-        <StatCard icon={Disc3}     label="Artists tracked" value={libraryStats?.total_artists?.toLocaleString() ?? '—'} color="#f78166"          delay={150} />
+        <StatCard icon={Music2}     label="Total tracks"    value={totalTracks > 0 ? totalTracks.toLocaleString() : '—'} color="var(--accent)"  delay={0} />
+        <StatCard icon={Users}      label="Active users"    value={users.filter(u=>u.status==='ok').length || '—'}        color="#60a5fa"         delay={50} />
+        <StatCard icon={TrendingUp} label="Library tracks"  value={libraryStats?.total_tracks?.toLocaleString() ?? '—'}   color="var(--purple)"  delay={100} />
+        <StatCard icon={Disc3}      label="Artists tracked" value={libraryStats?.total_artists?.toLocaleString() ?? '—'}  color="#f78166"         delay={150} />
       </div>
 
       {/* Main grid */}
@@ -240,7 +240,7 @@ export default function Dashboard() {
         <div className="lg:col-span-2 space-y-4">
           <div className="flex items-center justify-between">
             <div className="section-label flex items-center gap-2">
-              <Users size={12} />  Users
+              <Users size={12} /> Users
             </div>
           </div>
           {users.length === 0
@@ -252,7 +252,6 @@ export default function Dashboard() {
               </div>
           }
 
-          {/* Next index */}
           {nextIndex && (
             <div className="flex items-center gap-3 px-4 py-3 rounded-xl anim-fade-up"
                  style={{ background:'rgba(96,165,250,0.06)', border:'1px solid rgba(96,165,250,0.15)' }}>
@@ -268,7 +267,6 @@ export default function Dashboard() {
 
         {/* Right column */}
         <div className="space-y-4">
-          {/* Connections */}
           <div className="card anim-fade-up" style={{ animationDelay:'100ms' }}>
             <div className="section-label flex items-center gap-2 mb-3">
               <Radio size={12} /> Services
@@ -284,7 +282,6 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Activity feed */}
           <div className="card anim-fade-up" style={{ animationDelay:'150ms' }}>
             <div className="section-label flex items-center gap-2 mb-3">
               <Activity size={12} /> Recent Activity

@@ -70,6 +70,47 @@ def _get_settings(db):
     return Defaults()
 
 
+def _sync_wrap(async_fn, *args, **kwargs):
+    """
+    Run an async job function synchronously in a fresh event loop.
+
+    APScheduler's AsyncIOScheduler dispatches async jobs via
+    asyncio.ensure_future() on its internal event loop reference.
+    When that reference is None or mismatched with FastAPI's loop,
+    the coroutine is silently never awaited and the job appears permanently
+    overdue (next_run stays in the past).
+
+    Wrapping each scheduled job in a plain synchronous function that calls
+    asyncio.run() sidesteps this entirely — each job gets a clean, isolated
+    event loop that runs to completion and is then discarded.
+    This is safe because none of the job functions share state with
+    FastAPI's request-handling loop.
+    """
+    import asyncio
+    asyncio.run(async_fn(*args, **kwargs))
+
+
+def _job_run_index():
+    import asyncio
+    from services.indexer import run_full_index
+    asyncio.run(run_full_index())
+
+
+def _job_discovery_refresh():
+    from routers.automation import _run_discovery_refresh
+    _sync_wrap(_run_discovery_refresh)
+
+
+def _job_playlist_regen():
+    from routers.automation import _run_playlist_regen
+    _sync_wrap(_run_playlist_regen)
+
+
+def _job_auto_download():
+    from routers.automation import _run_auto_download
+    _sync_wrap(_run_auto_download)
+
+
 def start_scheduler(db_session_factory):
     """
     Register all four jobs and start the scheduler.
@@ -79,34 +120,36 @@ def start_scheduler(db_session_factory):
     reschedule_automation_jobs() immediately corrects them from the database.
     The two-step approach ensures the scheduler is running before any
     database access, which avoids startup order issues.
+
+    All scheduled functions are plain synchronous wrappers around their async
+    implementations — see _sync_wrap(). This avoids the APScheduler/asyncio
+    event loop mismatch that causes jobs to appear perpetually overdue.
     """
-    from services.indexer import run_full_index
-    from routers.automation import _run_discovery_refresh, _run_playlist_regen, _run_auto_download
 
     # Register jobs with conservative defaults — reschedule() below will override
     scheduler.add_job(
-        run_full_index,
+        _job_run_index,
         trigger=IntervalTrigger(hours=6),
         id=INDEX_JOB_ID,
         replace_existing=True,
-        misfire_grace_time=300,   # if the job fires 5+ minutes late, still run it
+        misfire_grace_time=300,
     )
     scheduler.add_job(
-        _run_discovery_refresh,
+        _job_discovery_refresh,
         trigger=IntervalTrigger(hours=24),
         id=DISCOVERY_JOB_ID,
         replace_existing=True,
         misfire_grace_time=600,
     )
     scheduler.add_job(
-        _run_playlist_regen,
+        _job_playlist_regen,
         trigger=IntervalTrigger(hours=24),
         id=PLAYLIST_JOB_ID,
         replace_existing=True,
         misfire_grace_time=600,
     )
     scheduler.add_job(
-        _run_auto_download,
+        _job_auto_download,
         trigger=IntervalTrigger(days=1),
         id=AUTO_DOWNLOAD_JOB_ID,
         replace_existing=True,
