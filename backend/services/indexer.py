@@ -42,26 +42,26 @@ W_FAVORITE     = 0.20   # explicit favorite flag (legacy path — scoring_engine
 # ── In-memory job state tracker ──────────────────────────────────────────────
 # Lightweight: no DB writes, just lets the frontend poll while a run is in progress.
 #
-# Why asyncio.Lock instead of threading.Lock?
-# run_full_index() is an async coroutine running on the asyncio event loop.
-# asyncio.ensure_future() (used by the API endpoints) queues multiple coroutines
-# on the same event loop. Between the guard check and the state update, the
-# event loop can yield and let another queued coroutine past the guard — a
-# classic TOCTOU race. asyncio.Lock prevents this: the lock is held across
-# both the check AND the set, so only one coroutine can enter at a time.
-# (threading.Lock would deadlock here because async code can't block threads.)
-import asyncio as _asyncio
+# Why threading.Lock and not asyncio.Lock?
+# run_full_index() is called from TWO different contexts:
+#   1. FastAPI route handlers — running on the uvicorn asyncio event loop
+#   2. APScheduler jobs — each fires asyncio.run(run_full_index()) which creates
+#      a BRAND NEW event loop in a scheduler thread.
+#
+# asyncio.Lock is bound to the event loop that was current when it was created.
+# If the lock is first created on FastAPI's loop, the scheduler's fresh loop
+# will raise "Task got Future attached to a different loop" when it tries to
+# acquire the same lock object — crashing the scheduled job and leaving the
+# lock permanently acquired, blocking all future runs.
+#
+# threading.Lock is loop-agnostic and works correctly in both contexts.
+# We use non-blocking acquire() + immediate check to avoid blocking the
+# async caller — if we can't get the lock the run is skipped (same as before).
+import threading as _threading
 from datetime import datetime as _dt
 
-# Module-level lock — created once, reused for every run_full_index call
-_index_lock: _asyncio.Lock | None = None
-
-def _get_index_lock() -> _asyncio.Lock:
-    """Lazily create the lock on first access (must be on the event loop)."""
-    global _index_lock
-    if _index_lock is None:
-        _index_lock = _asyncio.Lock()
-    return _index_lock
+# Module-level lock — plain threading lock, works across all event loops
+_index_lock = _threading.Lock()
 
 _job_state: dict = {
     "running":    False,
@@ -420,11 +420,9 @@ async def run_full_index():
     # asyncio.Lock.acquire() is a coroutine: it yields to the event loop
     # while waiting, so other requests stay responsive. Once acquired,
     # no other call to run_full_index() can enter until we release below.
-    lock = _get_index_lock()
-    if lock.locked():
+    if not _index_lock.acquire(blocking=False):
         log.warning("Index already running — skipping duplicate trigger.")
         return
-    await lock.acquire()
     db = None
     try:
         _set_job(True, "Connecting", "Reaching Jellyfin server…", 2)
@@ -509,7 +507,7 @@ async def run_full_index():
     finally:
         if db is not None:
             db.close()
-        lock.release()  # always release so the next run can proceed
+        _index_lock.release()  # always release so the next run can proceed
 
 
 # ── Global cache refresh state (for progress polling) ─────────────────────────

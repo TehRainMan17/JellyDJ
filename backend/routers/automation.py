@@ -4,6 +4,7 @@ JellyDJ Automation router — settings and manual triggers for all scheduled tas
 plus the activity feed endpoint.
 """
 from __future__ import annotations
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -135,8 +136,14 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
 @router.post("/trigger/index")
 async def trigger_index(db: Session = Depends(get_db)):
     """Manually trigger a full index run immediately."""
-    from scheduler import trigger_index_now
-    asyncio.create_task(trigger_index_now())
+    import threading
+    from services.indexer import run_full_index, get_job_state
+    state = get_job_state()
+    if state.get("running"):
+        return {"ok": True, "message": "Index already running."}
+    def _run():
+        asyncio.run(run_full_index())
+    threading.Thread(target=_run, daemon=True, name="manual-index").start()
     return {"ok": True, "message": "Index started in background"}
 
 
@@ -182,12 +189,20 @@ async def trigger_playlists(db: Session = Depends(get_db)):
 
 @router.post("/trigger/auto-download")
 async def trigger_auto_download(db: Session = Depends(get_db)):
-    """Manually trigger an auto-download run (respects enabled flag but bypasses cooldown)."""
+    """Manually trigger an auto-download run — bypasses cooldown and schedule.
+
+    The manual Run Now button always fires regardless of enabled state,
+    so users can test configuration. It does NOT update last_auto_download,
+    so the scheduled timer is unaffected.
+    """
     s = _get_or_create_settings(db)
     if not s.auto_download_enabled:
         raise HTTPException(400, "Auto-download is disabled. Enable it in settings first.")
-    asyncio.create_task(_run_auto_download(bypass_cooldown=True))
-    return {"ok": True, "message": "Auto-download check started"}
+    # bypass_cooldown=True  — skip the cooldown gate
+    # update_timestamp=False — do NOT stamp last_auto_download so the scheduled
+    #                          timer is not reset by a manual run
+    asyncio.create_task(_run_auto_download(bypass_cooldown=True, update_timestamp=False))
+    return {"ok": True, "message": "Auto-download started (manual run — schedule timer unchanged)"}
 
 
 @router.get("/auto-download-preview")
@@ -318,7 +333,7 @@ async def _run_playlist_regen():
         db.close()
 
 
-async def _run_auto_download(bypass_cooldown: bool = False):
+async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bool = True):
     """
     Auto-download job: sends the top-scored pending discovery items to Lidarr
     automatically, subject to the user's rate limit controls.
@@ -481,11 +496,11 @@ async def _run_auto_download(bypass_cooldown: bool = False):
             else:
                 log.info(f"Auto-download [{user.username}]: no fallback candidate")
 
-        # Always stamp last_auto_download so the cooldown advances regardless of
-        # whether anything was sent. Without this, an empty queue causes the job
-        # to fire every interval forever (cooldown never starts).
-        s.last_auto_download = datetime.utcnow()
-        db.commit()
+        # Stamp last_auto_download so the cooldown advances — but NOT on manual
+        # runs (update_timestamp=False), so the scheduled timer is unaffected.
+        if update_timestamp:
+            s.last_auto_download = datetime.utcnow()
+            db.commit()
         if total_sent > 0:
             log.info(f"Auto-download complete: {total_sent} album(s) sent to Lidarr")
         else:

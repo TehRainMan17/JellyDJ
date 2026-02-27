@@ -172,13 +172,24 @@ def library_stats(db: Session = Depends(get_db)):
 async def trigger_full_scan(db: Session = Depends(get_db)):
     """
     Trigger a complete rescan: library scan + play history + scoring rebuild.
-    This is the manual reindex button endpoint.
+    Runs in a daemon thread so the ASGI event loop is never blocked and the
+    dashboard stays responsive throughout. Same execution model as the scheduler.
     """
-    from services.indexer import run_full_index
+    import threading
+    from services.indexer import run_full_index, get_job_state
     import asyncio
-    # Run in background so the HTTP response returns immediately
-    asyncio.ensure_future(run_full_index())
-    return {"ok": True, "message": "Full scan started in background. Check /api/indexer/status for progress."}
+
+    # Don't start a second run if one is already in progress
+    state = get_job_state()
+    if state.get("running"):
+        return {"ok": True, "message": "Index already running."}
+
+    def _run():
+        asyncio.run(run_full_index())
+
+    t = threading.Thread(target=_run, daemon=True, name="manual-index")
+    t.start()
+    return {"ok": True, "message": "Full scan started in background. Poll /api/indexer/job-status for progress."}
 
 
 @router.get("/score-distribution/{user_id}")

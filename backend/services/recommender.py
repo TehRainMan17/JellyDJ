@@ -562,9 +562,9 @@ def recommend_new_albums(
         # Previously this was 40/25/35 (affinity-led), which caused familiar
         # artist similarities to always outrank genuinely popular new artists.
         blended = (
-            (lastfm_listeners * 0.50) +
-            (pop_score        * 0.30) +
-            (source_affinity  * 0.20)
+            (lastfm_listeners * 0.60) +  # global reach dominates discovery
+            (pop_score        * 0.25) +  # album/artist-level signal
+            (source_affinity  * 0.15)    # tiebreaker only
         )
 
         # "New but popular" boost: artist not in library at all + high listeners.
@@ -572,7 +572,7 @@ def recommend_new_albums(
         # mid-tier similarity results.
         never_heard = artist.lower() not in known_artists
         if never_heard and lastfm_listeners >= 60:
-            blended = min(100.0, blended + 15.0)
+            blended = min(100.0, blended + 20.0)
 
         # Wildcard bonus: pure popularity ranking, no affinity component
         if is_wildcard:
@@ -720,8 +720,10 @@ def recommend_new_albums(
     # of similarity to any seed. This is the "what's huge right now that I haven't
     # heard" path. It breaks the similarity-chain feedback loop entirely.
     # Target: 25% of the final output comes from this path.
-    path_d_target = max(3, limit // 4)
+    path_d_target = max(4, int(limit * 0.40))
     path_d_added = 0
+    # PATH D: pull genuinely popular artists not in library
+    # 1M listener floor keeps this tier high-quality
 
     try:
         from models import PopularityCache as PC
@@ -737,7 +739,7 @@ def recommend_new_albums(
             try:
                 pd = json.loads(row.payload)
                 raw_listeners = float(pd.get("listener_count", 0))
-                if raw_listeners < 500_000:   # filter micro-artists
+                if raw_listeners < 1_000_000:  # floor: only artists with genuine global reach
                     continue
                 artist_name_g = pd.get("name") or row.cache_key.replace("artist:", "")
                 if not artist_name_g:
