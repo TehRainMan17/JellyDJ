@@ -1,28 +1,31 @@
-
 """
-JellyDJ Scoring Engine — Module 8a
+JellyDJ Scoring Engine — v2
 
-Replaces the old UserTasteProfile-based scoring with a three-layer system:
+Changes from v1:
+  Phase 1 (ArtistProfile): now pulls replay_boost from UserReplaySignal and
+    stamps it onto ArtistProfile.replay_boost. Also copies related_artists and
+    tags from ArtistEnrichment for use by Discover Weekly.
 
-Layer 1 — ArtistProfile (per user, per artist)
-  Aggregates all play/skip data for an artist into a single affinity score.
+  Phase 2 (GenreProfile): unchanged logic, kept for compatibility.
 
-Layer 2 — GenreProfile (per user, per genre)
-  Same but at genre level. Drives scoring for unplayed tracks in liked genres.
+  Phase 3 (TrackScore): now factors in:
+    - replay_boost  (per-track and per-artist voluntary replay signal)
+    - global_popularity  (from TrackEnrichment, used by Discover Weekly sort)
+    - cooldown_until  (from TrackCooldown — stamped here so playlist queries
+      can filter with a simple WHERE cooldown_until IS NULL OR cooldown_until < now)
+    - skip_streak  (from SkipPenalty.consecutive_skips — denormalised for display)
 
-Layer 3 — TrackScore (per user, per track in full library)
-  Pre-computed final score for every track. Playlist generation queries this
-  table directly — no on-the-fly scoring.
-
-Scoring philosophy:
+Scoring philosophy (unchanged):
   - Played tracks: play frequency + recency + skip penalty + artist/genre pull
   - Unplayed tracks: neutral base + artist/genre affinity (capped below played max)
   - Skip-heavy artists get suppressed even on unplayed tracks
   - Favorites get a meaningful but not dominant bonus
-  - No echo chamber: unplayed can score up to ~75, played loved tracks score 85-100
+  - Replay boost is additive on top of final score, capped so it can't
+    vault a mediocre track above genuine favourites
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 from datetime import datetime, timedelta
@@ -38,113 +41,47 @@ from models import (
 log = logging.getLogger(__name__)
 
 # ── Scoring constants ─────────────────────────────────────────────────────────
-#
-# These weights and thresholds were tuned empirically. If you want to adjust
-# the "feel" of recommendations, these are the primary levers:
-#
-#   W_PLAY      — raise to make heavily-played tracks dominate
-#   W_RECENCY   — raise to favour recently-heard music over old favourites
-#   UNPLAYED_CAP — raise to let discovery tracks compete more with played ones
-#   FAVORITE_FLOOR — raise to push liked songs even higher in all playlists
 
-# Played track formula weights (must sum to 1.0)
-# These combine into a 0–100 raw base, then compressed before bonus is applied.
-W_PLAY      = 0.45   # raw play frequency (log-scaled against your personal max)
-W_RECENCY   = 0.25   # how recently played (decays linearly from 30 → 365 days)
-W_ARTIST    = 0.20   # artist-level affinity (scaled by AFFINITY_SCALE before use)
-W_GENRE     = 0.10   # genre affinity as a softer signal
+W_PLAY      = 0.45
+W_RECENCY   = 0.25
+W_ARTIST    = 0.20
+W_GENRE     = 0.10
 
-# Affinity scaling: caps how much loved-artist status can inflate a score.
-# 0.70 limits max artist+genre contribution to 14+7=21pts — meaningful pull
-# toward liked artists without carrying a track on its own.
 AFFINITY_SCALE        = 0.70
-
-# Score rescaling ceiling.
-# The raw formula tops out at ~88 (all inputs maxed simultaneously), so without
-# rescaling the best track in your library only compresses to ~90 before any bonus.
-# SCORE_RESCALE_MAX stretches the formula output so the practical ceiling maps to
-# 100 before the power curve is applied — this lets your top tracks use the full
-# scale rather than topping out at ~90 due to formula arithmetic.
-# Value = W_PLAY*100 + W_RECENCY*100 + W_ARTIST*(100*0.70) + W_GENRE*(100*0.70) = 91.
-# (Was 88 — wrong; used 0.70*70 instead of 0.70*100 for the affinity terms.)
-SCORE_RESCALE_MAX     = 91.0  # true formula max: 0.45*100+0.25*100+0.20*(100*0.70)+0.10*(100*0.70)
-
-# Score compression exponent. Applied as: 100 * (rescaled/100)^EXP.
-# EXP=0.75 produces the target feel:
-#   scaled 100→100,  95→96,  90→93,  85→89,  80→85,  75→81,  70→76,  60→66,  50→56
-# Target score bands:
-#   55–68  = casual listens, rarely played, low-affinity artists
-#   70–79  = good songs you genuinely like (solid play history)
-#   80–88  = great songs — well-played OR favourited
-#   89–94  = lifelong songs — well-played AND recent AND hearted
-#   95+    = only reachable as rounding on truly exceptional tracks
-# Was 0.80 — that over-compressed so even 150-play favourited anthems only scored
-# ~79, destroying granularity at the top end. 0.75 restores separation.
+SCORE_RESCALE_MAX     = 91.0
 COMPRESSION_EXP       = 0.75
 
-# Unplayed track scoring
-# Unplayed tracks use a separate formula so they can appear in playlists
-# without crowding out tracks the user genuinely loves.
-# Scores sit below the played-track range (~42–65) so unplayed tracks
-# appear as discovery without displacing genuinely loved songs.
-UNPLAYED_BASE         = 35.0   # floor for any unplayed track from any artist
-UNPLAYED_ARTIST_W     = 0.20   # max +20pts from artist affinity (beloved artist = 58 base)
-UNPLAYED_GENRE_W      = 0.14   # max +14pts from genre affinity
-UNPLAYED_NOVELTY      = 2.0    # small constant bump to prefer genuinely new tracks over stale ones
-UNPLAYED_CAP          = 65.0   # hard ceiling — keeps unplayed below a well-loved played track
+UNPLAYED_BASE         = 35.0
+UNPLAYED_ARTIST_W     = 0.20
+UNPLAYED_GENRE_W      = 0.14
+UNPLAYED_NOVELTY      = 2.0
+UNPLAYED_CAP          = 65.0
 
-# Recency decay parameters
-# A track played within GRACE days gets maximum recency score (100).
-# Score decays linearly to 0 at DECAY days. Tracks older than a year
-# contribute nothing from recency but still score via play count + affinity.
 RECENCY_GRACE_DAYS    = 30
 RECENCY_DECAY_DAYS    = 365
 
-# Minimum skip events before the penalty is applied.
-# Set to 1 so that any recorded skip contributes, but the penalty itself
-# scales gradually (calc in _calc_penalty in webhooks.py) so a single
-# accidental skip doesn't permanently suppress a track.
 SKIP_MIN_EVENTS       = 1
 
-# Favorite / heart / like signal
-# This is the strongest explicit signal a user can give. Design decisions:
-#
-#   FAVORITE_FLOOR (67):
-#     A hearted track scores at LEAST 67 regardless of play count or recency.
-#     Sits just above UNPLAYED_CAP (65) so liked-but-rarely-played songs always
-#     clear the discovery/unplayed band and appear in "songs you like" playlists.
-#
-#   FAVORITE_BONUS (6):
-#     Additive bonus applied after compression. Creates clear separation between
-#     a hearted track and an equally-played unloved one (~6 point lift), without
-#     being large enough to vault low-play songs into the 90s.
-#     With SCORE_RESCALE_MAX+EXP=0.75, the practical ceiling before bonus is ~93,
-#     so +6 can reach ~99 only for your absolute most-played recent favourites.
-#
-#   FAVORITE_SKIP_SHIELD (0.35):
-#     Max skip penalty applied to a favourited track.
-#     If you've liked a song, one or two mood-driven skips shouldn't crater it.
-#
-#   FAVORITE_ARTIST_BOOST (15):
-#     Additive bonus to ArtistProfile affinity if user has any favourite by that artist.
-#     Applied before normalisation so it raises the artist's relative standing.
 FAVORITE_FLOOR        = 67.0
 FAVORITE_BONUS        =  6.0
 FAVORITE_SKIP_SHIELD  = 0.35
 FAVORITE_ARTIST_BOOST = 15.0
 
+# v2: replay boost cap — a voluntary replay can add at most this many points
+# to a track's final_score. Keeps replayed tracks from vaulting above true
+# 90+ favourites purely from one enthusiastic week of replaying.
+REPLAY_BOOST_CAP      = 12.0
+
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
 def _play_score(play_count: int, max_plays: int) -> float:
-    """Log-scaled play count normalised to 0–100."""
     if play_count <= 0 or max_plays <= 0:
         return 0.0
     return min(100.0, (math.log1p(play_count) / math.log1p(max_plays)) * 100)
 
 
 def _recency_score(last_played: Optional[datetime]) -> float:
-    """1.0 (100) within grace period, linear decay to 0 at RECENCY_DECAY_DAYS."""
     if not last_played:
         return 0.0
     days = (datetime.utcnow() - last_played).days
@@ -157,21 +94,10 @@ def _recency_score(last_played: Optional[datetime]) -> float:
 
 
 def _skip_multiplier(penalty: float) -> float:
-    """Convert 0–1 skip penalty into a score multiplier (1.0 = no penalty)."""
     return max(0.1, 1.0 - float(penalty))
 
 
 def _compress(raw: float) -> float:
-    """
-    Two-step compression:
-    1. Rescale: the raw formula tops out at ~88 (SCORE_RESCALE_MAX), not 100.
-       We stretch it so raw=88 → scaled=100, meaning your most-played recent
-       favourite from a loved artist can actually approach 100 rather than
-       being hard-capped at ~90 before the bonus is applied.
-    2. Power curve: 100 * (scaled/100)^0.75 spreads the distribution.
-       scaled 100→100, 90→93, 80→85, 70→76, 60→66, 50→56.
-    Combined effect: the 70–93 range is wide and meaningful. 95+ is rare.
-    """
     if raw <= 0:
         return 0.0
     scaled = min(100.0, (raw / SCORE_RESCALE_MAX) * 100.0)
@@ -183,6 +109,10 @@ def _compress(raw: float) -> float:
 def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
     """
     Build ArtistProfile for every artist the user has played.
+
+    v2: also reads replay boosts and enrichment data to populate
+    ArtistProfile.replay_boost, .related_artists, .tags.
+
     Returns dict of artist_name → affinity_score for use in TrackScore phase.
     """
     now = datetime.utcnow()
@@ -192,7 +122,6 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
 
     max_plays = max((p.play_count for p in plays if p.play_count), default=1) or 1
 
-    # Aggregate play signals by artist
     artist_agg: dict[str, dict] = {}
     for p in plays:
         key = p.artist_name
@@ -218,7 +147,6 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         if p.genre:
             agg["genres"][p.genre] = agg["genres"].get(p.genre, 0) + p.play_count
 
-    # Pull skip data per artist
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
     artist_skips: dict[str, dict] = {}
     for sk in skip_rows:
@@ -230,7 +158,20 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         artist_skips[a]["total_events"] += sk.total_events
         artist_skips[a]["skip_count"] += sk.skip_count
 
-    # Delete and rebuild artist profiles for this user
+    # v2: load replay boosts for this user
+    from services.enrichment import compute_replay_boosts
+    replay_boosts = compute_replay_boosts(db, user_id)
+
+    # v2: load artist enrichment data for related_artists and tags
+    try:
+        from models import ArtistEnrichment
+        enrichment_map = {
+            row.artist_name_lower: row
+            for row in db.query(ArtistEnrichment).all()
+        }
+    except Exception:
+        enrichment_map = {}
+
     db.query(ArtistProfile).filter_by(user_id=user_id).delete()
 
     affinity_map: dict[str, float] = {}
@@ -244,19 +185,24 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         raw_score = W_PLAY * avg_play + W_RECENCY * avg_recency
         affinity = round(min(100.0, raw_score + fav_boost), 2)
 
-        # Skip penalty at artist level — but if the user has favorited a track
-        # by this artist, dampen the skip suppression (one bad skip ≠ dislike)
         sk_data = artist_skips.get(artist, {})
         total_ev = sk_data.get("total_events", 0)
         skip_ct = sk_data.get("skip_count", 0)
         skip_rate = round(skip_ct / total_ev, 4) if total_ev >= SKIP_MIN_EVENTS else 0.0
         if skip_rate > 0:
-            # Favorites shield: cap effective skip rate at 50% of normal for fav artists
             effective_skip_rate = skip_rate * (0.5 if agg["has_favorite"] else 1.0)
             affinity = round(affinity * (1.0 - effective_skip_rate * 0.5), 2)
 
         primary_genre = max(agg["genres"].items(), key=lambda x: x[1])[0] if agg["genres"] else ""
         affinity_map[artist] = affinity
+
+        # v2: replay boost at artist level
+        artist_replay_boost = replay_boosts.get(f"artist:{artist.lower()}", 0.0)
+
+        # v2: enrichment metadata
+        enc = enrichment_map.get(artist.lower())
+        related = enc.similar_artists if enc else None
+        tags = enc.tags if enc else None
 
         db.add(ArtistProfile(
             user_id=user_id,
@@ -269,6 +215,9 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             primary_genre=primary_genre,
             affinity_score=str(affinity),
             updated_at=now,
+            replay_boost=artist_replay_boost,
+            related_artists=related,
+            tags=tags,
         ))
 
     db.flush()
@@ -280,7 +229,7 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
 def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
     """
     Build GenreProfile for every genre the user has played.
-    Returns dict of genre → affinity_score.
+    Returns dict of genre → affinity_score. Unchanged from v1.
     """
     now = datetime.utcnow()
     plays = db.query(Play).filter_by(user_id=user_id).all()
@@ -311,7 +260,6 @@ def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
         if p.is_favorite:
             agg["has_favorite"] = True
 
-    # Skip data per genre
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
     genre_skips: dict[str, dict] = {}
     for sk in skip_rows:
@@ -371,38 +319,68 @@ def rebuild_track_scores(
 ) -> int:
     """
     Build TrackScore for every track in the library for this user.
-    Played tracks get engagement-based scoring.
-    Unplayed tracks get affinity-based scoring with a cap.
-    Returns count of scores written.
+
+    v2 additions:
+      - replay_boost  added to final_score (capped at REPLAY_BOOST_CAP)
+      - global_popularity  copied from TrackEnrichment
+      - cooldown_until  stamped from active TrackCooldown rows
+      - skip_streak  copied from SkipPenalty.consecutive_skips
     """
     now = datetime.utcnow()
 
-    # Pull all library tracks (not soft-deleted)
     library = db.query(LibraryTrack).filter(
         LibraryTrack.missing_since.is_(None)
     ).all()
 
     if not library:
-        log.warning(f"  No library tracks found for scoring — run library scan first")
+        log.warning("  No library tracks found for scoring — run library scan first")
         return 0
 
-    # Build play lookup — keyed by jellyfin_item_id
     plays = {p.jellyfin_item_id: p for p in db.query(Play).filter_by(user_id=user_id).all()}
 
-    # Build skip penalty lookup
-    skip_map = {
-        sk.jellyfin_item_id: float(sk.penalty)
-        for sk in db.query(SkipPenalty).filter_by(user_id=user_id).all()
-        if sk.total_events >= SKIP_MIN_EVENTS
-    }
+    # Build skip penalty lookup (penalty float + consecutive_skips)
+    skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
+    skip_map: dict[str, float] = {}
+    streak_map: dict[str, int] = {}
+    for sk in skip_rows:
+        if sk.total_events >= SKIP_MIN_EVENTS:
+            skip_map[sk.jellyfin_item_id] = float(sk.penalty)
+        streak_map[sk.jellyfin_item_id] = sk.consecutive_skips or 0
 
     max_plays = max((p.play_count for p in plays.values() if p.play_count), default=1) or 1
 
-    # Normalise affinity maps to 0–1 for formula use
     max_artist_aff = max(artist_affinity.values(), default=1.0) or 1.0
     max_genre_aff = max(genre_affinity.values(), default=1.0) or 1.0
 
-    # Delete existing scores for this user
+    # v2: load per-track replay boosts
+    from services.enrichment import compute_replay_boosts
+    replay_boosts = compute_replay_boosts(db, user_id)
+
+    # v2: load TrackEnrichment for global_popularity
+    try:
+        from models import TrackEnrichment
+        enrichment_pop: dict[str, Optional[float]] = {
+            row.jellyfin_item_id: row.popularity_score
+            for row in db.query(TrackEnrichment.jellyfin_item_id, TrackEnrichment.popularity_score).all()
+        }
+    except Exception:
+        enrichment_pop = {}
+
+    # v2: load active cooldowns for this user
+    try:
+        from models import TrackCooldown
+        active_cooldowns: dict[str, datetime] = {
+            row.jellyfin_item_id: row.cooldown_until
+            for row in db.query(TrackCooldown).filter_by(user_id=user_id, status="active").all()
+        }
+        permanent_penalty_ids: set[str] = {
+            row.jellyfin_item_id
+            for row in db.query(TrackCooldown).filter_by(user_id=user_id, status="permanent").all()
+        }
+    except Exception:
+        active_cooldowns = {}
+        permanent_penalty_ids = set()
+
     db.query(TrackScore).filter_by(user_id=user_id).delete()
 
     count = 0
@@ -410,22 +388,32 @@ def rebuild_track_scores(
         jid = track.jellyfin_item_id
         play = plays.get(jid)
         skip_pen = skip_map.get(jid, 0.0)
+        skip_streak = streak_map.get(jid, 0)
 
-        # Artist + genre affinity (0–100, normalised)
         raw_artist = artist_affinity.get(track.artist_name, 0.0)
         raw_genre = genre_affinity.get(track.genre, 0.0)
         a_aff = round((raw_artist / max_artist_aff) * 100, 2)
         g_aff = round((raw_genre / max_genre_aff) * 100, 2)
+
+        # v2: replay boost — per-track first, fall back to per-artist
+        track_boost = replay_boosts.get(jid, 0.0)
+        artist_boost = replay_boosts.get(f"artist:{track.artist_name.lower()}", 0.0)
+        replay_boost = min(REPLAY_BOOST_CAP, max(track_boost, artist_boost))
+
+        # v2: global popularity (may be None for unenriched tracks)
+        global_pop = enrichment_pop.get(jid)
+
+        # v2: cooldown
+        cooldown_until = active_cooldowns.get(jid)
+
+        # v2: permanent dislike — heavy penalty on final score
+        is_permanent_dislike = jid in permanent_penalty_ids
 
         if play and play.play_count > 0:
             # ── Played track scoring ──────────────────────────────────────────
             ps = _play_score(play.play_count, max_plays)
             rs = _recency_score(play.last_played)
 
-            # Scale affinity so even top-artist tracks need real play/recency
-            # data to score well. Without scaling, W_ARTIST * 100 = 20 free
-            # points push all tracks by loved artists into 90+ regardless of
-            # whether you've actually played them much.
             a_scaled = a_aff * AFFINITY_SCALE
             g_scaled = g_aff * AFFINITY_SCALE
 
@@ -436,11 +424,8 @@ def rebuild_track_scores(
                 W_GENRE   * g_scaled
             )
 
-            # Compress: spreads the 70–95 band so play count and recency
-            # create meaningful score differences instead of all clustering at 98–100.
             compressed = _compress(raw_base)
 
-            # Skip multiplier — favourites are shielded from the worst of it
             if play.is_favorite:
                 shielded_pen = min(skip_pen, FAVORITE_SKIP_SHIELD)
                 multiplier = _skip_multiplier(shielded_pen)
@@ -449,15 +434,17 @@ def rebuild_track_scores(
 
             final = round(compressed * multiplier, 2)
 
-            # Favourites: modest bonus + floor.
-            # 7pts bonus is intentional — enough to matter, not a free pass to 100.
-            # Floor (65) just clears the unplayed cap so liked-but-rarely-played
-            # songs don't sink below discovery tracks.
             if play.is_favorite:
-                # Cap at 99 so 100 is structurally unreachable.
-                # 100 appearing in the UI always means a stale pre-migration row.
                 final = round(min(99.0, final + FAVORITE_BONUS), 2)
                 final = max(final, FAVORITE_FLOOR)
+
+            # v2: add replay boost (additive, capped)
+            final = round(min(99.0, final + replay_boost), 2)
+
+            # v2: permanent dislike — score capped at 20 so it essentially
+            # never surfaces in any playlist
+            if is_permanent_dislike:
+                final = min(final, 20.0)
 
             db.add(TrackScore(
                 user_id=user_id,
@@ -478,11 +465,15 @@ def rebuild_track_scores(
                 novelty_bonus="0.0",
                 final_score=str(final),
                 updated_at=now,
+                # v2
+                replay_boost=replay_boost,
+                global_popularity=global_pop,
+                cooldown_until=cooldown_until,
+                skip_streak=skip_streak,
             ))
+
         else:
             # ── Unplayed track scoring ────────────────────────────────────────
-            # Affinity also scaled for consistency — top-artist unplayed tracks
-            # should sit noticeably below moderately-played tracks of the same artist.
             unplayed_score = (
                 UNPLAYED_BASE
                 + UNPLAYED_ARTIST_W * (a_aff * AFFINITY_SCALE)
@@ -490,11 +481,18 @@ def rebuild_track_scores(
                 + UNPLAYED_NOVELTY
             )
 
-            # Artist skip suppression carries over to unplayed tracks
             if skip_pen > 0.3:
                 unplayed_score *= (1.0 - skip_pen * 0.3)
 
             final = round(min(UNPLAYED_CAP, unplayed_score), 2)
+
+            # v2: replay boost applies to unplayed tracks too — user might have
+            # heard a track in a playlist, sought out more by the artist (artist_return
+            # signal fires), and we haven't fully indexed that track as played yet
+            final = round(min(UNPLAYED_CAP, final + replay_boost), 2)
+
+            if is_permanent_dislike:
+                final = min(final, 20.0)
 
             db.add(TrackScore(
                 user_id=user_id,
@@ -515,11 +513,14 @@ def rebuild_track_scores(
                 novelty_bonus=str(UNPLAYED_NOVELTY),
                 final_score=str(final),
                 updated_at=now,
+                # v2
+                replay_boost=replay_boost,
+                global_popularity=global_pop,
+                cooldown_until=cooldown_until,
+                skip_streak=skip_streak,
             ))
 
         count += 1
-
-        # Commit in batches to avoid large transactions
         if count % 500 == 0:
             db.flush()
             log.debug(f"  Scored {count} tracks...")
@@ -534,9 +535,19 @@ def rebuild_track_scores(
 def rebuild_all_scores(db: Session, user_id: str) -> dict:
     """
     Full scoring rebuild for one user. Runs all three phases in sequence.
-    Called by the indexer after play data is synced and library scan is done.
+    v2: also runs expire_cooldowns() at the start so scores reflect current state.
     """
     log.info(f"  Rebuilding scores for user {user_id}...")
+
+    # v2: expire any cooldowns that have timed out before scoring
+    try:
+        from services.enrichment import expire_cooldowns, detect_replay_signals
+        expired = expire_cooldowns(db)
+        if expired:
+            log.info(f"  Expired {expired} cooldowns before score rebuild")
+        detect_replay_signals(db, user_id)
+    except Exception as e:
+        log.warning(f"  Pre-score enrichment steps failed (non-fatal): {e}")
 
     artist_aff = rebuild_artist_profiles(db, user_id)
     log.info(f"  Built {len(artist_aff)} artist profiles")
@@ -554,12 +565,6 @@ def rebuild_all_scores(db: Session, user_id: str) -> dict:
 
 
 def get_score_distribution(db: Session, user_id: str) -> dict:
-    """
-    Return score distribution stats for diagnostics.
-    Useful for verifying the scoring is working as expected.
-    """
-    from sqlalchemy import func
-
     scores = db.query(TrackScore).filter_by(user_id=user_id).all()
     if not scores:
         return {}

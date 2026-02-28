@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback } from 'react'
 import {
   Activity, Music2, Telescope, CheckCircle2, XCircle, Loader2,
@@ -151,7 +152,7 @@ function ActivityFeed({ events }) {
               <Icon size={12} style={{ color: meta.color }} />
             </div>
             <div className="flex-1 min-w-0">
-              <div className="text-xs truncate" style={{ color:'var(--text-primary)' }}>{e.message}</div>
+              <div className="text-xs break-words" style={{ color:'var(--text-primary)' }}>{e.message}</div>
               <div className="text-[10px] mt-0.5" style={{ color:'var(--text-muted)' }}>{meta.label}</div>
             </div>
             <div className="text-[10px] flex-shrink-0 mt-0.5" style={{ color:'var(--text-muted)' }}>{timeAgo(e.created_at)}</div>
@@ -233,11 +234,11 @@ export default function Dashboard() {
         <StatCard icon={Disc3}      label="Artists tracked" value={libraryStats?.total_artists?.toLocaleString() ?? '—'}  color="#f78166"         delay={150} />
       </div>
 
-      {/* Main grid */}
+      {/* Main grid — Activity is wide (col-span-2), Users+Services are narrow */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
 
-        {/* Users */}
-        <div className="lg:col-span-2 space-y-4">
+        {/* Left column: Users + next-index pill */}
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="section-label flex items-center gap-2">
               <Users size={12} /> Users
@@ -247,26 +248,11 @@ export default function Dashboard() {
             ? <div className="card flex items-center justify-center py-12" style={{ color:'var(--text-muted)' }}>
                 <Loader2 size={20} className="animate-spin" />
               </div>
-            : <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 stagger">
+            : <div className="space-y-3 stagger">
                 {users.map(u => <UserCard key={u.jellyfin_user_id} user={u} />)}
               </div>
           }
 
-          {nextIndex && (
-            <div className="flex items-center gap-3 px-4 py-3 rounded-xl anim-fade-up"
-                 style={{ background:'rgba(96,165,250,0.06)', border:'1px solid rgba(96,165,250,0.15)' }}>
-              <Clock size={13} style={{ color:'#60a5fa', flexShrink:0 }} />
-              <span className="text-xs" style={{ color:'var(--text-secondary)' }}>
-                Next index: <span style={{ color:'var(--text-primary)', fontWeight:600 }}>
-                  {new Date(utc(nextIndex)).toLocaleTimeString()}
-                </span>
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Right column */}
-        <div className="space-y-4">
           <div className="card anim-fade-up" style={{ animationDelay:'100ms' }}>
             <div className="section-label flex items-center gap-2 mb-3">
               <Radio size={12} /> Services
@@ -282,7 +268,22 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="card anim-fade-up" style={{ animationDelay:'150ms' }}>
+          {nextIndex && (
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl anim-fade-up"
+                 style={{ background:'rgba(96,165,250,0.06)', border:'1px solid rgba(96,165,250,0.15)' }}>
+              <Clock size={13} style={{ color:'#60a5fa', flexShrink:0 }} />
+              <span className="text-xs" style={{ color:'var(--text-secondary)' }}>
+                Next index: <span style={{ color:'var(--text-primary)', fontWeight:600 }}>
+                  {new Date(utc(nextIndex)).toLocaleTimeString()}
+                </span>
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Right wide column: Recent Activity */}
+        <div className="lg:col-span-2">
+          <div className="card anim-fade-up h-full" style={{ animationDelay:'150ms' }}>
             <div className="section-label flex items-center gap-2 mb-3">
               <Activity size={12} /> Recent Activity
             </div>

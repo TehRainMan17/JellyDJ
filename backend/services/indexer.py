@@ -167,7 +167,16 @@ def _parse_last_played(item: dict) -> Optional[datetime]:
 
 
 def _upsert_play(db: Session, user_id: str, item: dict):
-    """Insert or update a single play record."""
+    """
+    Insert or update a single play record.
+
+    v3: tracks the last 3 play dates before last_played.
+    On each update, if last_played has changed (Jellyfin reported a newer play),
+    we rotate the history window:
+        prev_played_3 ← prev_played_2 ← prev_played_1 ← old last_played
+    This gives a 4-point window (prev_3, prev_2, prev_1, last_played) that
+    the scoring engine can use to calculate medium-term play frequency.
+    """
     jellyfin_id = item.get("Id", "")
     if not jellyfin_id:
         return
@@ -177,7 +186,6 @@ def _upsert_play(db: Session, user_id: str, item: dict):
     is_favorite = user_data.get("IsFavorite", False)
     last_played = _parse_last_played(item)
 
-    # Primary genre
     genres = item.get("Genres", [])
     genre = genres[0] if genres else ""
 
@@ -186,12 +194,23 @@ def _upsert_play(db: Session, user_id: str, item: dict):
     ).first()
 
     if existing:
+        # Rotate play history if last_played advanced
+        old_last = existing.last_played
+        if last_played and old_last and last_played > old_last:
+            # Shift the window: oldest falls off, new date becomes last_played
+            existing.prev_played_3 = existing.prev_played_2
+            existing.prev_played_2 = existing.prev_played_1
+            existing.prev_played_1 = old_last
+
         existing.play_count = play_count
         existing.last_played = last_played
         existing.is_favorite = is_favorite
         existing.genre = genre
         existing.track_name = item.get("Name", existing.track_name)
-        existing.artist_name = item.get("AlbumArtist", "") or item.get("Artists", [""])[0] if item.get("Artists") else existing.artist_name
+        existing.artist_name = (
+            item.get("AlbumArtist", "") or
+            (item.get("Artists", [""])[0] if item.get("Artists") else existing.artist_name)
+        )
         existing.album_name = item.get("Album", existing.album_name)
         existing.synced_at = datetime.utcnow()
     else:
@@ -208,6 +227,7 @@ def _upsert_play(db: Session, user_id: str, item: dict):
             play_count=play_count,
             last_played=last_played,
             is_favorite=is_favorite,
+            # prev_played_1/2/3 start NULL — populated on subsequent index runs
         ))
 
 
@@ -333,34 +353,89 @@ def _rebuild_taste_profile(db: Session, user_id: str):
     db.commit()
 
 
-async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session):
-    """Full index run for a single user."""
+async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session) -> bool:
+    """
+    Full index run for a single user.
+
+    Returns True on success, False on failure.
+    Does NOT raise — caller continues with remaining users regardless.
+    All errors are written to system_events so they appear in the dashboard
+    activity feed with the full error message.
+    """
+    import traceback as _tb
     log.info(f"Indexing play history for user: {user.username}")
+
+    def _ensure_status_row():
+        row = db.query(UserSyncStatus).filter_by(user_id=user.jellyfin_user_id).first()
+        if not row:
+            row = UserSyncStatus(user_id=user.jellyfin_user_id)
+            db.add(row)
+        row.username = user.username
+        return row
+
     try:
-        items = await _fetch_played_items(base_url, api_key, user.jellyfin_user_id)
-        log.info(f"  Fetched {len(items)} played items for {user.username}")
+        # ── Step A: fetch play history ─────────────────────────────────────
+        try:
+            items = await _fetch_played_items(base_url, api_key, user.jellyfin_user_id)
+            log.info(f"  Fetched {len(items)} played items for {user.username}")
+        except Exception as e:
+            err = f"Jellyfin fetch failed for {user.username}: {type(e).__name__}: {e}"
+            log.error(f"  {err}")
+            log.error(_tb.format_exc())
+            log_event(db, "index_error", err)
+            status_row = _ensure_status_row()
+            status_row.status = "error"
+            db.commit()
+            return False
 
+        # ── Step B: upsert play records ────────────────────────────────────
+        upsert_errors = 0
         for item in items:
-            _upsert_play(db, user.jellyfin_user_id, item)
-        db.commit()
+            try:
+                _upsert_play(db, user.jellyfin_user_id, item)
+            except Exception as e:
+                upsert_errors += 1
+                log.warning(f"  Upsert failed for item {item.get('Id', '?')}: {e}")
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            err = f"DB commit failed for {user.username}: {type(e).__name__}: {e}"
+            log.error(f"  {err}")
+            log_event(db, "index_error", err)
+            status_row = _ensure_status_row()
+            status_row.status = "error"
+            db.commit()
+            return False
 
-        # Legacy taste profile (kept for discovery queue compatibility until Module 8b)
-        _rebuild_taste_profile(db, user.jellyfin_user_id)
+        if upsert_errors:
+            log.warning(f"  {upsert_errors} upsert error(s) for {user.username} — partial data written")
+            log_event(db, "index_error",
+                      f"{user.username}: {upsert_errors} track(s) failed to save — others indexed OK")
 
-        # Module 8a: rebuild artist/genre profiles and pre-computed track scores
-        rebuild_all_scores(db, user.jellyfin_user_id)
+        # ── Step C: rebuild profiles + scores ─────────────────────────────
+        try:
+            _rebuild_taste_profile(db, user.jellyfin_user_id)
+        except Exception as e:
+            log.warning(f"  Taste profile rebuild failed for {user.username}: {e} — continuing")
 
-        # Pre-warm popularity + similarity cache for the recommendation engine
-        await warm_popularity_cache(user.jellyfin_user_id, db)
+        try:
+            rebuild_all_scores(db, user.jellyfin_user_id)
+        except Exception as e:
+            err = f"Score rebuild failed for {user.username}: {type(e).__name__}: {e}"
+            log.error(f"  {err}")
+            log.error(_tb.format_exc())
+            log_event(db, "index_error", err)
+            # Don't abort — play data was written; scores can be fixed on next run
 
-        # Update sync status
-        status_row = db.query(UserSyncStatus).filter_by(
-            user_id=user.jellyfin_user_id
-        ).first()
-        if not status_row:
-            status_row = UserSyncStatus(user_id=user.jellyfin_user_id)
-            db.add(status_row)
-        status_row.username = user.username
+        # ── Step D: popularity cache (best-effort, never blocks index) ────
+        try:
+            await warm_popularity_cache(user.jellyfin_user_id, db)
+        except Exception as e:
+            log.warning(f"  Popularity cache warm failed for {user.username}: {e} — non-fatal")
+
+        # ── Step E: update sync status ────────────────────────────────────
+        status_row = _ensure_status_row()
         status_row.last_synced = datetime.utcnow()
         status_row.tracks_indexed = db.query(Play).filter_by(
             user_id=user.jellyfin_user_id
@@ -370,21 +445,23 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
 
         log.info(f"  Done indexing {user.username}: {status_row.tracks_indexed} tracks")
         log_event(db, "index_complete",
-                  f"Indexed {user.username}: {status_row.tracks_indexed} tracks in library")
+                  f"Indexed {user.username}: {status_row.tracks_indexed} tracks in library"
+                  + (f" ({upsert_errors} save errors)" if upsert_errors else ""))
+        return True
 
     except Exception as e:
-        log.error(f"  Index failed for {user.username}: {e}")
-        log_event(db, "index_error", f"Index failed for {user.username}: {e}")
-        status_row = db.query(UserSyncStatus).filter_by(
-            user_id=user.jellyfin_user_id
-        ).first()
-        if not status_row:
-            status_row = UserSyncStatus(user_id=user.jellyfin_user_id)
-            db.add(status_row)
-        status_row.username = user.username
-        status_row.status = "error"
-        db.commit()
-        raise
+        # Catch-all for any unexpected failure not caught above
+        err = f"Index failed for {user.username}: {type(e).__name__}: {e}"
+        log.error(f"  {err}")
+        log.error(_tb.format_exc())
+        log_event(db, "index_error", err)
+        try:
+            status_row = _ensure_status_row()
+            status_row.status = "error"
+            db.commit()
+        except Exception:
+            pass
+        return False
 
 
 async def _sync_usernames(base_url: str, api_key: str, db: Session):
@@ -475,9 +552,9 @@ async def run_full_index():
                 from models import ManagedUser as MU
                 fresh_user = user_db.query(MU).filter_by(jellyfin_user_id=uid).first()
                 if fresh_user:
-                    await index_user(base_url, api_key, fresh_user, user_db)
-            except Exception as e:
-                log.error(f"  User {uname} index failed (continuing): {e}")
+                    success = await index_user(base_url, api_key, fresh_user, user_db)
+                    if not success:
+                        log.warning(f"  User {uname} index completed with errors — see activity feed")
             finally:
                 user_db.close()
 
@@ -1024,3 +1101,143 @@ def _warm_similar_artist_top_albums(top_artist_rows, db):
             log.debug(f"    Top album cached for {artist_name}: {alb_name}")
         except Exception as e:
             log.warning(f"    Top album cache failed for '{artist_name}': {e}")
+
+# ── Billboard chart sync ──────────────────────────────────────────────────────
+
+def _normalise_for_match(s: str) -> str:
+    """Lowercase, strip punctuation/features for fuzzy library matching."""
+    import re
+    s = s.lower()
+    # Strip feat./ft. and everything after
+    s = re.sub(r'\s+(feat|ft|featuring|with)\.?\s+.*', '', s)
+    # Strip punctuation
+    s = re.sub(r'[^\w\s]', '', s)
+    return s.strip()
+
+
+def sync_billboard_chart(db: Session) -> dict:
+    """
+    Fetch the Billboard Hot 100, replace the billboard_chart_entries table,
+    and attempt to match each entry to a LibraryTrack.
+
+    Called by the scheduler weekly (configurable).
+    Always replaces all 100 rows — no historical accumulation.
+    Returns stats dict.
+    """
+    import re as _re
+    log.info("Billboard: fetching Hot 100...")
+
+    try:
+        import billboard as bb
+        chart = bb.ChartData("hot-100")
+    except Exception as e:
+        log.error(f"Billboard fetch failed: {e}")
+        log_event(db, "index_error", f"Billboard chart fetch failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+    chart_date = getattr(chart, "date", None) or getattr(chart, "previousDate", None)
+
+    # Build a lookup of normalised (artist, title) → jellyfin_item_id from library
+    library_tracks = db.query(LibraryTrack).filter(LibraryTrack.missing_since.is_(None)).all()
+    lib_lookup: dict[tuple, str] = {}
+    for lt in library_tracks:
+        key = (_normalise_for_match(lt.artist_name), _normalise_for_match(lt.track_name))
+        lib_lookup[key] = lt.jellyfin_item_id
+
+    # Wipe existing chart rows and replace — always exactly 100 rows
+    from models import BillboardChartEntry
+    db.query(BillboardChartEntry).delete()
+
+    now = datetime.utcnow()
+    matched = 0
+    entries_added = 0
+
+    for entry in chart[:100]:
+        rank = entry.rank
+        title = entry.title or ""
+        artist = entry.artist or ""
+
+        # chart_score: rank 1 → 100, rank 100 → 1
+        chart_score = max(1.0, 101.0 - rank)
+
+        # Try to match against library
+        norm_key = (_normalise_for_match(artist), _normalise_for_match(title))
+        jellyfin_id = lib_lookup.get(norm_key)
+
+        # Fallback: try artist-only match on title substring
+        if not jellyfin_id:
+            norm_artist = _normalise_for_match(artist)
+            norm_title = _normalise_for_match(title)
+            for (la, lt_), jid in lib_lookup.items():
+                if la == norm_artist and (norm_title in lt_ or lt_ in norm_title):
+                    jellyfin_id = jid
+                    break
+
+        if jellyfin_id:
+            matched += 1
+
+        db.add(BillboardChartEntry(
+            rank=rank,
+            title=title,
+            artist=artist,
+            chart_score=chart_score,
+            weeks_on_chart=getattr(entry, "weeks", None),
+            peak_position=getattr(entry, "peakPos", None),
+            last_week_position=getattr(entry, "lastPos", None) or None,
+            jellyfin_item_id=jellyfin_id,
+            fetched_at=now,
+            chart_date=str(chart_date) if chart_date else None,
+        ))
+        entries_added += 1
+
+    db.commit()
+
+    # Update last_billboard_refresh in AutomationSettings
+    try:
+        from models import AutomationSettings
+        s = db.query(AutomationSettings).first()
+        if s:
+            s.last_billboard_refresh = now
+            db.commit()
+    except Exception:
+        pass
+
+    msg = (f"Billboard Hot 100 refreshed: {entries_added} entries, "
+           f"{matched} matched to library" +
+           (f" (chart date: {chart_date})" if chart_date else ""))
+    log.info(f"Billboard: {msg}")
+    log_event(db, "index_complete", msg)
+
+    return {"ok": True, "entries": entries_added, "matched": matched, "chart_date": str(chart_date)}
+
+
+def get_chart_score_for_track(jellyfin_item_id: str, db: Session) -> float:
+    """
+    Return the current Billboard chart_score (1–100) for a track, or 0.0
+    if it's not on the chart. Used by the scoring engine and playlist writer.
+    """
+    from models import BillboardChartEntry
+    entry = db.query(BillboardChartEntry).filter_by(
+        jellyfin_item_id=jellyfin_item_id
+    ).first()
+    return entry.chart_score if entry else 0.0
+
+
+def get_current_hot100(db: Session) -> list[dict]:
+    """Return the current Hot 100 as a list of dicts, ordered by rank."""
+    from models import BillboardChartEntry
+    rows = db.query(BillboardChartEntry).order_by(BillboardChartEntry.rank.asc()).all()
+    return [
+        {
+            "rank": r.rank,
+            "title": r.title,
+            "artist": r.artist,
+            "chart_score": r.chart_score,
+            "weeks_on_chart": r.weeks_on_chart,
+            "peak_position": r.peak_position,
+            "in_library": bool(r.jellyfin_item_id),
+            "jellyfin_item_id": r.jellyfin_item_id,
+            "chart_date": r.chart_date,
+        }
+        for r in rows
+    ]

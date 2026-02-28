@@ -1,4 +1,3 @@
-
 """
 JellyDJ Playlist Writer — Module 7
 
@@ -7,7 +6,7 @@ Each managed user gets their own named playlist visible to all Jellyfin users.
 
 Playlist types:
   for_you         — "For You - Alice"          affinity-weighted
-  discover        — "Discover Weekly - Alice"  novelty-heavy
+  discover        — "Discover Weekly - Alice"  novelty-heavy, NEW-artist-first
   most_played     — "Most Played - Alice"      sorted by play count
   recently_played — "Recently Played - Alice"  sorted by last_played desc
 
@@ -20,7 +19,9 @@ Flow per playlist:
 """
 from __future__ import annotations
 
+import json
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -115,6 +116,52 @@ def _diversify(
     return result
 
 
+def _build_artist_play_totals(user_id: str, db: Session) -> dict[str, int]:
+    """
+    Return a dict of {artist_name_lower: total_play_count} for the user.
+
+    This is the key signal for Discover Weekly: we need to know which artists
+    the user has NEVER played (strangers), barely played (acquaintances), and
+    plays heavily (familiar). We derive this from the ArtistProfile table which
+    the scoring engine builds on every index run.
+
+    Falls back to summing TrackScore.play_count per artist if ArtistProfile
+    is empty (e.g. first run before scoring).
+    """
+    from models import ArtistProfile
+    rows = db.query(ArtistProfile).filter_by(user_id=user_id).all()
+    if rows:
+        return {r.artist_name.lower(): r.total_plays for r in rows}
+
+    # Fallback: aggregate from TrackScore
+    from sqlalchemy import func
+    results = (
+        db.query(TrackScore.artist_name, func.sum(TrackScore.play_count))
+        .filter_by(user_id=user_id)
+        .group_by(TrackScore.artist_name)
+        .all()
+    )
+    return {artist.lower(): total for artist, total in results if artist}
+
+
+def _get_artist_popularity(artist_name: str, db: Session) -> float:
+    """
+    Pull cached popularity score for an artist (0–100).
+    Uses the PopularityCache keyed as 'artist:{name_lower}'.
+    Returns a neutral 50.0 if nothing is cached — never blocks.
+    """
+    from models import PopularityCache
+    key = f"artist:{artist_name.lower()}"
+    row = db.query(PopularityCache).filter_by(cache_key=key).first()
+    if not row:
+        return 50.0
+    try:
+        data = json.loads(row.payload)
+        return float(data.get("popularity_score", 50.0))
+    except Exception:
+        return 50.0
+
+
 def _get_tracks_for_playlist(
     playlist_type: str,
     user_id: str,
@@ -124,18 +171,41 @@ def _get_tracks_for_playlist(
     """
     Return a list of Jellyfin item IDs for the given playlist type.
 
-    Variety mechanisms (moderate randomness):
+    Variety mechanisms:
     - for_you:   20% reserved discovery slots (unplayed from loved artists) +
                  10% deep cuts (high-affinity tracks not heard in 6+ months) +
                  mid-tier score jitter on the remaining 70%
-    - discover:  55% unplayed + 25% deep cuts + 20% recently played stale tracks
-                 all with score jitter in mid-tier
-    - most_played / recently_played: stable (these are intentionally deterministic)
+    - discover:  NEW-ARTIST-FIRST algorithm (see below)
+    - most_played / recently_played: stable (intentionally deterministic)
+
+    Discover Weekly algorithm (completely reworked):
+    ─────────────────────────────────────────────────
+    Goal: Surface the absolute best songs from artists the user has never
+    or barely played, filtered by genre/taste compatibility, sorted by
+    global popularity so we always lead with genuine hits — not deep cuts.
+
+    Artist familiarity tiers (based on ArtistProfile.total_plays):
+      Stranger    — 0 total plays  → 60% of playlist
+      Acquaintance — 1–9 plays     → 25% of playlist
+      Familiar     — 10+ plays, unplayed tracks → 15% of playlist (safety net)
+
+    Sorting within each tier:
+      Stranger/Acquaintance: genre_affinity (taste match) × artist_popularity
+        This finds "sounds like what you love" artists ranked by how well-known
+        they are, so we serve their biggest hits rather than obscure B-sides.
+      Familiar: genre_affinity DESC (still unplayed, just from known artists)
+
+    Per-artist cap:
+      Discover Weekly uses max_per_artist=1 (one song per artist, period).
+      This forces maximum breadth. If the pool runs dry we relax to 2.
+
+    Popularity bonus:
+      Each track gets a discover_score = genre_affinity * 0.4 + popularity * 0.6
+      (popularity from PopularityCache for the artist, 0–100).
+      This means a genre-matched artist with 80 popularity scores above a
+      perfect-genre-match artist with 20 popularity — we always lead with hits.
     """
-    import random
-    from datetime import timedelta
-    from models import TrackScore, Play
-    from sqlalchemy import text as satext, cast, Float as SAFloat
+    from sqlalchemy import text as satext
 
     limit = PLAYLIST_SIZES.get(playlist_type, 50)
     score_count = db.query(TrackScore).filter_by(user_id=user_id).count()
@@ -190,7 +260,6 @@ def _get_tracks_for_playlist(
         for r in mid:
             score = float(r.final_score)
             jitter = random.uniform(-jitter_pct, jitter_pct) * score
-            # Temporarily store jittered score for sorting; don't persist
             r._jittered = score + jitter
         mid.sort(key=lambda r: getattr(r, "_jittered", float(r.final_score)), reverse=True)
         return top + mid
@@ -242,64 +311,179 @@ def _get_tracks_for_playlist(
             .all()
         )
         deep_pool = [r for r in deep_pool if r.jellyfin_item_id not in combined_set]
-        random.shuffle(deep_pool)   # true shuffle for deep cuts — surprise factor
+        random.shuffle(deep_pool)
         deep_ids = _diversify(deep_pool, n_deep_cuts)
 
         result = core_ids + discovery_ids + deep_ids
-        random.shuffle(result)   # interleave all three pools so playlist doesn't feel sectioned
+        random.shuffle(result)
         return result
 
-    # ── discover: unplayed-heavy + deep cuts + stale played ──────────────────
+    # ── discover: new-artist-first, popularity-sorted ────────────────────────
 
     if playlist_type == "discover":
-        n_unplayed   = int(limit * 0.55)   # 55% never heard
-        n_deep_cuts  = int(limit * 0.25)   # 25% deep cuts (6+ months unheard)
-        n_stale      = limit - n_unplayed - n_deep_cuts  # 20% oldest plays
+        #
+        # DISCOVER WEEKLY — complete rework
+        #
+        # The old algorithm queried unplayed tracks sorted by final_score, which
+        # bakes in artist_affinity. That meant "most loved artist's unplayed B-sides"
+        # won every time — the opposite of discovery.
+        #
+        # New approach:
+        #   1. Pull ALL unplayed tracks + their genre_affinity
+        #   2. Bucket by artist familiarity (stranger / acquaintance / familiar)
+        #   3. Within each bucket, rank by discover_score:
+        #        discover_score = genre_affinity * 0.4 + artist_popularity * 0.6
+        #      Genre affinity keeps it on-taste; popularity ensures we serve
+        #      genuine hits rather than obscure album cuts.
+        #   4. Blend pools: 60% strangers, 25% acquaintances, 15% familiar-unplayed
+        #   5. max_per_artist=1 for maximum breadth (relax to 2 if pool is thin)
+        #
 
-        unplayed_pool = (
-            db.query(TrackScore)
-            .filter_by(user_id=user_id)
-            .filter(TrackScore.is_played == False)
-            .order_by(satext("CAST(final_score AS REAL) DESC"))
-            .limit(n_unplayed * 6)
-            .all()
-        )
-        unplayed_pool = _jitter(unplayed_pool)
-        unplayed_ids = _diversify(unplayed_pool, n_unplayed)
-        used = set(unplayed_ids)
+        # Familiarity thresholds
+        STRANGER_MAX_PLAYS    = 0    # never played a single track by this artist
+        ACQUAINTANCE_MAX_PLAYS = 9   # played 1–9 tracks total by this artist
 
-        cutoff = datetime.utcnow() - timedelta(days=180)
-        deep_pool = (
+        # Pool size targets
+        n_stranger      = int(limit * 0.60)   # 60%  — pure new artists
+        n_acquaintance  = int(limit * 0.25)   # 25%  — lightly heard artists
+        n_familiar      = limit - n_stranger - n_acquaintance  # 15% safety net
+
+        # Build artist familiarity map for this user
+        artist_plays = _build_artist_play_totals(user_id, db)
+
+        # Fetch all unplayed tracks (broad pool — we'll sort in Python)
+        # We need genre_affinity to compute discover_score so we can't
+        # just ORDER BY in SQL without also sorting by popularity.
+        fetch_limit = max(limit * 20, 400)
+        all_unplayed = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(
-                TrackScore.is_played == True,
-                TrackScore.last_played < cutoff,
+                TrackScore.is_played == False,
+                TrackScore.auto_skip == False if hasattr(TrackScore, 'auto_skip') else True,
             )
-            .order_by(satext("CAST(artist_affinity AS REAL) DESC"))
-            .limit(n_deep_cuts * 6)
+            .limit(fetch_limit)
             .all()
         )
-        deep_pool = [r for r in deep_pool if r.jellyfin_item_id not in used]
-        random.shuffle(deep_pool)
-        deep_ids = _diversify(deep_pool, n_deep_cuts)
-        used |= set(deep_ids)
 
-        stale_pool = (
+        # Also pull tracks from acquaintance artists that haven't been played recently
+        # (a different slice: played artist, but not this specific track)
+        all_played_artist_unplayed_tracks = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(
-                TrackScore.is_played == True,
-                TrackScore.last_played.isnot(None),
+                TrackScore.is_played == False,
             )
-            .order_by(TrackScore.last_played)   # oldest first
-            .limit(n_stale * 6)
+            .limit(fetch_limit)
             .all()
         )
-        stale_pool = [r for r in stale_pool if r.jellyfin_item_id not in used]
-        stale_ids = _diversify(stale_pool, n_stale)
+        # Merge and deduplicate (all_unplayed is a subset if is_played covers it)
+        seen_ids: set[str] = set()
+        candidate_pool: list = []
+        for row in all_unplayed + all_played_artist_unplayed_tracks:
+            if row.jellyfin_item_id not in seen_ids:
+                seen_ids.add(row.jellyfin_item_id)
+                candidate_pool.append(row)
 
-        result = unplayed_ids + deep_ids + stale_ids
+        # Build popularity cache lookup (batch: avoid N+1 queries)
+        artist_names_needed = {(r.artist_name or "").lower() for r in candidate_pool}
+        popularity_cache: dict[str, float] = {}
+        for aname in artist_names_needed:
+            popularity_cache[aname] = _get_artist_popularity(aname, db)
+
+        # Score each track for discover purposes
+        def _discover_score(row) -> float:
+            """
+            discover_score = genre_affinity * 0.4 + artist_popularity * 0.6
+
+            We use genre_affinity (not artist_affinity) because:
+            - genre_affinity tells us "does this fit your taste in music"
+            - artist_affinity tells us "do you already love this artist" — wrong
+              for a playlist trying to introduce NEW artists
+
+            Artist popularity (0–100 from PopularityCache) is weighted at 60%
+            so we surface genuine hits first, not deep cuts from unknown artists.
+            A track with genre_affinity=80 and popularity=20 scores 44.
+            A track with genre_affinity=60 and popularity=80 scores 72.
+            The hit wins — intentionally.
+            """
+            genre_aff = float(row.genre_affinity or 0)
+            artist_key = (row.artist_name or "").lower()
+            pop = popularity_cache.get(artist_key, 50.0)
+            return genre_aff * 0.4 + pop * 0.6
+
+        # Bucket by artist familiarity
+        strangers: list      = []   # artist total plays == 0
+        acquaintances: list  = []   # artist total plays 1–9
+        familiar: list       = []   # artist total plays 10+, track unplayed
+
+        for row in candidate_pool:
+            artist_key = (row.artist_name or "").lower()
+            total = artist_plays.get(artist_key, 0)
+            row._discover_score = _discover_score(row)
+
+            if total <= STRANGER_MAX_PLAYS:
+                strangers.append(row)
+            elif total <= ACQUAINTANCE_MAX_PLAYS:
+                acquaintances.append(row)
+            else:
+                familiar.append(row)
+
+        # Sort each bucket by discover_score DESC — hits first
+        strangers.sort(key=lambda r: r._discover_score, reverse=True)
+        acquaintances.sort(key=lambda r: r._discover_score, reverse=True)
+        familiar.sort(key=lambda r: r._discover_score, reverse=True)
+
+        log.info(
+            f"  Discover Weekly [{username}]: "
+            f"{len(strangers)} stranger tracks, "
+            f"{len(acquaintances)} acquaintance tracks, "
+            f"{len(familiar)} familiar-unplayed tracks"
+        )
+
+        # Pick from each bucket with tight per-artist cap (max 1 song per artist)
+        # This maximises breadth — one hit from each new artist rather than
+        # 3 songs from the same "new to you" artist.
+        used_ids: set[str] = set()
+
+        def _pick_bucket(rows: list, n: int, max_pa: int = 1) -> list[str]:
+            counts: dict[str, int] = {}
+            picked = []
+            for row in rows:
+                if row.jellyfin_item_id in used_ids:
+                    continue
+                key = (row.artist_name or "").lower()
+                if counts.get(key, 0) < max_pa:
+                    picked.append(row.jellyfin_item_id)
+                    counts[key] = counts.get(key, 0) + 1
+                    used_ids.add(row.jellyfin_item_id)
+                if len(picked) >= n:
+                    break
+            return picked
+
+        stranger_ids     = _pick_bucket(strangers,     n_stranger,     max_pa=1)
+        acquaintance_ids = _pick_bucket(acquaintances, n_acquaintance, max_pa=1)
+        familiar_ids     = _pick_bucket(familiar,      n_familiar,     max_pa=2)
+
+        # If a bucket ran dry, backfill from the others (still strict cap)
+        shortage = limit - len(stranger_ids) - len(acquaintance_ids) - len(familiar_ids)
+        if shortage > 0:
+            log.info(f"  Discover Weekly [{username}]: backfilling {shortage} slots from remaining pools")
+            remaining = [
+                r for r in (strangers + acquaintances + familiar)
+                if r.jellyfin_item_id not in used_ids
+            ]
+            remaining.sort(key=lambda r: r._discover_score, reverse=True)
+            backfill = _pick_bucket(remaining, shortage, max_pa=2)
+            familiar_ids.extend(backfill)
+
+        result = stranger_ids + acquaintance_ids + familiar_ids
+        log.info(
+            f"  Discover Weekly [{username}]: "
+            f"{len(stranger_ids)} strangers + {len(acquaintance_ids)} acquaintances + "
+            f"{len(familiar_ids)} familiar = {len(result)} total"
+        )
+        # Shuffle within tiers so the playlist doesn't open with a block of one style
         random.shuffle(result)
         return result
 

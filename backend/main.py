@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -46,6 +47,45 @@ def _run_migrations():
         ("automation_settings", "last_auto_download",          "DATETIME", "NULL"),
         ("discovery_queue",     "auto_queued",                 "BOOLEAN",  "0"),
         ("discovery_queue",     "auto_skip",                   "BOOLEAN",  "0"),
+        # v3: play history window — last 3 play dates before last_played
+        ("plays", "prev_played_1",        "DATETIME", "NULL"),
+        ("plays", "prev_played_2",        "DATETIME", "NULL"),
+        ("plays", "prev_played_3",        "DATETIME", "NULL"),
+        # v3: skip + cooldown signals denormalised onto Play
+        ("plays", "total_skips",          "INTEGER",  "0"),
+        ("plays", "consecutive_skips",    "INTEGER",  "0"),
+        ("plays", "voluntary_play_count", "INTEGER",  "0"),
+        ("plays", "cooldown_until",       "DATETIME", "NULL"),
+        ("plays", "cooldown_count",       "INTEGER",  "0"),
+        # v3: billboard chart refresh schedule on AutomationSettings
+        ("automation_settings", "billboard_refresh_enabled",        "BOOLEAN",  "1"),
+        ("automation_settings", "billboard_refresh_interval_hours", "INTEGER",  "168"),
+        ("automation_settings", "last_billboard_refresh",           "DATETIME", "NULL"),
+        # v2: enrichment + scoring columns (silently skipped if already present)
+        ("artist_profiles",  "replay_boost",      "REAL",     "0.0"),
+        ("artist_profiles",  "related_artists",   "TEXT",     "NULL"),
+        ("artist_profiles",  "tags",              "TEXT",     "NULL"),
+        ("track_scores",     "cooldown_until",    "DATETIME", "NULL"),
+        ("track_scores",     "replay_boost",      "REAL",     "0.0"),
+        ("track_scores",     "global_popularity", "REAL",     "NULL"),
+        ("track_scores",     "skip_streak",       "INTEGER",  "0"),
+        ("skip_penalties",   "consecutive_skips",   "INTEGER",  "0"),
+        ("skip_penalties",   "skip_streak_peak",    "INTEGER",  "0"),
+        ("skip_penalties",   "last_skip_at",        "DATETIME", "NULL"),
+        ("skip_penalties",   "last_completed_at",   "DATETIME", "NULL"),
+        ("playback_events",  "source_context",  "TEXT",    "NULL"),
+        ("playback_events",  "session_id",      "TEXT",    "NULL"),
+        ("automation_settings", "enrichment_enabled",        "BOOLEAN",  "1"),
+        ("automation_settings", "enrichment_interval_hours", "INTEGER",  "48"),
+        ("automation_settings", "last_enrichment",           "DATETIME", "NULL"),
+        # v2: enrichment columns on library_tracks
+        ("library_tracks", "mbid",              "TEXT",     "NULL"),
+        ("library_tracks", "lastfm_url",        "TEXT",     "NULL"),
+        ("library_tracks", "global_playcount",  "INTEGER",  "NULL"),
+        ("library_tracks", "global_listeners",  "INTEGER",  "NULL"),
+        ("library_tracks", "tags",              "TEXT",     "NULL"),
+        ("library_tracks", "enriched_at",       "DATETIME", "NULL"),
+        ("library_tracks", "enrichment_source", "TEXT",     "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
