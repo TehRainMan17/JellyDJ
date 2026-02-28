@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Central background job scheduler.
 
@@ -41,6 +42,7 @@ INDEX_JOB_ID          = "play_history_index"
 DISCOVERY_JOB_ID      = "discovery_refresh"
 PLAYLIST_JOB_ID       = "playlist_regen"
 AUTO_DOWNLOAD_JOB_ID  = "auto_download"
+BILLBOARD_JOB_ID      = "billboard_refresh"
 
 
 def _get_settings(db):
@@ -111,6 +113,46 @@ def _job_auto_download():
     _sync_wrap(_run_auto_download)
 
 
+def _job_billboard_refresh():
+    """Fetch Billboard Hot 100 and update the chart entries table."""
+    from database import SessionLocal
+    from services.indexer import sync_billboard_chart
+    db = SessionLocal()
+    try:
+        sync_billboard_chart(db)
+    except Exception as e:
+        log.error(f"Billboard refresh job failed: {e}")
+    finally:
+        db.close()
+
+
+def _run_billboard_if_empty():
+    """
+    Run a billboard sync immediately if the table has never been populated.
+    This ensures the dashboard shows chart data on first launch without waiting
+    a full week for the scheduler to fire.
+    """
+    import threading
+    from database import SessionLocal
+    from models import BillboardChartEntry
+
+    def _check_and_run():
+        db = SessionLocal()
+        try:
+            count = db.query(BillboardChartEntry).count()
+            if count == 0:
+                log.info("Billboard table empty — running initial chart fetch...")
+                from services.indexer import sync_billboard_chart
+                sync_billboard_chart(db)
+        except Exception as e:
+            log.warning(f"Initial billboard fetch failed (non-fatal): {e}")
+        finally:
+            db.close()
+
+    t = threading.Thread(target=_check_and_run, daemon=True, name="billboard-init")
+    t.start()
+
+
 def start_scheduler(db_session_factory):
     """
     Register all four jobs and start the scheduler.
@@ -156,12 +198,23 @@ def start_scheduler(db_session_factory):
         misfire_grace_time=600,
     )
 
+    scheduler.add_job(
+        _job_billboard_refresh,
+        trigger=IntervalTrigger(hours=168),  # weekly default
+        id=BILLBOARD_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     scheduler.start()
 
     # Auto-download starts paused — reschedule_automation_jobs will enable it
     # only if auto_download_enabled=True is saved in the database
     scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (4 jobs registered).")
+    log.info("Scheduler started (5 jobs registered).")
+
+    # Run billboard sync immediately on first start if table is empty
+    _run_billboard_if_empty()
 
     # Immediately apply stored settings so intervals are correct from the first run
     from database import SessionLocal
@@ -316,6 +369,36 @@ def reschedule_automation_jobs(db):
         except Exception:
             pass
 
+    # Billboard chart refresh — weekly by default
+    billboard_enabled  = getattr(s, "billboard_refresh_enabled", True)
+    billboard_interval = getattr(s, "billboard_refresh_interval_hours", 168) or 168
+    if billboard_enabled:
+        from datetime import timedelta as _td
+        _bb_interval = _td(hours=billboard_interval)
+        _bb_last     = getattr(s, "last_billboard_refresh", None)
+        _now         = datetime.now(timezone.utc)
+        if _bb_last is None:
+            _bb_next = _now + _td(minutes=1)   # run soon if never run
+        else:
+            if _bb_last.tzinfo is None:
+                _bb_last = _bb_last.replace(tzinfo=timezone.utc)
+            _bb_next = _bb_last + _bb_interval
+            if _bb_next < _now:
+                _bb_next = _now + _td(minutes=1)
+        try:
+            scheduler.reschedule_job(
+                BILLBOARD_JOB_ID,
+                trigger=IntervalTrigger(hours=billboard_interval, start_date=_bb_next),
+            )
+            scheduler.resume_job(BILLBOARD_JOB_ID)
+        except Exception:
+            pass
+    else:
+        try:
+            scheduler.pause_job(BILLBOARD_JOB_ID)
+        except Exception:
+            pass
+
     log.info(
         f"Automation rescheduled: index={s.index_interval_hours}h | "
         f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
@@ -323,7 +406,9 @@ def reschedule_automation_jobs(db):
         f"playlists={'on' if s.playlist_regen_enabled else 'off'} "
         f"({s.playlist_regen_interval_hours}h) | "
         f"auto_download={'on' if auto_dl_enabled else 'off'} "
-        f"(every {cooldown_days}d)"
+        f"(every {cooldown_days}d) | "
+        f"billboard={'on' if billboard_enabled else 'off'} "
+        f"(every {billboard_interval}h)"
     )
 
 

@@ -1125,6 +1125,7 @@ def sync_billboard_chart(db: Session) -> dict:
     Returns stats dict.
     """
     import re as _re
+    from models import LibraryTrack, BillboardChartEntry  # noqa: local import avoids circular
     log.info("Billboard: fetching Hot 100...")
 
     try:
@@ -1145,7 +1146,6 @@ def sync_billboard_chart(db: Session) -> dict:
         lib_lookup[key] = lt.jellyfin_item_id
 
     # Wipe existing chart rows and replace — always exactly 100 rows
-    from models import BillboardChartEntry
     db.query(BillboardChartEntry).delete()
 
     now = datetime.utcnow()

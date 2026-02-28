@@ -1,9 +1,9 @@
-
 import { useState, useEffect, useCallback } from 'react'
 import {
   Activity, Music2, Telescope, CheckCircle2, XCircle, Loader2,
   RefreshCw, Clock, Database, SkipForward, Heart, Disc3, Download,
-  Users, TrendingUp, Radio,
+  Users, TrendingUp, TrendingDown, Radio, Flame, Library,
+  ExternalLink, ChevronRight, AlertCircle, ArrowUp, ArrowDown, Minus,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { useJobStatus } from '../hooks/useJobStatus.js'
@@ -30,6 +30,471 @@ const EVENT_META = {
   track_snoozed:       { icon: Clock,        color: '#8899b5', label: 'Snoozed' },
   skip_recorded:       { icon: SkipForward,  color: '#fbbf24', label: 'Skip recorded' },
   auto_download:       { icon: Download,     color: '#d29922', label: 'Auto-downloaded' },
+}
+
+// ── Billboard download modal ──────────────────────────────────────────────────
+function BillboardDownloadModal({ entry, onClose, onSuccess }) {
+  const [status, setStatus] = useState('idle') // idle | loading | ok | error
+  const [message, setMessage] = useState('')
+
+  const handleDownload = async () => {
+    setStatus('loading')
+    try {
+      const r = await fetch('/api/indexer/billboard/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artist: entry.artist,
+          title: entry.title,
+          album_name: '',
+        }),
+      })
+      const d = await r.json()
+      if (r.ok && d.ok) {
+        setStatus('ok')
+        setMessage(d.message || 'Sent to Lidarr!')
+        onSuccess?.()
+      } else {
+        setStatus('error')
+        setMessage(d.detail || d.message || 'Failed to send to Lidarr')
+      }
+    } catch (e) {
+      setStatus('error')
+      setMessage('Network error — is Lidarr configured?')
+    }
+  }
+
+  return (
+    // Backdrop
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)' }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div
+        className="w-full max-w-sm rounded-2xl overflow-hidden anim-fade-up"
+        style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', boxShadow: '0 32px 80px rgba(0,0,0,0.6)' }}
+      >
+        {/* Album art header */}
+        <div className="relative h-40 overflow-hidden">
+          {entry.image_url ? (
+            <img
+              src={entry.image_url}
+              alt=""
+              className="w-full h-full object-cover"
+              style={{ filter: 'brightness(0.55)' }}
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center"
+                 style={{ background: 'linear-gradient(135deg, var(--bg-overlay) 0%, var(--bg-card) 100%)' }}>
+              <Music2 size={40} style={{ color: 'var(--text-muted)', opacity: 0.4 }} />
+            </div>
+          )}
+          {/* Rank badge */}
+          <div className="absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full"
+               style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.1)' }}>
+            <Flame size={11} style={{ color: '#f97316' }} />
+            <span className="text-xs font-bold" style={{ color: 'white' }}>#{entry.rank}</span>
+          </div>
+          {/* In library badge */}
+          {entry.in_library && (
+            <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full"
+                 style={{ background: 'rgba(0,212,170,0.2)', backdropFilter: 'blur(8px)', border: '1px solid rgba(0,212,170,0.3)' }}>
+              <Library size={11} style={{ color: '#00d4aa' }} />
+              <span className="text-xs font-medium" style={{ color: '#00d4aa' }}>In library</span>
+            </div>
+          )}
+          {/* Text overlay */}
+          <div className="absolute bottom-0 left-0 right-0 p-4"
+               style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 100%)' }}>
+            <div className="text-base font-bold leading-tight" style={{ color: 'white' }}>{entry.title}</div>
+            <div className="text-sm mt-0.5" style={{ color: 'rgba(255,255,255,0.7)' }}>{entry.artist}</div>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="p-4 space-y-3">
+          {/* Chart stats */}
+          <div className="flex gap-3">
+            {entry.weeks_on_chart && (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'var(--bg-overlay)' }}>
+                <div className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>{entry.weeks_on_chart}</div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Weeks on chart</div>
+              </div>
+            )}
+            {entry.peak_position && (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'var(--bg-overlay)' }}>
+                <div className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>#{entry.peak_position}</div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Peak</div>
+              </div>
+            )}
+            {/* Trend tile */}
+            {entry.position_change === null || entry.position_change === undefined ? (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'rgba(96,165,250,0.1)' }}>
+                <div className="text-lg font-bold" style={{ color: '#60a5fa' }}>NEW</div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>This week</div>
+              </div>
+            ) : entry.position_change > 0 ? (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'rgba(0,212,170,0.08)' }}>
+                <div className="flex items-center justify-center gap-1">
+                  <ArrowUp size={14} style={{ color: '#00d4aa' }} />
+                  <span className="text-lg font-bold" style={{ color: '#00d4aa' }}>{entry.position_change}</span>
+                </div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Up from #{entry.last_week_position}</div>
+              </div>
+            ) : entry.position_change < 0 ? (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'rgba(248,113,113,0.08)' }}>
+                <div className="flex items-center justify-center gap-1">
+                  <ArrowDown size={14} style={{ color: '#f87171' }} />
+                  <span className="text-lg font-bold" style={{ color: '#f87171' }}>{Math.abs(entry.position_change)}</span>
+                </div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Down from #{entry.last_week_position}</div>
+              </div>
+            ) : (
+              <div className="flex-1 rounded-xl px-3 py-2 text-center"
+                   style={{ background: 'var(--bg-overlay)' }}>
+                <div className="text-lg font-bold" style={{ color: 'var(--text-muted)' }}>—</div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Holding</div>
+              </div>
+            )}
+          </div>
+
+          {entry.in_library ? (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl"
+                 style={{ background: 'rgba(0,212,170,0.08)', border: '1px solid rgba(0,212,170,0.2)' }}>
+              <CheckCircle2 size={14} style={{ color: '#00d4aa', flexShrink: 0 }} />
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                This track is already in your Jellyfin library.
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl"
+                 style={{ background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.15)' }}>
+              <AlertCircle size={14} style={{ color: '#fbbf24', flexShrink: 0, marginTop: 1 }} />
+              <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                Not in your library yet. Lidarr will find and download the album.
+              </span>
+            </div>
+          )}
+
+          {/* Status message */}
+          {status === 'ok' && (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl"
+                 style={{ background: 'rgba(0,212,170,0.08)', border: '1px solid rgba(0,212,170,0.2)' }}>
+              <CheckCircle2 size={14} style={{ color: '#00d4aa' }} />
+              <span className="text-xs" style={{ color: '#00d4aa' }}>{message}</span>
+            </div>
+          )}
+          {status === 'error' && (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl"
+                 style={{ background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.2)' }}>
+              <XCircle size={14} style={{ color: '#f87171' }} />
+              <span className="text-xs" style={{ color: '#f87171' }}>{message}</span>
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={onClose}
+              className="flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
+              style={{ background: 'var(--bg-overlay)', color: 'var(--text-secondary)', border: '1px solid var(--border)' }}
+            >
+              {status === 'ok' ? 'Close' : 'Cancel'}
+            </button>
+            {status !== 'ok' && (
+              <button
+                onClick={handleDownload}
+                disabled={status === 'loading'}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all btn-primary"
+                style={{ opacity: status === 'loading' ? 0.7 : 1 }}
+              >
+                {status === 'loading'
+                  ? <><Loader2 size={13} className="animate-spin" />Sending…</>
+                  : <><Download size={13} />Send to Lidarr</>
+                }
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Billboard card ────────────────────────────────────────────────────────────
+function BillboardCard({ entry, rank, onClick }) {
+  const [imgError, setImgError] = useState(false)
+  const inLibrary = entry.in_library
+
+  return (
+    <button
+      onClick={inLibrary ? undefined : onClick}
+      className={`group relative flex flex-col rounded-xl overflow-hidden text-left transition-all duration-200 anim-fade-up ${inLibrary ? '' : 'cursor-pointer'}`}
+      style={{
+        animationDelay: `${rank * 60}ms`,
+        background: 'var(--bg-card)',
+        border: `1px solid ${inLibrary ? 'rgba(0,212,170,0.2)' : 'var(--border)'}`,
+        cursor: inLibrary ? 'default' : 'pointer',
+      }}
+      onMouseEnter={e => {
+        if (inLibrary) return
+        e.currentTarget.style.transform = 'translateY(-2px)'
+        e.currentTarget.style.borderColor = 'var(--accent)'
+        e.currentTarget.style.boxShadow = '0 8px 32px rgba(0,212,170,0.12)'
+      }}
+      onMouseLeave={e => {
+        if (inLibrary) return
+        e.currentTarget.style.transform = ''
+        e.currentTarget.style.borderColor = 'var(--border)'
+        e.currentTarget.style.boxShadow = ''
+      }}
+    >
+      {/* Album art */}
+      <div className="relative w-full aspect-square overflow-hidden"
+           style={{ background: 'var(--bg-overlay)' }}>
+        {entry.image_url && !imgError ? (
+          <img
+            src={entry.image_url}
+            alt=""
+            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+            onError={() => setImgError(true)}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center"
+               style={{ background: 'linear-gradient(135deg, var(--bg-overlay) 0%, rgba(0,0,0,0.3) 100%)' }}>
+            <Music2 size={28} style={{ color: 'var(--text-muted)', opacity: 0.35 }} />
+          </div>
+        )}
+
+        {/* Rank badge */}
+        <div className="absolute top-2 left-2 flex items-center gap-1 px-2 py-0.5 rounded-md"
+             style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)' }}>
+          <span className="text-[11px] font-black" style={{ color: 'white', letterSpacing: '-0.02em' }}>
+            #{entry.rank}
+          </span>
+        </div>
+
+        {/* In library badge */}
+        {entry.in_library && (
+          <div className="absolute top-2 right-2 w-5 h-5 rounded-full flex items-center justify-center"
+               style={{ background: 'rgba(0,212,170,0.25)', border: '1px solid rgba(0,212,170,0.5)' }}>
+            <Library size={10} style={{ color: '#00d4aa' }} />
+          </div>
+        )}
+
+        {/* Hover overlay — only show download CTA if not already in library */}
+        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200"
+             style={{ background: 'rgba(0,0,0,0.45)' }}>
+          {entry.in_library ? (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold"
+                 style={{ background: 'rgba(0,212,170,0.85)', color: '#fff' }}>
+              <CheckCircle2 size={11} />
+              Have it
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold"
+                 style={{ background: 'var(--accent)', color: 'var(--bg-card)' }}>
+              <Download size={11} />
+              Get album
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Info */}
+      <div className="p-2.5">
+        <div className="text-xs font-semibold leading-tight truncate" style={{ color: 'var(--text-primary)' }}>
+          {entry.title}
+        </div>
+        <div className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-secondary)' }}>
+          {entry.artist}
+        </div>
+        <div className="flex items-center justify-between mt-1.5 gap-1">
+          {/* Weeks on chart */}
+          {entry.weeks_on_chart ? (
+            <div className="flex items-center gap-1">
+              <Flame size={9} style={{ color: '#f97316', opacity: entry.weeks_on_chart > 4 ? 1 : 0.5 }} />
+              <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                {entry.weeks_on_chart}w
+              </span>
+            </div>
+          ) : <span />}
+
+          {/* Trend badge */}
+          {entry.position_change === null || entry.position_change === undefined ? (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-md font-semibold"
+                  style={{ background: 'rgba(96,165,250,0.15)', color: '#60a5fa' }}>
+              NEW
+            </span>
+          ) : entry.position_change > 0 ? (
+            <div className="flex items-center gap-0.5">
+              <ArrowUp size={9} style={{ color: '#00d4aa' }} />
+              <span className="text-[10px] font-semibold" style={{ color: '#00d4aa' }}>
+                {entry.position_change}
+              </span>
+            </div>
+          ) : entry.position_change < 0 ? (
+            <div className="flex items-center gap-0.5">
+              <ArrowDown size={9} style={{ color: '#f87171' }} />
+              <span className="text-[10px] font-semibold" style={{ color: '#f87171' }}>
+                {Math.abs(entry.position_change)}
+              </span>
+            </div>
+          ) : (
+            <Minus size={9} style={{ color: 'var(--text-muted)' }} />
+          )}
+        </div>
+      </div>
+    </button>
+  )
+}
+
+// ── Billboard strip ───────────────────────────────────────────────────────────
+function BillboardStrip() {
+  const [entries, setEntries] = useState([])
+  const [state, setState] = useState('loading') // loading | fetching | ready | error
+  const [selected, setSelected] = useState(null)
+  const [downloadedIds, setDownloadedIds] = useState(new Set())
+  const LIMIT = 5
+
+  const loadEntries = useCallback(async (triggerRefreshIfEmpty = false) => {
+    try {
+      const r = await fetch(`/api/indexer/billboard?limit=${LIMIT}`)
+      const d = await r.json()
+      const list = Array.isArray(d) ? d : []
+
+      if (list.length > 0) {
+        setEntries(list)
+        setState('ready')
+      } else if (triggerRefreshIfEmpty) {
+        // Table is empty — trigger a background fetch and poll for results
+        setState('fetching')
+        await fetch('/api/indexer/billboard/refresh', { method: 'POST' })
+        // Poll every 3s for up to 60s waiting for billboard.py to return data
+        let attempts = 0
+        const poll = setInterval(async () => {
+          attempts++
+          try {
+            const r2 = await fetch(`/api/indexer/billboard?limit=${LIMIT}`)
+            const d2 = await r2.json()
+            const list2 = Array.isArray(d2) ? d2 : []
+            if (list2.length > 0) {
+              clearInterval(poll)
+              setEntries(list2)
+              setState('ready')
+            } else if (attempts >= 20) {
+              clearInterval(poll)
+              setState('error')
+            }
+          } catch {
+            clearInterval(poll)
+            setState('error')
+          }
+        }, 3000)
+      } else {
+        setState('ready') // empty but don't re-trigger
+      }
+    } catch {
+      setState('error')
+    }
+  }, [])
+
+  useEffect(() => { loadEntries(true) }, [loadEntries])
+
+  if (state === 'loading') return (
+    <div className="anim-fade-up rounded-xl px-4 py-3 flex items-center gap-3"
+         style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+      <Loader2 size={14} className="animate-spin flex-shrink-0" style={{ color: 'var(--text-muted)' }} />
+      <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Loading Billboard Hot 100…</span>
+    </div>
+  )
+
+  if (state === 'fetching') return (
+    <div className="anim-fade-up rounded-xl px-4 py-3 flex items-center gap-3"
+         style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+      <Loader2 size={14} className="animate-spin flex-shrink-0" style={{ color: '#f97316' }} />
+      <div>
+        <div className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Fetching Billboard Hot 100…</div>
+        <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>First load takes ~10 seconds</div>
+      </div>
+    </div>
+  )
+
+  if (state === 'error') return (
+    <div className="anim-fade-up rounded-xl px-4 py-3 flex items-center justify-between gap-3"
+         style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+      <div className="flex items-center gap-2" style={{ color: 'var(--text-muted)' }}>
+        <XCircle size={14} style={{ color: '#f87171', flexShrink: 0 }} />
+        <span className="text-xs">Billboard chart unavailable — check network access</span>
+      </div>
+      <button onClick={() => { setState('loading'); loadEntries(true) }}
+              className="text-xs px-3 py-1 rounded-lg flex-shrink-0"
+              style={{ background: 'var(--bg-overlay)', color: 'var(--text-secondary)', border: '1px solid var(--border)' }}>
+        Retry
+      </button>
+    </div>
+  )
+
+  if (!entries.length) return null
+
+  return (
+    <>
+      <div className="space-y-2 anim-fade-up">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div className="section-label flex items-center gap-2">
+            <Flame size={12} style={{ color: '#f97316' }} />
+            Billboard Hot 100
+            {entries[0]?.chart_date && (
+              <span className="normal-case font-normal" style={{ color: 'var(--text-muted)' }}>
+                · {entries[0].chart_date}
+              </span>
+            )}
+          </div>
+          <Link
+            to="/discovery"
+            className="flex items-center gap-1 text-[11px] transition-colors hover:opacity-80"
+            style={{ color: 'var(--accent)' }}
+          >
+            Discovery queue <ChevronRight size={11} />
+          </Link>
+        </div>
+
+        {/* Cards */}
+        <div className={`grid gap-3`}
+             style={{ gridTemplateColumns: `repeat(${Math.min(entries.length, LIMIT)}, minmax(0, 1fr))` }}>
+          {entries.map((entry, i) => (
+            <BillboardCard
+              key={entry.rank}
+              entry={downloadedIds.has(entry.rank)
+                ? { ...entry, in_library: true }
+                : entry
+              }
+              rank={i}
+              onClick={entry.in_library ? undefined : () => setSelected(entry)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {selected && (
+        <BillboardDownloadModal
+          entry={selected}
+          onClose={() => setSelected(null)}
+          onSuccess={() => {
+            setDownloadedIds(prev => new Set([...prev, selected.rank]))
+            setTimeout(() => setSelected(null), 1800)
+          }}
+        />
+      )}
+    </>
+  )
 }
 
 // ── Connection status dot ─────────────────────────────────────────────────────
@@ -171,7 +636,6 @@ export default function Dashboard() {
   const [activity, setActivity]     = useState([])
   const [indexing, setIndexing]     = useState(false)
 
-  // Hook must come before any derived values that reference its output
   const { indexStatus, cacheStatus, startPolling } = useJobStatus((finalState) => {
     setIndexing(false)
     fetchAll()
@@ -196,7 +660,6 @@ export default function Dashboard() {
     }
   }
 
-  // Derived values — safe here, after all hook calls
   const isIndexRunning = indexing || !!indexStatus?.running
   const nextIndex      = schedulerStatus?.play_history_index?.next_run
   const totalTracks    = Array.isArray(users) ? users.reduce((s, u) => s + (u.tracks_indexed || 0), 0) : 0
@@ -223,8 +686,11 @@ export default function Dashboard() {
         </button>
       </div>
 
-      {/* Live index + cache progress — visible immediately if a job is already running */}
+      {/* Live progress */}
       <JobProgress indexStatus={indexStatus} cacheStatus={cacheStatus} />
+
+      {/* ── Billboard Hot 100 ─────────────────────────────────────────────── */}
+      <BillboardStrip />
 
       {/* Top stat row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 stagger">
@@ -234,10 +700,10 @@ export default function Dashboard() {
         <StatCard icon={Disc3}      label="Artists tracked" value={libraryStats?.total_artists?.toLocaleString() ?? '—'}  color="#f78166"         delay={150} />
       </div>
 
-      {/* Main grid — Activity is wide (col-span-2), Users+Services are narrow */}
+      {/* Main grid — Activity wide, Users+Services narrow */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
 
-        {/* Left column: Users + next-index pill */}
+        {/* Left column: Users + Services + next-index pill */}
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="section-label flex items-center gap-2">
