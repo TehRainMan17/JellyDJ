@@ -472,7 +472,7 @@ def rebuild_track_scores(
                 skip_streak=skip_streak,
                 # v4: holiday
                 holiday_tag=track.holiday_tag,
-                holiday_exclude=bool(track.holiday_exclude),
+                holiday_exclude=(True if track.holiday_exclude else False),
             ))
 
         else:
@@ -523,7 +523,7 @@ def rebuild_track_scores(
                 skip_streak=skip_streak,
                 # v4: holiday
                 holiday_tag=track.holiday_tag,
-                holiday_exclude=bool(track.holiday_exclude),
+                holiday_exclude=(True if track.holiday_exclude else False),
             ))
 
         count += 1

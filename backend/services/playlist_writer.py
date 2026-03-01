@@ -40,12 +40,22 @@ from sqlalchemy import or_ as _sa_or_
 
 def _holiday_ok():
     """
-    SQLAlchemy filter: pass through tracks that have no holiday tag, or whose
-    holiday season is currently active.  Blocks out-of-season holiday tracks.
+    SQLAlchemy filter: exclude tracks that are definitively marked as
+    out-of-season holiday content.
+
+    Logic: block the track ONLY when BOTH conditions are true:
+      1. holiday_tag IS NOT NULL  (it was detected as a holiday track)
+      2. holiday_exclude == True  (its season window is currently closed)
+
+    Using the negative form (~) makes NULL handling explicit: tracks where
+    either column is NULL (untagged, or not yet scored) are never blocked.
+    This is safer than the OR(is_null, ==False) form, which can pass through
+    tracks incorrectly if holiday_exclude is NULL due to a tagging failure.
     """
-    return _sa_or_(
-        TrackScore.holiday_tag.is_(None),
-        TrackScore.holiday_exclude == False,  # noqa: E712
+    from sqlalchemy import and_ as _sa_and_
+    return ~_sa_and_(
+        TrackScore.holiday_tag.isnot(None),
+        TrackScore.holiday_exclude == True,  # noqa: E712
     )
 
 
@@ -226,15 +236,26 @@ def _get_tracks_for_playlist(
 
     if score_count == 0:
         log.warning(f"  No TrackScores for {username} — falling back to plays table")
+        from models import LibraryTrack
+        # Exclude out-of-season holiday tracks even in the fallback path
+        excluded_ids = {
+            r.jellyfin_item_id
+            for r in db.query(LibraryTrack.jellyfin_item_id)
+            .filter(
+                LibraryTrack.holiday_tag.isnot(None),
+                LibraryTrack.holiday_exclude == True,
+            )
+            .all()
+        }
         rows = (
             db.query(Play.jellyfin_item_id)
             .filter_by(user_id=user_id)
             .filter(Play.play_count > 0)
             .order_by(Play.play_count.desc())
-            .limit(limit)
+            .limit(limit * 4)
             .all()
         )
-        return [r.jellyfin_item_id for r in rows]
+        return [r.jellyfin_item_id for r in rows if r.jellyfin_item_id not in excluded_ids][:limit]
 
     # ── Deterministic types — no jitter ──────────────────────────────────────
 
@@ -391,6 +412,7 @@ def _get_tracks_for_playlist(
         all_played_artist_unplayed_tracks = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
+            .filter(_holiday_ok())
             .filter(
                 TrackScore.is_played == False,
             )
@@ -511,6 +533,7 @@ def _get_tracks_for_playlist(
     rows = (
         db.query(TrackScore)
         .filter_by(user_id=user_id)
+        .filter(_holiday_ok())
         .order_by(satext("CAST(final_score AS REAL) DESC"))
         .limit(limit)
         .all()

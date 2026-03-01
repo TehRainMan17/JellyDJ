@@ -191,15 +191,16 @@ def scan_library(db: Session, items: list[dict]) -> dict:
         f"(+{added} new, {updated} updated, {missing_count} missing)"
     )
 
-    # v4: stamp holiday tags on every active library track
-    try:
-        from services.holiday import tag_library
-        holiday_stats = tag_library(db)
-        stats["holiday_tagged"]    = holiday_stats["tagged"]
-        stats["holiday_breakdown"] = holiday_stats["breakdown"]
-        log.info(f"  Holiday tagger: {holiday_stats['tagged']} holiday tracks tagged")
-    except Exception as _he:
-        log.warning(f"Holiday tagger failed (non-fatal): {_he}")
+    # v4: stamp holiday tags on every active library track.
+    # Run AFTER the db.commit() above so all new/updated LibraryTrack rows
+    # are visible. This must succeed — a silent failure here leaves
+    # holiday_exclude=NULL on LibraryTrack, which scoring_engine will read
+    # as False, causing excluded holiday tracks to slip into playlists.
+    from services.holiday import tag_library
+    holiday_stats = tag_library(db)
+    stats["holiday_tagged"]    = holiday_stats["tagged"]
+    stats["holiday_breakdown"] = holiday_stats["breakdown"]
+    log.info(f"  Holiday tagger: {holiday_stats['tagged']} holiday tracks tagged")
 
     return stats
 
