@@ -470,6 +470,9 @@ def rebuild_track_scores(
                 global_popularity=global_pop,
                 cooldown_until=cooldown_until,
                 skip_streak=skip_streak,
+                # v4: holiday
+                holiday_tag=track.holiday_tag,
+                holiday_exclude=bool(track.holiday_exclude),
             ))
 
         else:
@@ -518,6 +521,9 @@ def rebuild_track_scores(
                 global_popularity=global_pop,
                 cooldown_until=cooldown_until,
                 skip_streak=skip_streak,
+                # v4: holiday
+                holiday_tag=track.holiday_tag,
+                holiday_exclude=bool(track.holiday_exclude),
             ))
 
         count += 1

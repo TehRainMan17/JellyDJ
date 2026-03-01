@@ -9315,458 +9315,6 @@ async def debug_recommend(user_id: str, db: Session = Depends(get_db)):
     }
 </file>
 
-<file path="backend/routers/indexer.py">
-from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from datetime import datetime
-
-from database import get_db
-from models import IndexerSettings, UserSyncStatus, Play, UserTasteProfile
-
-router = APIRouter(prefix="/api/indexer", tags=["indexer"])
-
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class IndexerSettingsUpdate(BaseModel):
-    index_interval_hours: int
-
-
-# ── Settings ──────────────────────────────────────────────────────────────────
-
-def _get_or_create_settings(db: Session) -> IndexerSettings:
-    row = db.query(IndexerSettings).first()
-    if not row:
-        row = IndexerSettings(index_interval_hours=6)
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    return row
-
-
-@router.get("/settings")
-def get_settings(db: Session = Depends(get_db)):
-    row = _get_or_create_settings(db)
-    return {
-        "index_interval_hours": row.index_interval_hours,
-        "last_full_index": row.last_full_index,
-    }
-
-
-@router.post("/settings")
-def update_settings(payload: IndexerSettingsUpdate, db: Session = Depends(get_db)):
-    if not (1 <= payload.index_interval_hours <= 168):
-        raise HTTPException(400, "Interval must be between 1 and 168 hours.")
-    row = _get_or_create_settings(db)
-    row.index_interval_hours = payload.index_interval_hours
-    db.commit()
-    # Reschedule the live job
-    try:
-        from scheduler import reschedule_index_job
-        reschedule_index_job(db)
-    except Exception:
-        pass  # Scheduler may not be running in test mode
-    return {"ok": True}
-
-
-# ── Manual trigger ────────────────────────────────────────────────────────────
-
-@router.post("/run-now")
-async def run_now(background_tasks: BackgroundTasks):
-    """Trigger a full index run immediately (non-blocking)."""
-    from scheduler import trigger_index_now
-    background_tasks.add_task(trigger_index_now)
-    return {"ok": True, "message": "Index started in background."}
-
-
-# ── Status / dashboard data ───────────────────────────────────────────────────
-
-@router.get("/status")
-def get_status(db: Session = Depends(get_db)):
-    """
-    Return per-user sync status for the dashboard widget.
-    Always returns ALL enabled managed users — new users show as 'never'
-    even before their first index run completes.
-    """
-    from models import ManagedUser
-    # Build sync status lookup
-    sync_map = {
-        r.user_id: r
-        for r in db.query(UserSyncStatus).all()
-    }
-    # All enabled managed users — source of truth
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
-    result = []
-    for u in users:
-        s = sync_map.get(u.jellyfin_user_id)
-        result.append({
-            "user_id": u.jellyfin_user_id,
-            "username": u.username,
-            "last_synced": s.last_synced if s else None,
-            "tracks_indexed": s.tracks_indexed if s else 0,
-            "status": s.status if s else "never",
-        })
-    return result
-
-
-@router.get("/job-status")
-def job_status():
-    """
-    Lightweight polling endpoint for the frontend.
-    Returns current indexer run state: phase, detail, percent complete.
-    Safe to call every 2s — reads from in-memory state, no DB hit.
-    """
-    from services.indexer import get_job_state
-    return get_job_state()
-
-
-@router.get("/scheduler")
-def get_scheduler_status():
-    """Return next-run times for all scheduled jobs."""
-    try:
-        from scheduler import get_job_status
-        return get_job_status()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ── Taste profile inspection (useful for debugging Module 5) ──────────────────
-
-@router.get("/taste-profile/{user_id}")
-def get_taste_profile(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
-    """Return the top affinity scores for a user — artists and genres separately."""
-    rows = db.query(UserTasteProfile).filter_by(user_id=user_id).all()
-
-    artists = sorted(
-        [r for r in rows if r.artist_name],
-        key=lambda r: float(r.affinity_score),
-        reverse=True,
-    )[:limit]
-
-    genres = sorted(
-        [r for r in rows if r.genre],
-        key=lambda r: float(r.affinity_score),
-        reverse=True,
-    )[:20]
-
-    play_count = db.query(Play).filter_by(user_id=user_id).count()
-
-    return {
-        "user_id": user_id,
-        "total_plays_indexed": play_count,
-        "top_artists": [
-            {"artist": r.artist_name, "score": float(r.affinity_score)}
-            for r in artists
-        ],
-        "top_genres": [
-            {"genre": r.genre, "score": float(r.affinity_score)}
-            for r in genres
-        ],
-    }
-
-
-# ── Module 8a: Library scan + scoring endpoints ───────────────────────────────
-
-@router.post("/library-scan")
-async def trigger_library_scan(db: Session = Depends(get_db)):
-    """Trigger a full library scan (all Jellyfin audio, played or not)."""
-    from services.library_scanner import run_library_scan
-    result = await run_library_scan(db)
-    if not result.get("ok"):
-        raise HTTPException(500, result.get("error", "Library scan failed"))
-    return result
-
-
-@router.get("/library-stats")
-def library_stats(db: Session = Depends(get_db)):
-    """Return library size stats for the dashboard."""
-    from services.library_scanner import get_library_stats
-    return get_library_stats(db)
-
-
-@router.post("/full-scan")
-async def trigger_full_scan(db: Session = Depends(get_db)):
-    """
-    Trigger a complete rescan: library scan + play history + scoring rebuild.
-    Runs in a daemon thread so the ASGI event loop is never blocked and the
-    dashboard stays responsive throughout. Same execution model as the scheduler.
-    """
-    import threading
-    from services.indexer import run_full_index, get_job_state
-    import asyncio
-
-    # Don't start a second run if one is already in progress
-    state = get_job_state()
-    if state.get("running"):
-        return {"ok": True, "message": "Index already running."}
-
-    def _run():
-        asyncio.run(run_full_index())
-
-    t = threading.Thread(target=_run, daemon=True, name="manual-index")
-    t.start()
-    return {"ok": True, "message": "Full scan started in background. Poll /api/indexer/job-status for progress."}
-
-
-@router.get("/score-distribution/{user_id}")
-def score_distribution(user_id: str, db: Session = Depends(get_db)):
-    """Return score distribution stats for a user — useful for tuning/debugging."""
-    from services.scoring_engine import get_score_distribution
-    dist = get_score_distribution(db, user_id)
-    if not dist:
-        raise HTTPException(404, "No scores found for this user. Run a full scan first.")
-    return dist
-
-
-@router.get("/score-distribution/by-username/{username}")
-def score_distribution_by_username(username: str, db: Session = Depends(get_db)):
-    """Score distribution by username for convenience."""
-    from models import ManagedUser
-    from services.scoring_engine import get_score_distribution
-    user = db.query(ManagedUser).filter(
-        ManagedUser.username.ilike(username)
-    ).first()
-    if not user:
-        raise HTTPException(404, f"User '{username}' not found")
-    dist = get_score_distribution(db, user.jellyfin_user_id)
-    if not dist:
-        raise HTTPException(404, "No scores found. Run a full scan first.")
-    return {"username": user.username, "user_id": user.jellyfin_user_id, **dist}
-
-# ── Billboard Hot 100 endpoints ───────────────────────────────────────────────
-
-@router.get("/billboard")
-def get_billboard(limit: int = 5, db: Session = Depends(get_db)):
-    """
-    Return the top N Billboard Hot 100 entries with album art and trend data.
-
-    Artwork strategy (tried in order):
-      1. iTunes Search API — free, no key, returns high-res artwork for current
-         chart hits. Results cached in popularity_cache for 7 days so repeated
-         loads are instant and we don't hammer Apple's servers.
-      2. Popularity cache artist image_url — falls back to whatever Last.fm/
-         Spotify stored for the artist if iTunes comes up empty.
-
-    Trend fields:
-      last_week_position  — chart position last week (None = new entry)
-      position_change     — positive = moved up, negative = moved down, 0 = same,
-                            None = new entry this week
-    """
-    from models import BillboardChartEntry, PopularityCache
-    import json, httpx
-    from datetime import timedelta
-
-    rows = (
-        db.query(BillboardChartEntry)
-        .order_by(BillboardChartEntry.rank.asc())
-        .limit(limit)
-        .all()
-    )
-
-    if not rows:
-        return []
-
-    # ── Artwork: iTunes Search API, cached 7 days ─────────────────────────────
-    def _itunes_artwork(artist: str, title: str) -> str | None:
-        """Query iTunes Search API for artwork. Returns URL or None."""
-        cache_key = f"itunes_art:{artist.lower()}::{title.lower()}"
-        cached = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
-        if cached:
-            try:
-                return json.loads(cached.payload).get("url")
-            except Exception:
-                pass
-
-        try:
-            import urllib.parse
-            query = urllib.parse.quote(f"{artist} {title}")
-            resp = httpx.get(
-                f"https://itunes.apple.com/search?term={query}&media=music&limit=5&entity=song",
-                timeout=6.0,
-            )
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                url = None
-                for r in results:
-                    raw = r.get("artworkUrl100", "")
-                    if raw:
-                        # Upgrade to 600px artwork
-                        url = raw.replace("100x100bb", "600x600bb")
-                        break
-
-                # Cache result (even None) for 7 days so we don't repeat failed lookups
-                payload = json.dumps({"url": url})
-                row = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
-                if not row:
-                    row = PopularityCache(cache_key=cache_key)
-                    db.add(row)
-                row.payload = payload
-                row.expires_at = datetime.utcnow() + timedelta(days=7)
-                row.updated_at = datetime.utcnow()
-                db.commit()
-                return url
-        except Exception:
-            pass
-        return None
-
-    # Fallback: artist image from popularity cache
-    artist_names = list({r.artist.lower() for r in rows})
-    artist_image_cache: dict[str, str | None] = {}
-    for name_lower in artist_names:
-        cache_row = db.query(PopularityCache).filter_by(
-            cache_key=f"artist:{name_lower}"
-        ).first()
-        if cache_row:
-            try:
-                artist_image_cache[name_lower] = json.loads(cache_row.payload).get("image_url")
-            except Exception:
-                pass
-
-    # ── Live library check ────────────────────────────────────────────────────
-    from models import LibraryTrack
-    from services.indexer import _normalise_for_match
-
-    def _artist_in_library(artist: str) -> bool:
-        norm = _normalise_for_match(artist)
-        # Direct match first
-        match = db.query(LibraryTrack.id).filter(
-            LibraryTrack.missing_since.is_(None),
-            LibraryTrack.artist_name.ilike(f"%{artist}%"),
-        ).first()
-        if match:
-            return True
-        # Also check album_artist field
-        match2 = db.query(LibraryTrack.id).filter(
-            LibraryTrack.missing_since.is_(None),
-            LibraryTrack.album_artist.ilike(f"%{artist}%"),
-        ).first()
-        return bool(match2)
-
-    result = []
-    for r in rows:
-        # Try iTunes first, fall back to artist cache
-        image_url = _itunes_artwork(r.artist, r.title)
-        if not image_url:
-            image_url = artist_image_cache.get(r.artist.lower())
-
-        # Trend: positive = moved up the chart (lower rank number = better)
-        position_change = None
-        if r.last_week_position is not None:
-            position_change = r.last_week_position - r.rank  # +ve = improved
-
-        # Live library check — more accurate than the weekly sync match
-        in_library = bool(r.jellyfin_item_id) or _artist_in_library(r.artist)
-
-        result.append({
-            "rank":               r.rank,
-            "title":              r.title,
-            "artist":             r.artist,
-            "chart_score":        r.chart_score,
-            "weeks_on_chart":     r.weeks_on_chart,
-            "peak_position":      r.peak_position,
-            "last_week_position": r.last_week_position,
-            "position_change":    position_change,
-            "in_library":         in_library,
-            "jellyfin_item_id":   r.jellyfin_item_id,
-            "image_url":          image_url,
-            "chart_date":         r.chart_date,
-        })
-
-    return result
-
-
-@router.get("/billboard/status")
-def get_billboard_status(db: Session = Depends(get_db)):
-    """Return chart metadata and when it was last refreshed."""
-    from models import BillboardChartEntry, AutomationSettings
-    count = db.query(BillboardChartEntry).count()
-    latest = (
-        db.query(BillboardChartEntry)
-        .order_by(BillboardChartEntry.fetched_at.desc())
-        .first()
-    )
-    settings = db.query(AutomationSettings).first()
-    return {
-        "entries": count,
-        "chart_date": latest.chart_date if latest else None,
-        "fetched_at": latest.fetched_at.isoformat() if latest else None,
-        "last_refresh": settings.last_billboard_refresh.isoformat()
-            if settings and settings.last_billboard_refresh else None,
-    }
-
-
-@router.post("/billboard/refresh")
-async def refresh_billboard(db: Session = Depends(get_db)):
-    """Manually trigger a Billboard chart refresh."""
-    import threading, asyncio
-    from services.indexer import sync_billboard_chart
-
-    def _run():
-        from database import SessionLocal
-        rdb = SessionLocal()
-        try:
-            sync_billboard_chart(rdb)
-        finally:
-            rdb.close()
-
-    t = threading.Thread(target=_run, daemon=True, name="billboard-refresh")
-    t.start()
-    return {"ok": True, "message": "Billboard refresh started in background"}
-
-
-class BillboardDownloadRequest(BaseModel):
-    artist: str
-    title: str
-    album_name: str = ""
-
-
-@router.post("/billboard/download")
-async def billboard_download(payload: BillboardDownloadRequest, db: Session = Depends(get_db)):
-    """
-    Send a Billboard chart track directly to Lidarr without needing a
-    discovery queue item. Creates a temporary queue entry, sends it, then
-    leaves it in the queue as 'approved' so the user can see it was actioned.
-    """
-    from models import DiscoveryQueueItem
-    from routers.discovery import _send_to_lidarr, _get_lidarr_creds
-
-    try:
-        base_url, api_key = _get_lidarr_creds(db)
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))
-
-    # Use album_name if provided, otherwise fall back to track title
-    # (Lidarr works on albums not tracks, so we find the artist's top album)
-    album_to_send = payload.album_name or ""
-
-    try:
-        result = await _send_to_lidarr(payload.artist, album_to_send, base_url, api_key)
-    except Exception as e:
-        raise HTTPException(502, str(e))
-
-    # Record in discovery queue so the user can see what was downloaded
-    entry = DiscoveryQueueItem(
-        user_id="billboard",  # system-sourced, not user-specific
-        artist_name=payload.artist,
-        album_name=result.get("album_name") or album_to_send or payload.title,
-        why=f"Billboard Hot 100 — manually requested from dashboard",
-        source_artist="billboard",
-        source_affinity="100.0",
-        status="approved",
-        lidarr_sent=result["ok"],
-        lidarr_response=result["message"],
-        actioned_at=datetime.utcnow(),
-    )
-    db.add(entry)
-    db.commit()
-
-    if not result["ok"]:
-        raise HTTPException(502, result["message"])
-
-    return {"ok": True, "message": result["message"]}
-</file>
-
 <file path="backend/routers/insights.py">
 """
 JellyDJ Insights router — v2
@@ -13065,6 +12613,458 @@ def _backfill_top_album_cache():
         db.close()
 </file>
 
+<file path="backend/routers/indexer.py">
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from datetime import datetime
+
+from database import get_db
+from models import IndexerSettings, UserSyncStatus, Play, UserTasteProfile
+
+router = APIRouter(prefix="/api/indexer", tags=["indexer"])
+
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+
+class IndexerSettingsUpdate(BaseModel):
+    index_interval_hours: int
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+def _get_or_create_settings(db: Session) -> IndexerSettings:
+    row = db.query(IndexerSettings).first()
+    if not row:
+        row = IndexerSettings(index_interval_hours=6)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+@router.get("/settings")
+def get_settings(db: Session = Depends(get_db)):
+    row = _get_or_create_settings(db)
+    return {
+        "index_interval_hours": row.index_interval_hours,
+        "last_full_index": row.last_full_index,
+    }
+
+
+@router.post("/settings")
+def update_settings(payload: IndexerSettingsUpdate, db: Session = Depends(get_db)):
+    if not (1 <= payload.index_interval_hours <= 168):
+        raise HTTPException(400, "Interval must be between 1 and 168 hours.")
+    row = _get_or_create_settings(db)
+    row.index_interval_hours = payload.index_interval_hours
+    db.commit()
+    # Reschedule the live job
+    try:
+        from scheduler import reschedule_index_job
+        reschedule_index_job(db)
+    except Exception:
+        pass  # Scheduler may not be running in test mode
+    return {"ok": True}
+
+
+# ── Manual trigger ────────────────────────────────────────────────────────────
+
+@router.post("/run-now")
+async def run_now(background_tasks: BackgroundTasks):
+    """Trigger a full index run immediately (non-blocking)."""
+    from scheduler import trigger_index_now
+    background_tasks.add_task(trigger_index_now)
+    return {"ok": True, "message": "Index started in background."}
+
+
+# ── Status / dashboard data ───────────────────────────────────────────────────
+
+@router.get("/status")
+def get_status(db: Session = Depends(get_db)):
+    """
+    Return per-user sync status for the dashboard widget.
+    Always returns ALL enabled managed users — new users show as 'never'
+    even before their first index run completes.
+    """
+    from models import ManagedUser
+    # Build sync status lookup
+    sync_map = {
+        r.user_id: r
+        for r in db.query(UserSyncStatus).all()
+    }
+    # All enabled managed users — source of truth
+    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+    result = []
+    for u in users:
+        s = sync_map.get(u.jellyfin_user_id)
+        result.append({
+            "user_id": u.jellyfin_user_id,
+            "username": u.username,
+            "last_synced": s.last_synced if s else None,
+            "tracks_indexed": s.tracks_indexed if s else 0,
+            "status": s.status if s else "never",
+        })
+    return result
+
+
+@router.get("/job-status")
+def job_status():
+    """
+    Lightweight polling endpoint for the frontend.
+    Returns current indexer run state: phase, detail, percent complete.
+    Safe to call every 2s — reads from in-memory state, no DB hit.
+    """
+    from services.indexer import get_job_state
+    return get_job_state()
+
+
+@router.get("/scheduler")
+def get_scheduler_status():
+    """Return next-run times for all scheduled jobs."""
+    try:
+        from scheduler import get_job_status
+        return get_job_status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Taste profile inspection (useful for debugging Module 5) ──────────────────
+
+@router.get("/taste-profile/{user_id}")
+def get_taste_profile(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    """Return the top affinity scores for a user — artists and genres separately."""
+    rows = db.query(UserTasteProfile).filter_by(user_id=user_id).all()
+
+    artists = sorted(
+        [r for r in rows if r.artist_name],
+        key=lambda r: float(r.affinity_score),
+        reverse=True,
+    )[:limit]
+
+    genres = sorted(
+        [r for r in rows if r.genre],
+        key=lambda r: float(r.affinity_score),
+        reverse=True,
+    )[:20]
+
+    play_count = db.query(Play).filter_by(user_id=user_id).count()
+
+    return {
+        "user_id": user_id,
+        "total_plays_indexed": play_count,
+        "top_artists": [
+            {"artist": r.artist_name, "score": float(r.affinity_score)}
+            for r in artists
+        ],
+        "top_genres": [
+            {"genre": r.genre, "score": float(r.affinity_score)}
+            for r in genres
+        ],
+    }
+
+
+# ── Module 8a: Library scan + scoring endpoints ───────────────────────────────
+
+@router.post("/library-scan")
+async def trigger_library_scan(db: Session = Depends(get_db)):
+    """Trigger a full library scan (all Jellyfin audio, played or not)."""
+    from services.library_scanner import run_library_scan
+    result = await run_library_scan(db)
+    if not result.get("ok"):
+        raise HTTPException(500, result.get("error", "Library scan failed"))
+    return result
+
+
+@router.get("/library-stats")
+def library_stats(db: Session = Depends(get_db)):
+    """Return library size stats for the dashboard."""
+    from services.library_scanner import get_library_stats
+    return get_library_stats(db)
+
+
+@router.post("/full-scan")
+async def trigger_full_scan(db: Session = Depends(get_db)):
+    """
+    Trigger a complete rescan: library scan + play history + scoring rebuild.
+    Runs in a daemon thread so the ASGI event loop is never blocked and the
+    dashboard stays responsive throughout. Same execution model as the scheduler.
+    """
+    import threading
+    from services.indexer import run_full_index, get_job_state
+    import asyncio
+
+    # Don't start a second run if one is already in progress
+    state = get_job_state()
+    if state.get("running"):
+        return {"ok": True, "message": "Index already running."}
+
+    def _run():
+        asyncio.run(run_full_index())
+
+    t = threading.Thread(target=_run, daemon=True, name="manual-index")
+    t.start()
+    return {"ok": True, "message": "Full scan started in background. Poll /api/indexer/job-status for progress."}
+
+
+@router.get("/score-distribution/{user_id}")
+def score_distribution(user_id: str, db: Session = Depends(get_db)):
+    """Return score distribution stats for a user — useful for tuning/debugging."""
+    from services.scoring_engine import get_score_distribution
+    dist = get_score_distribution(db, user_id)
+    if not dist:
+        raise HTTPException(404, "No scores found for this user. Run a full scan first.")
+    return dist
+
+
+@router.get("/score-distribution/by-username/{username}")
+def score_distribution_by_username(username: str, db: Session = Depends(get_db)):
+    """Score distribution by username for convenience."""
+    from models import ManagedUser
+    from services.scoring_engine import get_score_distribution
+    user = db.query(ManagedUser).filter(
+        ManagedUser.username.ilike(username)
+    ).first()
+    if not user:
+        raise HTTPException(404, f"User '{username}' not found")
+    dist = get_score_distribution(db, user.jellyfin_user_id)
+    if not dist:
+        raise HTTPException(404, "No scores found. Run a full scan first.")
+    return {"username": user.username, "user_id": user.jellyfin_user_id, **dist}
+
+# ── Billboard Hot 100 endpoints ───────────────────────────────────────────────
+
+@router.get("/billboard")
+def get_billboard(limit: int = 5, db: Session = Depends(get_db)):
+    """
+    Return the top N Billboard Hot 100 entries with album art and trend data.
+
+    Artwork strategy (tried in order):
+      1. iTunes Search API — free, no key, returns high-res artwork for current
+         chart hits. Results cached in popularity_cache for 7 days so repeated
+         loads are instant and we don't hammer Apple's servers.
+      2. Popularity cache artist image_url — falls back to whatever Last.fm/
+         Spotify stored for the artist if iTunes comes up empty.
+
+    Trend fields:
+      last_week_position  — chart position last week (None = new entry)
+      position_change     — positive = moved up, negative = moved down, 0 = same,
+                            None = new entry this week
+    """
+    from models import BillboardChartEntry, PopularityCache
+    import json, httpx
+    from datetime import timedelta
+
+    rows = (
+        db.query(BillboardChartEntry)
+        .order_by(BillboardChartEntry.rank.asc())
+        .limit(limit)
+        .all()
+    )
+
+    if not rows:
+        return []
+
+    # ── Artwork: iTunes Search API, cached 7 days ─────────────────────────────
+    def _itunes_artwork(artist: str, title: str) -> str | None:
+        """Query iTunes Search API for artwork. Returns URL or None."""
+        cache_key = f"itunes_art:{artist.lower()}::{title.lower()}"
+        cached = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
+        if cached:
+            try:
+                return json.loads(cached.payload).get("url")
+            except Exception:
+                pass
+
+        try:
+            import urllib.parse
+            query = urllib.parse.quote(f"{artist} {title}")
+            resp = httpx.get(
+                f"https://itunes.apple.com/search?term={query}&media=music&limit=5&entity=song",
+                timeout=6.0,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                url = None
+                for r in results:
+                    raw = r.get("artworkUrl100", "")
+                    if raw:
+                        # Upgrade to 600px artwork
+                        url = raw.replace("100x100bb", "600x600bb")
+                        break
+
+                # Cache result (even None) for 7 days so we don't repeat failed lookups
+                payload = json.dumps({"url": url})
+                row = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
+                if not row:
+                    row = PopularityCache(cache_key=cache_key)
+                    db.add(row)
+                row.payload = payload
+                row.expires_at = datetime.utcnow() + timedelta(days=7)
+                row.updated_at = datetime.utcnow()
+                db.commit()
+                return url
+        except Exception:
+            pass
+        return None
+
+    # Fallback: artist image from popularity cache
+    artist_names = list({r.artist.lower() for r in rows})
+    artist_image_cache: dict[str, str | None] = {}
+    for name_lower in artist_names:
+        cache_row = db.query(PopularityCache).filter_by(
+            cache_key=f"artist:{name_lower}"
+        ).first()
+        if cache_row:
+            try:
+                artist_image_cache[name_lower] = json.loads(cache_row.payload).get("image_url")
+            except Exception:
+                pass
+
+    # ── Live library check ────────────────────────────────────────────────────
+    from models import LibraryTrack
+    from services.indexer import _normalise_for_match
+
+    def _artist_in_library(artist: str) -> bool:
+        norm = _normalise_for_match(artist)
+        # Direct match first
+        match = db.query(LibraryTrack.id).filter(
+            LibraryTrack.missing_since.is_(None),
+            LibraryTrack.artist_name.ilike(f"%{artist}%"),
+        ).first()
+        if match:
+            return True
+        # Also check album_artist field
+        match2 = db.query(LibraryTrack.id).filter(
+            LibraryTrack.missing_since.is_(None),
+            LibraryTrack.album_artist.ilike(f"%{artist}%"),
+        ).first()
+        return bool(match2)
+
+    result = []
+    for r in rows:
+        # Try iTunes first, fall back to artist cache
+        image_url = _itunes_artwork(r.artist, r.title)
+        if not image_url:
+            image_url = artist_image_cache.get(r.artist.lower())
+
+        # Trend: positive = moved up the chart (lower rank number = better)
+        position_change = None
+        if r.last_week_position is not None:
+            position_change = r.last_week_position - r.rank  # +ve = improved
+
+        # Live library check — more accurate than the weekly sync match
+        in_library = bool(r.jellyfin_item_id) or _artist_in_library(r.artist)
+
+        result.append({
+            "rank":               r.rank,
+            "title":              r.title,
+            "artist":             r.artist,
+            "chart_score":        r.chart_score,
+            "weeks_on_chart":     r.weeks_on_chart,
+            "peak_position":      r.peak_position,
+            "last_week_position": r.last_week_position,
+            "position_change":    position_change,
+            "in_library":         in_library,
+            "jellyfin_item_id":   r.jellyfin_item_id,
+            "image_url":          image_url,
+            "chart_date":         r.chart_date,
+        })
+
+    return result
+
+
+@router.get("/billboard/status")
+def get_billboard_status(db: Session = Depends(get_db)):
+    """Return chart metadata and when it was last refreshed."""
+    from models import BillboardChartEntry, AutomationSettings
+    count = db.query(BillboardChartEntry).count()
+    latest = (
+        db.query(BillboardChartEntry)
+        .order_by(BillboardChartEntry.fetched_at.desc())
+        .first()
+    )
+    settings = db.query(AutomationSettings).first()
+    return {
+        "entries": count,
+        "chart_date": latest.chart_date if latest else None,
+        "fetched_at": latest.fetched_at.isoformat() if latest else None,
+        "last_refresh": settings.last_billboard_refresh.isoformat()
+            if settings and settings.last_billboard_refresh else None,
+    }
+
+
+@router.post("/billboard/refresh")
+async def refresh_billboard(db: Session = Depends(get_db)):
+    """Manually trigger a Billboard chart refresh."""
+    import threading, asyncio
+    from services.indexer import sync_billboard_chart
+
+    def _run():
+        from database import SessionLocal
+        rdb = SessionLocal()
+        try:
+            sync_billboard_chart(rdb)
+        finally:
+            rdb.close()
+
+    t = threading.Thread(target=_run, daemon=True, name="billboard-refresh")
+    t.start()
+    return {"ok": True, "message": "Billboard refresh started in background"}
+
+
+class BillboardDownloadRequest(BaseModel):
+    artist: str
+    title: str
+    album_name: str = ""
+
+
+@router.post("/billboard/download")
+async def billboard_download(payload: BillboardDownloadRequest, db: Session = Depends(get_db)):
+    """
+    Send a Billboard chart track directly to Lidarr without needing a
+    discovery queue item. Creates a temporary queue entry, sends it, then
+    leaves it in the queue as 'approved' so the user can see it was actioned.
+    """
+    from models import DiscoveryQueueItem
+    from routers.discovery import _send_to_lidarr, _get_lidarr_creds
+
+    try:
+        base_url, api_key = _get_lidarr_creds(db)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+    # Use album_name if provided, otherwise fall back to track title
+    # (Lidarr works on albums not tracks, so we find the artist's top album)
+    album_to_send = payload.album_name or ""
+
+    try:
+        result = await _send_to_lidarr(payload.artist, album_to_send, base_url, api_key)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+    # Record in discovery queue so the user can see what was downloaded
+    entry = DiscoveryQueueItem(
+        user_id="billboard",  # system-sourced, not user-specific
+        artist_name=payload.artist,
+        album_name=result.get("album_name") or album_to_send or payload.title,
+        why=f"Billboard Hot 100 — manually requested from dashboard",
+        source_artist="billboard",
+        source_affinity="100.0",
+        status="approved",
+        lidarr_sent=result["ok"],
+        lidarr_response=result["message"],
+        actioned_at=datetime.utcnow(),
+    )
+    db.add(entry)
+    db.commit()
+
+    if not result["ok"]:
+        raise HTTPException(502, result["message"])
+
+    return {"ok": True, "message": result["message"]}
+</file>
+
 <file path="backend/services/popularity/aggregator.py">
 """
 PopularityAggregator — unified interface over all adapters.
@@ -15704,1230 +15704,6 @@ export default function Dashboard() {
 }
 </file>
 
-<file path="backend/routers/webhooks.py">
-"""
-JellyDJ Webhook receiver — v2
-
-Changes from v1:
-  - SkipPenalty now tracks consecutive_skips (streak) and resets on completion
-  - After every skip event, check_and_apply_cooldown() is called — if the streak
-    reaches COOLDOWN_SKIP_STREAK_THRESHOLD (3), the track enters cooldown
-  - PlaybackEvent now stores source_context and session_id
-  - Session ID is derived from (user_id + day) so we can group a listening session
-    without requiring Jellyfin to report session info
-
-Skip detection strategy — designed to work across ALL Jellyfin clients:
-
-  STANDARD clients (Android, web, Jellyfin iOS, Swiftfin):
-    Send PlaybackStart → PlaybackProgress → PlaybackStop.
-    Completion measured via server-side wall-clock timing (most accurate).
-
-  PROGRESS-ONLY clients (Manet on iOS, some others):
-    Send only PlaybackProgress heartbeats (~1s interval, IsAutomated=True).
-    No PlaybackStart or PlaybackStop.
-    Track transition detected when ItemId changes for the same user.
-    Completion measured via max position reached on previous track.
-
-  SKIP CONFIRMATION (all clients):
-    A stop that looks like a skip is held PENDING for SKIP_CONFIRM_SECS (10s).
-    If the user's next PlaybackStart arrives within that window, it's confirmed.
-    If silence follows (session ended), it's discarded — not penalized.
-
-  MAX-POSITION tracking:
-    Both paths track the PEAK position reached, not the last reported position.
-    Protects against false skips when users seek backward.
-
-Cooldown rules (v2):
-  - consecutive_skips tracks skips in a row WITHOUT a completion between them
-  - A completion resets consecutive_skips to 0
-  - When consecutive_skips >= 3: check_and_apply_cooldown() in enrichment.py
-  - Cooldown durations: 1st=7d, 2nd=14d, 3rd=30d, 4th+=permanent penalty
-  - Favorites are shielded: consecutive_skips capped at 2 for favorited tracks
-    (one or two bad-day skips shouldn't cooldown a beloved song)
-"""
-from __future__ import annotations
-
-import hashlib
-import json
-import logging
-import time
-from datetime import datetime
-from typing import Optional
-
-from fastapi import APIRouter, Depends, Request, HTTPException
-from sqlalchemy.orm import Session
-
-from database import get_db
-from models import PlaybackEvent, SkipPenalty, ManagedUser
-
-log = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
-
-# ── Skip detection thresholds ────────────────────────────────────────────────
-
-SKIP_THRESHOLD = 0.80
-MAX_PENALTY = 0.60
-MIN_EVENTS_FOR_PENALTY = 1
-DEDUP_WINDOW_SECONDS = 10
-SKIP_CONFIRM_SECS = 10
-SESSION_END_SECS = 60
-MIN_POSITION_TICKS = 5_000_000  # 0.5 seconds
-
-# Favorites shield: a favorited track's consecutive skip count is capped at this
-# value so it can never trigger cooldown from casual skips alone
-FAVORITE_CONSECUTIVE_SKIP_CAP = 2
-
-
-# ── In-memory state ───────────────────────────────────────────────────────────
-
-_playback_starts: dict = {}
-_playback_progress: dict = {}
-_active_item: dict = {}
-_pending_skips: dict = {}
-_recent_stops: dict = {}
-_recent_errors: list = []
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _calc_penalty(skip_count: int, total_events: int) -> float:
-    import math
-    if total_events < MIN_EVENTS_FOR_PENALTY:
-        return 0.0
-    skip_rate = skip_count / total_events
-    return round(min(MAX_PENALTY, MAX_PENALTY * (1 - math.exp(-3 * skip_rate))), 4)
-
-
-def _session_id(user_id: str) -> str:
-    """
-    Derive a session identifier from user + current UTC date.
-    A "session" = one calendar day of listening for a user.
-    This groups plays without requiring Jellyfin to report session data.
-    Fine-grained enough to detect same-session artist returns.
-    """
-    day = datetime.utcnow().strftime("%Y-%m-%d")
-    raw = f"{user_id}:{day}"
-    return hashlib.md5(raw.encode()).hexdigest()[:16]
-
-
-def _parse_body(body: dict) -> Optional[dict]:
-    item    = body.get("Item") or {}
-    session = body.get("Session") or {}
-
-    item_id = item.get("Id") or body.get("ItemId") or body.get("Id")
-    user_id = session.get("UserId") or body.get("UserId")
-    if not item_id or not user_id:
-        return None
-
-    user_id = user_id.replace("-", "").lower()
-
-    runtime = int(item.get("RunTimeTicks") or body.get("RunTimeTicks") or 0)
-    position = int(
-        body.get("PlaybackPositionTicks") or
-        session.get("PlayState", {}).get("PositionTicks") or 0
-    )
-
-    artists = item.get("Artists") or []
-    artist = (
-        body.get("Artist") or
-        item.get("AlbumArtist") or
-        (artists[0] if artists else "") or ""
-    )
-
-    genre_raw = body.get("Genres") or item.get("Genres") or ""
-    if isinstance(genre_raw, str):
-        genre = genre_raw.split(",")[0].strip()
-    elif isinstance(genre_raw, list):
-        genre = genre_raw[0] if genre_raw else ""
-    else:
-        genre = ""
-
-    return {
-        "item_id":    item_id,
-        "user_id":    user_id,
-        "track_name": item.get("Name") or body.get("Name") or "",
-        "artist_name": artist,
-        "album_name": item.get("Album") or body.get("Album") or "",
-        "genre":      genre,
-        "runtime_ticks":  runtime,
-        "position_ticks": position,
-        "played_to_completion": bool(body.get("PlayedToCompletion") or False),
-        "is_automated": bool(body.get("IsAutomated") or False),
-        "is_favorite": False,   # filled in by _enrich_favorite flag below
-    }
-
-
-def _is_managed(user_id: str, db: Session) -> bool:
-    normalised = user_id.replace("-", "").lower()
-    result = db.query(ManagedUser).filter_by(
-        jellyfin_user_id=normalised, is_enabled=True
-    ).first()
-    if not result:
-        all_enabled = db.query(ManagedUser).filter_by(is_enabled=True).all()
-        result = next(
-            (u for u in all_enabled
-             if u.jellyfin_user_id.replace("-", "").lower() == normalised),
-            None,
-        )
-        if result:
-            log.warning(
-                f"Webhook user_id='{user_id}' matched '{result.username}' via normalisation. "
-                f"Consider updating the stored ID."
-            )
-    if not result:
-        all_users = db.query(ManagedUser).all()
-        exists = next(
-            (u for u in all_users
-             if u.jellyfin_user_id.replace("-", "").lower() == normalised),
-            None,
-        )
-        if exists:
-            log.warning(f"Webhook from known user '{exists.username}' but is_enabled=False — skipping")
-        else:
-            log.warning(
-                f"Webhook from UNKNOWN user_id='{user_id}'. "
-                f"Stored IDs: {[u.jellyfin_user_id for u in db.query(ManagedUser).all()]}"
-            )
-        return False
-    return True
-
-
-def _prune(d: dict, max_age: float = 3600):
-    cutoff = time.time() - max_age
-    dead = [k for k, v in d.items()
-            if isinstance(v, tuple) and isinstance(v[0], float) and v[0] < cutoff]
-    for k in dead:
-        del d[k]
-
-
-def _write_event(db: Session, p: dict, completion: float, method: str, is_skip: bool):
-    """
-    Persist a PlaybackEvent and update the SkipPenalty row.
-    v2: also updates consecutive_skips and triggers cooldown if threshold reached.
-    """
-    import traceback as _tb
-    try:
-        sid = _session_id(p["user_id"])
-
-        db.add(PlaybackEvent(
-            user_id=p["user_id"],
-            jellyfin_item_id=p["item_id"],
-            track_name=p["track_name"],
-            artist_name=p["artist_name"],
-            album_name=p["album_name"],
-            genre=p["genre"],
-            position_ticks=int(completion * p["runtime_ticks"]),
-            runtime_ticks=p["runtime_ticks"],
-            completion_pct=str(round(completion, 4)),
-            was_skip=is_skip,
-            received_at=datetime.utcnow(),
-            source_context=p.get("source_context"),  # set externally if known
-            session_id=sid,
-        ))
-
-        row = db.query(SkipPenalty).filter_by(
-            user_id=p["user_id"], jellyfin_item_id=p["item_id"]
-        ).first()
-        if not row:
-            row = SkipPenalty(
-                user_id=p["user_id"], jellyfin_item_id=p["item_id"],
-                artist_name=p["artist_name"], genre=p["genre"],
-                total_events=0, skip_count=0,
-                consecutive_skips=0, skip_streak_peak=0,
-            )
-            db.add(row)
-            db.flush()
-
-        row.total_events = (row.total_events or 0) + 1
-        now = datetime.utcnow()
-
-        if is_skip:
-            row.skip_count = (row.skip_count or 0) + 1
-            row.consecutive_skips = (row.consecutive_skips or 0) + 1
-            row.last_skip_at = now
-
-            # Favorites shield: cap consecutive skips so beloved songs can't
-            # be accidentally cooled down by a couple of bad-day skips
-            if p.get("is_favorite") and row.consecutive_skips > FAVORITE_CONSECUTIVE_SKIP_CAP:
-                row.consecutive_skips = FAVORITE_CONSECUTIVE_SKIP_CAP
-
-            row.skip_streak_peak = max(
-                row.skip_streak_peak or 0,
-                row.consecutive_skips,
-            )
-        else:
-            # Completed — reset the consecutive skip streak
-            row.consecutive_skips = 0
-            row.last_completed_at = now
-
-        skip_rate = (row.skip_count or 0) / row.total_events
-        row.skip_rate = str(round(skip_rate, 4))
-        row.penalty   = str(_calc_penalty(row.skip_count, row.total_events))
-        row.updated_at = now
-        db.flush()
-
-        # v2: check if this track should enter cooldown
-        cooldown_result = None
-        if is_skip:
-            try:
-                from services.enrichment import check_and_apply_cooldown
-                cooldown_result = check_and_apply_cooldown(
-                    db=db,
-                    user_id=p["user_id"],
-                    jellyfin_item_id=p["item_id"],
-                    artist_name=p["artist_name"],
-                    track_name=p["track_name"],
-                    consecutive_skips=row.consecutive_skips,
-                )
-            except Exception as ce:
-                log.warning(f"  Cooldown check failed: {ce}")
-
-        db.commit()
-
-        outcome = "SKIP"
-        if not is_skip:
-            outcome = "PLAYED"
-        if cooldown_result == "triggered":
-            outcome += " → COOLDOWN"
-        elif cooldown_result == "permanent":
-            outcome += " → PERMANENT DISLIKE"
-
-        log.info(
-            f"  ✓ Recorded  user={p['user_id'][:8]}  '{p['track_name']}'  "
-            f"{completion:.0%} via {method}  → {outcome}  "
-            f"(streak={row.consecutive_skips})"
-        )
-
-    except Exception as exc:
-        err_msg = (
-            f"user={p['user_id'][:8]} track='{p['track_name']}' "
-            f"{type(exc).__name__}: {exc}"
-        )
-        log.error(f"  ✗ DB WRITE FAILED  {err_msg}")
-        import traceback
-        log.error(traceback.format_exc())
-        _recent_errors.append({
-            "at": datetime.utcnow().isoformat(),
-            "user_id": p["user_id"],
-            "track": p["track_name"],
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
-        })
-        if len(_recent_errors) > 20:
-            _recent_errors.pop(0)
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
-
-def _expire_pending_skips(db: Session):
-    now = time.time()
-    expired = [
-        uid for uid, entry in _pending_skips.items()
-        if now - entry["wall_time"] > SKIP_CONFIRM_SECS
-    ]
-    for uid in expired:
-        entry = _pending_skips.pop(uid)
-        log.info(
-            f"  Session end (no next track within {SKIP_CONFIRM_SECS}s) — "
-            f"NOT penalizing  user={uid[:8]}  '{entry['p']['track_name']}'"
-        )
-
-
-def _finalize_progress_track(user_id: str, old_item_id: str, db: Session):
-    key = f"{user_id}::{old_item_id}"
-    entry = _playback_progress.pop(key, None)
-    if not entry:
-        return
-
-    _wall, max_pos, runtime, p = entry
-    if runtime <= 0 or max_pos < MIN_POSITION_TICKS:
-        log.debug(f"  Progress finalize: skipping '{p['track_name']}' — insufficient data")
-        return
-
-    completion = min(1.0, max_pos / runtime)
-    is_skip = completion < SKIP_THRESHOLD
-
-    log.info(
-        f"Playback TRANSITION (progress-only)  user={user_id[:8]}  "
-        f"'{p['track_name']}'  max_pos={max_pos//10_000_000}s / {runtime//10_000_000}s "
-        f"= {completion:.0%}  → {'SKIP' if is_skip else 'PLAYED'}"
-    )
-    _write_event(db, p, completion, "progress_transition", is_skip)
-
-
-# ── Event handlers ────────────────────────────────────────────────────────────
-
-def handle_start(body: dict, db: Session):
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-
-    _expire_pending_skips(db)
-
-    uid = p["user_id"]
-    key = f"{uid}::{p['item_id']}"
-
-    if uid in _pending_skips:
-        entry = _pending_skips.pop(uid)
-        log.info(
-            f"  Skip CONFIRMED by next PlaybackStart  user={uid[:8]}  "
-            f"'{entry['p']['track_name']}'"
-        )
-        _write_event(db, entry["p"], entry["completion"], entry["method"], is_skip=True)
-
-    prev_item_id = _active_item.get(uid)
-    if prev_item_id and prev_item_id != p["item_id"]:
-        log.debug(f"  Start-triggered transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
-        _finalize_progress_track(uid, prev_item_id, db)
-
-    _playback_starts[key]   = (time.time(), p["runtime_ticks"], p["track_name"])
-    _playback_progress[key] = (time.time(), 0, p["runtime_ticks"], p)
-    _active_item[uid]       = p["item_id"]
-
-    _prune(_playback_starts)
-    _prune(_playback_progress)
-    log.info(
-        f"Playback START  user={uid[:8]}  '{p['track_name']}'  "
-        f"runtime={p['runtime_ticks']//10_000_000}s"
-    )
-
-
-def handle_progress(body: dict, db: Session):
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-
-    _expire_pending_skips(db)
-
-    uid = p["user_id"]
-    key = f"{uid}::{p['item_id']}"
-    now = time.time()
-
-    prev_item_id = _active_item.get(uid)
-    if prev_item_id and prev_item_id != p["item_id"]:
-        log.debug(f"  Track transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
-        _finalize_progress_track(uid, prev_item_id, db)
-
-    _active_item[uid] = p["item_id"]
-
-    existing = _playback_progress.get(key)
-    current_max = existing[1] if existing else 0
-    new_max = max(current_max, p["position_ticks"]) if p["position_ticks"] >= MIN_POSITION_TICKS else current_max
-    _playback_progress[key] = (now, new_max, p["runtime_ticks"] or (existing[2] if existing else 0), p)
-    _prune(_playback_progress)
-
-    log.debug(
-        f"Progress: '{p['track_name']}'  "
-        f"{p['position_ticks']//10_000_000}s / {p['runtime_ticks']//10_000_000}s  "
-        f"max={new_max//10_000_000}s"
-    )
-
-
-def handle_stop(body: dict, db: Session):
-    p = _parse_body(body)
-    if not p or not _is_managed(p["user_id"], db):
-        return
-
-    _expire_pending_skips(db)
-
-    uid = p["user_id"]
-    key = f"{uid}::{p['item_id']}"
-    now = time.time()
-
-    if now - _recent_stops.get(key, 0) < DEDUP_WINDOW_SECONDS:
-        log.debug(f"Dedup: dropping duplicate stop  user={uid[:8]}  '{p['track_name']}'")
-        return
-    _recent_stops[key] = now
-    _prune(_recent_stops)
-
-    if _active_item.get(uid) == p["item_id"]:
-        del _active_item[uid]
-
-    start_entry    = _playback_starts.pop(key, None)
-    progress_entry = _playback_progress.pop(key, None)
-
-    runtime_ticks = (
-        p["runtime_ticks"]
-        or (start_entry[1] if start_entry else 0)
-        or (progress_entry[2] if progress_entry else 0)
-    )
-
-    if p["played_to_completion"]:
-        completion = 1.0
-        method = "played_to_completion_flag"
-        is_skip = False
-        log.info(f"Playback STOP  user={uid[:8]}  '{p['track_name']}' — 100% (completion flag) → PLAYED")
-        _write_event(db, p, completion, method, is_skip)
-        return
-
-    if start_entry and runtime_ticks > 0:
-        start_wall, _rt, _ = start_entry
-        elapsed_ticks = (now - start_wall) * 10_000_000
-        completion = min(1.0, elapsed_ticks / runtime_ticks)
-        method = "server_timing"
-
-    elif progress_entry and runtime_ticks > 0:
-        _wall, max_pos, _rt, _ = progress_entry
-        extra_ticks = (now - _wall) * 10_000_000
-        effective_pos = min(runtime_ticks, max_pos + extra_ticks)
-        completion = effective_pos / runtime_ticks
-        method = "progress_heartbeat"
-
-    else:
-        completion = 0.0
-        method = "ambiguous"
-
-    is_skip = (method != "ambiguous") and (completion < SKIP_THRESHOLD)
-
-    log.info(
-        f"Playback STOP  user={uid[:8]}  '{p['track_name']}'  "
-        f"{completion:.0%} via {method}  → {'pending skip confirmation' if is_skip else 'PLAYED'}"
-    )
-
-    if not is_skip or method == "ambiguous":
-        _write_event(db, p, completion, method, is_skip=False if method == "ambiguous" else is_skip)
-        return
-
-    _pending_skips[uid] = {
-        "p":          p,
-        "completion": completion,
-        "method":     method,
-        "wall_time":  now,
-    }
-    log.info(
-        f"  Skip PENDING confirmation  user={uid[:8]}  '{p['track_name']}'  "
-        f"{completion:.0%} — waiting {SKIP_CONFIRM_SECS}s for next PlaybackStart"
-    )
-
-
-# ── API endpoint ──────────────────────────────────────────────────────────────
-
-@router.post("/jellyfin")
-async def jellyfin_webhook(request: Request, db: Session = Depends(get_db)):
-    try:
-        body = json.loads(await request.body())
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-
-    raw_type = (
-        body.get("NotificationType") or
-        body.get("Event") or
-        body.get("Type") or ""
-    ).lower().replace(".", "").replace("_", "").replace(" ", "")
-
-    log.debug(f"Webhook event: {raw_type} — {body.get('Name')}")
-
-    try:
-        if "playbackstart" in raw_type:
-            handle_start(body, db)
-            return {"ok": True, "event": "start"}
-        elif "playbackprogress" in raw_type or "playbacktick" in raw_type:
-            handle_progress(body, db)
-            return {"ok": True, "event": "progress"}
-        elif "playbackstop" in raw_type:
-            handle_stop(body, db)
-            return {"ok": True, "event": "stop"}
-        else:
-            return {"ok": True, "processed": False, "reason": f"'{raw_type}' ignored"}
-    except Exception as e:
-        log.error(f"Webhook error ({raw_type}): {e}")
-        return {"ok": True, "processed": False, "error": str(e)}
-
-
-# ── Diagnostic / utility endpoints ───────────────────────────────────────────
-
-_debug_captures: list = []
-
-@router.post("/jellyfin/debug")
-async def debug_capture(request: Request):
-    raw  = await request.body()
-    body = {}
-    try:
-        body = json.loads(raw)
-    except Exception:
-        pass
-    session = body.get("Session") or {}
-    item    = body.get("Item") or {}
-    capture = {
-        "NotificationType":      body.get("NotificationType"),
-        "Name":                  body.get("Name"),
-        "Artist":                body.get("Artist"),
-        "UserId_body":           body.get("UserId"),
-        "UserId_session":        session.get("UserId"),
-        "Username_session":      session.get("UserName") or session.get("Username"),
-        "ItemId_item":           item.get("Id"),
-        "ItemId_body":           body.get("ItemId"),
-        "PlaybackPositionTicks": body.get("PlaybackPositionTicks"),
-        "RunTimeTicks":          body.get("RunTimeTicks"),
-        "PlayedToCompletion":    body.get("PlayedToCompletion"),
-        "IsAutomated":           body.get("IsAutomated"),
-        "ClientName":            body.get("ClientName") or body.get("Client"),
-        "DeviceName":            body.get("DeviceName"),
-        "raw_text": raw.decode("utf-8", errors="replace")[:2000],
-    }
-    _debug_captures.append(capture)
-    if len(_debug_captures) > 20:
-        _debug_captures.pop(0)
-    print(f"DEBUG: type={body.get('NotificationType')} track={body.get('Name')} pos={body.get('PlaybackPositionTicks')}", flush=True)
-    return {"received": True, "capture": capture}
-
-
-@router.get("/jellyfin/debug")
-async def get_debug():
-    return {"count": len(_debug_captures), "captures": _debug_captures}
-
-
-@router.get("/pending-starts")
-def pending_starts():
-    now = time.time()
-    return {
-        k: {
-            "track_name": v[2],
-            "started_ago_seconds": round(now - v[0], 1),
-            "runtime_seconds": round(v[1] / 10_000_000, 0),
-        }
-        for k, v in _playback_starts.items()
-    }
-
-
-@router.get("/pending-skips")
-def pending_skips_diagnostic():
-    now = time.time()
-    return {
-        uid: {
-            "track_name": entry["p"]["track_name"],
-            "completion": f"{entry['completion']:.0%}",
-            "method": entry["method"],
-            "waiting_secs": round(now - entry["wall_time"], 1),
-            "expires_in_secs": round(SKIP_CONFIRM_SECS - (now - entry["wall_time"]), 1),
-        }
-        for uid, entry in _pending_skips.items()
-    }
-
-
-@router.get("/managed-users")
-def managed_users_diagnostic(db: Session = Depends(get_db)):
-    from models import PlaybackEvent, SkipPenalty
-    from sqlalchemy import desc
-
-    users = db.query(ManagedUser).all()
-    result = []
-
-    for u in users:
-        uid = u.jellyfin_user_id
-
-        total_events = db.query(PlaybackEvent).filter_by(user_id=uid).count()
-        skip_events  = db.query(PlaybackEvent).filter_by(user_id=uid, was_skip=True).count()
-        ambiguous    = db.query(PlaybackEvent).filter_by(user_id=uid).filter(
-            PlaybackEvent.completion_pct == "0.0"
-        ).count()
-
-        last_event = (
-            db.query(PlaybackEvent)
-            .filter_by(user_id=uid)
-            .order_by(PlaybackEvent.received_at.desc())
-            .first()
-        )
-
-        # v2: cooldown stats
-        from models import TrackCooldown
-        active_cooldowns = db.query(TrackCooldown).filter_by(
-            user_id=uid, status="active"
-        ).count()
-        permanent_dislikes = db.query(TrackCooldown).filter_by(
-            user_id=uid, status="permanent"
-        ).count()
-
-        pending_start_keys    = [k for k in _playback_starts    if k.startswith(uid)]
-        pending_progress_keys = [k for k in _playback_progress if k.startswith(uid)]
-        pending_skip          = _pending_skips.get(uid)
-
-        if total_events == 0:
-            diagnosis = "No events in DB — webhook user_id mismatch or events not reaching server"
-        elif skip_events == 0 and total_events > 5:
-            diagnosis = f"{total_events} events but 0 skips — progress-only client (Manet)"
-        else:
-            diagnosis = f"{total_events} events, {skip_events} skips ({100*skip_events//total_events if total_events else 0}%) — OK"
-
-        result.append({
-            "username":            u.username,
-            "jellyfin_user_id":    uid,
-            "is_enabled":          u.is_enabled,
-            "db_total_events":     total_events,
-            "db_skip_events":      skip_events,
-            "db_ambiguous_events": ambiguous,
-            "last_event_track":    last_event.track_name if last_event else None,
-            "last_event_was_skip": last_event.was_skip if last_event else None,
-            "last_event_at":       last_event.received_at.isoformat() if last_event else None,
-            "in_memory_pending_starts":   len(pending_start_keys),
-            "in_memory_pending_progress": len(pending_progress_keys),
-            "in_memory_pending_skip":     bool(pending_skip),
-            # v2 additions
-            "active_cooldowns":    active_cooldowns,
-            "permanent_dislikes":  permanent_dislikes,
-            "diagnosis": diagnosis,
-        })
-
-    return {
-        "managed_users": result,
-        "in_memory_active_starts":   len(_playback_starts),
-        "in_memory_pending_skips":   len(_pending_skips),
-        "recent_db_errors": _recent_errors[-5:],
-    }
-
-
-@router.get("/cooldowns/{user_id}")
-def get_cooldowns(user_id: str, db: Session = Depends(get_db)):
-    """Show all active and historical cooldowns for a user."""
-    from models import TrackCooldown
-    rows = (
-        db.query(TrackCooldown)
-        .filter_by(user_id=user_id)
-        .order_by(TrackCooldown.cooldown_started_at.desc())
-        .limit(50)
-        .all()
-    )
-    now = datetime.utcnow()
-    return [
-        {
-            "track_name":         r.track_name,
-            "artist_name":        r.artist_name,
-            "status":             r.status,
-            "cooldown_count":     r.cooldown_count,
-            "skip_streak":        r.skip_streak_at_trigger,
-            "cooldown_until":     r.cooldown_until.isoformat() if r.cooldown_until else None,
-            "days_remaining":     max(0, round((r.cooldown_until - now).total_seconds() / 86400, 1))
-                                  if r.cooldown_until and r.status == "active" else 0,
-            "started_at":         r.cooldown_started_at.isoformat() if r.cooldown_started_at else None,
-        }
-        for r in rows
-    ]
-
-
-@router.get("/setup-guide")
-def setup_guide(request: Request):
-    host = request.headers.get("host", "localhost:7879")
-    url  = f"http://{host}/api/webhooks/jellyfin"
-    return {
-        "webhook_url": url,
-        "instructions": [
-            "1. Jellyfin → Dashboard → Plugins → Webhook",
-            "2. Click 'Add Generic Destination'",
-            f"3. URL: {url}",
-            "4. Request Type: POST",
-            "5. Notification Types: enable 'Playback Start', 'Playback Progress', AND 'Playback Stop'",
-            "6. Item Type: Songs",
-            "7. Send all fields — Save",
-        ],
-        "skip_threshold": f"{SKIP_THRESHOLD:.0%}",
-        "skip_confirm_window_secs": SKIP_CONFIRM_SECS,
-        "cooldown_threshold_skips": 3,
-    }
-
-
-@router.get("/stats/{user_id}")
-def skip_stats(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
-    rows = (
-        db.query(SkipPenalty)
-        .filter_by(user_id=user_id)
-        .filter(SkipPenalty.total_events >= MIN_EVENTS_FOR_PENALTY)
-        .order_by(SkipPenalty.skip_rate.desc())
-        .limit(limit).all()
-    )
-    return {
-        "user_id": user_id,
-        "total_tracked": db.query(SkipPenalty).filter_by(user_id=user_id).count(),
-        "items": [
-            {
-                "jellyfin_item_id": r.jellyfin_item_id,
-                "artist_name":      r.artist_name,
-                "total_events":     r.total_events,
-                "skip_count":       r.skip_count,
-                "skip_rate":        float(r.skip_rate),
-                "penalty":          float(r.penalty),
-                # v2
-                "consecutive_skips": r.consecutive_skips,
-                "skip_streak_peak":  r.skip_streak_peak,
-                "last_skip_at":      r.last_skip_at.isoformat() if r.last_skip_at else None,
-                "last_completed_at": r.last_completed_at.isoformat() if r.last_completed_at else None,
-            }
-            for r in rows
-        ],
-    }
-
-
-@router.get("/recent/{user_id}")
-def recent_events(user_id: str, limit: int = 20, db: Session = Depends(get_db)):
-    rows = (
-        db.query(PlaybackEvent)
-        .filter_by(user_id=user_id)
-        .order_by(PlaybackEvent.received_at.desc())
-        .limit(limit).all()
-    )
-    return [
-        {
-            "track_name":     r.track_name,
-            "artist_name":    r.artist_name,
-            "completion_pct": float(r.completion_pct),
-            "was_skip":       r.was_skip,
-            "received_at":    r.received_at,
-            "source_context": r.source_context,
-            "session_id":     r.session_id,
-        }
-        for r in rows
-    ]
-
-
-@router.delete("/penalties/{user_id}")
-def clear_penalties(user_id: str, db: Session = Depends(get_db)):
-    pc = db.query(SkipPenalty).filter_by(user_id=user_id).delete()
-    ec = db.query(PlaybackEvent).filter_by(user_id=user_id).delete()
-    db.commit()
-    return {"ok": True, "penalties_cleared": pc, "events_cleared": ec}
-</file>
-
-<file path="backend/scheduler.py">
-"""
-JellyDJ — Central background job scheduler.
-
-Uses APScheduler's AsyncIOScheduler so that scheduled jobs can be async
-coroutines and share the same event loop as FastAPI.
-
-Registered jobs
-───────────────
-  play_history_index   Run library scan + per-user play history sync + score rebuild.
-                       Default: every 6 hours. Configurable in Automation settings.
-
-  discovery_refresh    Populate the discovery queue with new album recommendations
-                       for all enabled users. Default: every 24 hours.
-
-  playlist_regen       Regenerate all Jellyfin playlists from current scores.
-                       Default: every 24 hours.
-
-  auto_download        Send top-scored pending discovery items to Lidarr.
-                       Starts paused; only runs when auto_download_enabled=True.
-                       Interval matches the cooldown_days setting.
-
-All intervals are re-read from the AutomationSettings database row on startup
-via reschedule_automation_jobs(), so changes made in the UI take effect after
-the next container restart (or immediately if the user saves settings, which
-calls reschedule_automation_jobs() again).
-"""
-from __future__ import annotations
-
-import asyncio
-import logging
-from datetime import datetime, timezone
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-
-log = logging.getLogger(__name__)
-
-scheduler = AsyncIOScheduler()
-
-# Stable job IDs — used to reschedule or pause individual jobs
-INDEX_JOB_ID          = "play_history_index"
-DISCOVERY_JOB_ID      = "discovery_refresh"
-PLAYLIST_JOB_ID       = "playlist_regen"
-AUTO_DOWNLOAD_JOB_ID  = "auto_download"
-BILLBOARD_JOB_ID      = "billboard_refresh"
-
-
-def _get_settings(db):
-    """
-    Read AutomationSettings from the database.
-    Returns a Defaults fallback object if the row doesn't exist yet
-    (i.e. on a fresh install before the user has visited the Automation page).
-    """
-    try:
-        from models import AutomationSettings
-        row = db.query(AutomationSettings).first()
-        if row:
-            return row
-    except Exception:
-        pass
-
-    # Inline defaults — mirrors the column defaults in models.py
-    class Defaults:
-        index_interval_hours              = 6
-        discovery_refresh_enabled         = True
-        discovery_refresh_interval_hours  = 24
-        discovery_items_per_run           = 10
-        playlist_regen_enabled            = True
-        playlist_regen_interval_hours     = 24
-        auto_download_enabled             = False
-        auto_download_cooldown_days       = 7
-    return Defaults()
-
-
-def _sync_wrap(async_fn, *args, **kwargs):
-    """
-    Run an async job function synchronously in a fresh event loop.
-
-    APScheduler's AsyncIOScheduler dispatches async jobs via
-    asyncio.ensure_future() on its internal event loop reference.
-    When that reference is None or mismatched with FastAPI's loop,
-    the coroutine is silently never awaited and the job appears permanently
-    overdue (next_run stays in the past).
-
-    Wrapping each scheduled job in a plain synchronous function that calls
-    asyncio.run() sidesteps this entirely — each job gets a clean, isolated
-    event loop that runs to completion and is then discarded.
-    This is safe because none of the job functions share state with
-    FastAPI's request-handling loop.
-    """
-    import asyncio
-    asyncio.run(async_fn(*args, **kwargs))
-
-
-def _job_run_index():
-    import asyncio
-    from services.indexer import run_full_index
-    asyncio.run(run_full_index())
-
-
-def _job_discovery_refresh():
-    from routers.automation import _run_discovery_refresh
-    _sync_wrap(_run_discovery_refresh)
-
-
-def _job_playlist_regen():
-    from routers.automation import _run_playlist_regen
-    _sync_wrap(_run_playlist_regen)
-
-
-def _job_auto_download():
-    from routers.automation import _run_auto_download
-    _sync_wrap(_run_auto_download)
-
-
-def _job_billboard_refresh():
-    """Fetch Billboard Hot 100 and update the chart entries table."""
-    from database import SessionLocal
-    from services.indexer import sync_billboard_chart
-    db = SessionLocal()
-    try:
-        sync_billboard_chart(db)
-    except Exception as e:
-        log.error(f"Billboard refresh job failed: {e}")
-    finally:
-        db.close()
-
-
-def _run_billboard_if_empty():
-    """
-    Run a billboard sync immediately if the table has never been populated.
-    This ensures the dashboard shows chart data on first launch without waiting
-    a full week for the scheduler to fire.
-    """
-    import threading
-    from database import SessionLocal
-    from models import BillboardChartEntry
-
-    def _check_and_run():
-        db = SessionLocal()
-        try:
-            count = db.query(BillboardChartEntry).count()
-            if count == 0:
-                log.info("Billboard table empty — running initial chart fetch...")
-                from services.indexer import sync_billboard_chart
-                sync_billboard_chart(db)
-        except Exception as e:
-            log.warning(f"Initial billboard fetch failed (non-fatal): {e}")
-        finally:
-            db.close()
-
-    t = threading.Thread(target=_check_and_run, daemon=True, name="billboard-init")
-    t.start()
-
-
-def start_scheduler(db_session_factory):
-    """
-    Register all four jobs and start the scheduler.
-    Called once from the FastAPI lifespan in main.py.
-
-    Jobs are registered with their default intervals first, then
-    reschedule_automation_jobs() immediately corrects them from the database.
-    The two-step approach ensures the scheduler is running before any
-    database access, which avoids startup order issues.
-
-    All scheduled functions are plain synchronous wrappers around their async
-    implementations — see _sync_wrap(). This avoids the APScheduler/asyncio
-    event loop mismatch that causes jobs to appear perpetually overdue.
-    """
-
-    # Register jobs with conservative defaults — reschedule() below will override
-    scheduler.add_job(
-        _job_run_index,
-        trigger=IntervalTrigger(hours=6),
-        id=INDEX_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
-    scheduler.add_job(
-        _job_discovery_refresh,
-        trigger=IntervalTrigger(hours=24),
-        id=DISCOVERY_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
-    scheduler.add_job(
-        _job_playlist_regen,
-        trigger=IntervalTrigger(hours=24),
-        id=PLAYLIST_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
-    scheduler.add_job(
-        _job_auto_download,
-        trigger=IntervalTrigger(days=1),
-        id=AUTO_DOWNLOAD_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
-
-    scheduler.add_job(
-        _job_billboard_refresh,
-        trigger=IntervalTrigger(hours=168),  # weekly default
-        id=BILLBOARD_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=3600,
-    )
-
-    scheduler.start()
-
-    # Auto-download starts paused — reschedule_automation_jobs will enable it
-    # only if auto_download_enabled=True is saved in the database
-    scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (5 jobs registered).")
-
-    # Run billboard sync immediately on first start if table is empty
-    _run_billboard_if_empty()
-
-    # Immediately apply stored settings so intervals are correct from the first run
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        reschedule_automation_jobs(db)
-    finally:
-        db.close()
-
-
-def reschedule_index_job(db):
-    """
-    Update only the indexer job interval.
-    Called when the user changes index_interval_hours in the Automation settings.
-    """
-    s = _get_settings(db)
-    scheduler.reschedule_job(
-        INDEX_JOB_ID,
-        trigger=IntervalTrigger(
-            hours=s.index_interval_hours,
-            start_date=datetime.now(timezone.utc),  # always schedule forward from now
-        ),
-    )
-    log.info(f"Index job rescheduled: every {s.index_interval_hours}h")
-
-
-def reschedule_automation_jobs(db):
-    """
-    Apply current AutomationSettings to all four scheduler jobs.
-
-    Called:
-      - On startup (after registering jobs with defaults)
-      - When the user saves Automation settings in the UI
-      - After any manual trigger that might change settings
-
-    Disabled jobs are paused rather than removed so they can be re-enabled
-    without re-registering.
-    """
-    s = _get_settings(db)
-
-    # Indexer always runs — only the interval changes
-    scheduler.reschedule_job(
-        INDEX_JOB_ID,
-        trigger=IntervalTrigger(
-            hours=s.index_interval_hours,
-            start_date=datetime.now(timezone.utc),
-        ),
-    )
-
-    # Discovery refresh — can be fully disabled
-    if s.discovery_refresh_enabled:
-        from datetime import timedelta as _td
-        _disc_interval = _td(hours=s.discovery_refresh_interval_hours)
-        _disc_last     = getattr(s, "last_discovery_refresh", None)
-        _now           = datetime.now(timezone.utc)
-        if _disc_last is None:
-            _disc_next = _now + _disc_interval
-        else:
-            if _disc_last.tzinfo is None:
-                _disc_last = _disc_last.replace(tzinfo=timezone.utc)
-            _disc_next = _disc_last + _disc_interval
-            if _disc_next < _now:
-                _disc_next = _now + _td(minutes=2)
-        scheduler.reschedule_job(
-            DISCOVERY_JOB_ID,
-            trigger=IntervalTrigger(
-                hours=s.discovery_refresh_interval_hours,
-                start_date=_disc_next,
-            ),
-        )
-        try:
-            scheduler.resume_job(DISCOVERY_JOB_ID)
-        except Exception:
-            pass
-    else:
-        try:
-            scheduler.pause_job(DISCOVERY_JOB_ID)
-        except Exception:
-            pass
-
-    # Playlist regen — can be fully disabled
-    if s.playlist_regen_enabled:
-        from datetime import timedelta as _td
-        _pl_interval = _td(hours=s.playlist_regen_interval_hours)
-        _pl_last     = getattr(s, "last_playlist_regen", None)
-        _now         = datetime.now(timezone.utc)
-        if _pl_last is None:
-            _pl_next = _now + _pl_interval
-        else:
-            if _pl_last.tzinfo is None:
-                _pl_last = _pl_last.replace(tzinfo=timezone.utc)
-            _pl_next = _pl_last + _pl_interval
-            if _pl_next < _now:
-                _pl_next = _now + _td(minutes=3)
-        scheduler.reschedule_job(
-            PLAYLIST_JOB_ID,
-            trigger=IntervalTrigger(
-                hours=s.playlist_regen_interval_hours,
-                start_date=_pl_next,
-            ),
-        )
-        try:
-            scheduler.resume_job(PLAYLIST_JOB_ID)
-        except Exception:
-            pass
-    else:
-        try:
-            scheduler.pause_job(PLAYLIST_JOB_ID)
-        except Exception:
-            pass
-
-    # Auto-download — disabled by default; interval = cooldown_days
-    # The job itself also enforces the cooldown internally as a safety net.
-    auto_dl_enabled = getattr(s, "auto_download_enabled", False)
-    cooldown_days   = getattr(s, "auto_download_cooldown_days", 7) or 1
-    if auto_dl_enabled:
-        from datetime import timedelta as _td
-        interval = _td(days=cooldown_days)
-        now      = datetime.now(timezone.utc)
-        last_run = getattr(s, "last_auto_download", None)
-
-        if last_run is None:
-            # Never run — schedule one interval from now so it doesn't fire immediately
-            next_run = now + interval
-        else:
-            # Base next run on last_run + interval, not on now + interval.
-            # This way container restarts and settings saves don't reset the clock —
-            # if the job ran 3 days ago with a 7-day cooldown it stays due in 4 days,
-            # not pushed back to 7 days from now.
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(tzinfo=timezone.utc)
-            next_run = last_run + interval
-            # If overdue (next_run in the past), run shortly after startup
-            if next_run < now:
-                next_run = now + _td(minutes=5)
-
-        scheduler.reschedule_job(
-            AUTO_DOWNLOAD_JOB_ID,
-            trigger=IntervalTrigger(days=cooldown_days, start_date=next_run),
-        )
-        try:
-            scheduler.resume_job(AUTO_DOWNLOAD_JOB_ID)
-        except Exception:
-            pass
-        log.info(
-            f"Auto-download scheduled: every {cooldown_days}d, "
-            f"next run {next_run.strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-    else:
-        try:
-            scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-        except Exception:
-            pass
-
-    # Billboard chart refresh — weekly by default
-    billboard_enabled  = getattr(s, "billboard_refresh_enabled", True)
-    billboard_interval = getattr(s, "billboard_refresh_interval_hours", 168) or 168
-    if billboard_enabled:
-        from datetime import timedelta as _td
-        _bb_interval = _td(hours=billboard_interval)
-        _bb_last     = getattr(s, "last_billboard_refresh", None)
-        _now         = datetime.now(timezone.utc)
-        if _bb_last is None:
-            _bb_next = _now + _td(minutes=1)   # run soon if never run
-        else:
-            if _bb_last.tzinfo is None:
-                _bb_last = _bb_last.replace(tzinfo=timezone.utc)
-            _bb_next = _bb_last + _bb_interval
-            if _bb_next < _now:
-                _bb_next = _now + _td(minutes=1)
-        try:
-            scheduler.reschedule_job(
-                BILLBOARD_JOB_ID,
-                trigger=IntervalTrigger(hours=billboard_interval, start_date=_bb_next),
-            )
-            scheduler.resume_job(BILLBOARD_JOB_ID)
-        except Exception:
-            pass
-    else:
-        try:
-            scheduler.pause_job(BILLBOARD_JOB_ID)
-        except Exception:
-            pass
-
-    log.info(
-        f"Automation rescheduled: index={s.index_interval_hours}h | "
-        f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
-        f"({s.discovery_refresh_interval_hours}h) | "
-        f"playlists={'on' if s.playlist_regen_enabled else 'off'} "
-        f"({s.playlist_regen_interval_hours}h) | "
-        f"auto_download={'on' if auto_dl_enabled else 'off'} "
-        f"(every {cooldown_days}d) | "
-        f"billboard={'on' if billboard_enabled else 'off'} "
-        f"(every {billboard_interval}h)"
-    )
-
-
-async def trigger_index_now():
-    """
-    Immediately fire the indexer outside of its normal schedule.
-    Called by the manual "Index Now" button in the UI via the automation router.
-    """
-    from services.indexer import run_full_index
-    log.info("Manual index triggered.")
-    await run_full_index()
-
-
-def get_job_status() -> dict:
-    """
-    Return the next scheduled run time for all registered jobs.
-    next_run is None when a job is paused.
-    Used by the Dashboard and the Automation page to show upcoming run times.
-    """
-    statuses = {}
-    for job in scheduler.get_jobs():
-        statuses[job.id] = {
-            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
-            "paused":   job.next_run_time is None,
-            "name":     job.name or job.id,
-        }
-    return statuses
-</file>
-
 <file path="backend/routers/automation.py">
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
@@ -17489,6 +16265,1302 @@ def scheduler_status(db: Session = Depends(get_db)):
             "playlist_regen_interval_hours": s.playlist_regen_interval_hours,
         }
     }
+</file>
+
+<file path="backend/routers/webhooks.py">
+"""
+JellyDJ Webhook receiver — v2.1
+
+Changes from v2:
+  - BUG FIX: item_id is now normalised (dashes stripped, lowercased) the same
+    way user_id is.  Some 3rd-party clients (e.g. Manet on iOS) inconsistently
+    include or omit dashes in the UUID they report, causing every heartbeat to
+    look like a track transition and write a false skip.  This was the primary
+    cause of wildly inflated skip counts (e.g. 173 skips for 2 actual plays).
+
+  - BUG FIX: _finalize_progress_track now requires a minimum accumulated
+    wall-clock listen time (MIN_LISTEN_SECS, default 8 s) before it will
+    write *any* event.  This prevents stale in-memory entries left over from
+    a server restart from producing phantom skips on the next track transition.
+
+  - BUG FIX: Progress-only (Manet-style) skips now go through the same
+    SKIP_CONFIRM_SECS pending window as standard-client skips.  Previously
+    they were written immediately, so pausing then abandoning a song always
+    counted as a skip.
+
+  - BUG FIX: _playback_progress wall-clock timestamp is no longer updated on
+    every heartbeat.  It now preserves the *start* wall time so that elapsed-
+    time calculations remain accurate across the full listen session.
+
+  - IMPROVEMENT: _active_item is now cleaned up after a confirmed transition
+    so that a second identical "transition" heartbeat from a slow client can't
+    re-trigger finalization for the same old item.
+
+Changes from v1 (retained from v2):
+  - SkipPenalty tracks consecutive_skips (streak) and resets on completion
+  - check_and_apply_cooldown() called on skip; cooldown at streak >= 3
+  - PlaybackEvent stores source_context and session_id
+  - Session ID derived from (user_id + day)
+
+Skip detection strategy:
+
+  STANDARD clients (Android, web, Swiftfin …):
+    PlaybackStart → PlaybackProgress → PlaybackStop.
+    Completion measured via server-side wall-clock timing (most accurate).
+
+  PROGRESS-ONLY clients (Manet on iOS, some others):
+    Only PlaybackProgress heartbeats (~1 s interval, IsAutomated=True).
+    Track transition detected when ItemId changes for the same user.
+    Completion measured via max position reached on previous track.
+    Transitions that look like skips enter the same SKIP_CONFIRM_SECS
+    pending window as standard-client stops.
+
+  SKIP CONFIRMATION (all clients):
+    A stop/transition that looks like a skip is held PENDING for
+    SKIP_CONFIRM_SECS (10 s).  Confirmed by the user's next playback
+    event; discarded (not penalised) if silence follows.
+
+  MAX-POSITION tracking:
+    Both paths track the PEAK position reached, not the last reported
+    position, to protect against false skips on backward seeks.
+
+Cooldown rules (v2, unchanged):
+  - consecutive_skips tracks skips in a row without a completion
+  - Completion resets consecutive_skips to 0
+  - When consecutive_skips >= 3: check_and_apply_cooldown() fires
+  - Cooldown durations: 1st=7 d, 2nd=14 d, 3rd=30 d, 4th+=permanent
+  - Favourites shielded: consecutive_skips capped at 2
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Request, HTTPException
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import PlaybackEvent, SkipPenalty, ManagedUser
+
+log = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+
+# ── Skip detection thresholds ────────────────────────────────────────────────
+
+SKIP_THRESHOLD          = 0.80
+MAX_PENALTY             = 0.60
+MIN_EVENTS_FOR_PENALTY  = 1
+DEDUP_WINDOW_SECONDS    = 10
+SKIP_CONFIRM_SECS       = 10
+SESSION_END_SECS        = 60
+MIN_POSITION_TICKS      = 5_000_000   # 0.5 s — ignore sub-half-second pings
+
+# Minimum wall-clock seconds that must have elapsed (since we first saw the
+# item) before we will write ANY event for it.  Prevents stale in-memory
+# entries (e.g. from a server restart mid-song) producing phantom skips.
+MIN_LISTEN_SECS         = 8
+
+# Favourites shield: cap consecutive skips for a favourited track so a couple
+# of bad-day skips can never trigger cooldown.
+FAVORITE_CONSECUTIVE_SKIP_CAP = 2
+
+
+# ── In-memory state ───────────────────────────────────────────────────────────
+
+_playback_starts:   dict = {}   # key -> (wall_start, runtime_ticks, track_name)
+_playback_progress: dict = {}   # key -> (wall_start, max_pos, runtime_ticks, p)
+_active_item:       dict = {}   # uid  -> normalised item_id
+_pending_skips:     dict = {}   # uid  -> {p, completion, method, wall_time}
+_recent_stops:      dict = {}   # key  -> wall_time  (dedup)
+_recent_errors:     list = []
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _norm_id(raw: str) -> str:
+    """Normalise a Jellyfin UUID: strip dashes, lowercase."""
+    return raw.replace("-", "").lower()
+
+
+def _calc_penalty(skip_count: int, total_events: int) -> float:
+    import math
+    if total_events < MIN_EVENTS_FOR_PENALTY:
+        return 0.0
+    skip_rate = skip_count / total_events
+    return round(min(MAX_PENALTY, MAX_PENALTY * (1 - math.exp(-3 * skip_rate))), 4)
+
+
+def _session_id(user_id: str) -> str:
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    return hashlib.md5(f"{user_id}:{day}".encode()).hexdigest()[:16]
+
+
+def _parse_body(body: dict) -> Optional[dict]:
+    item    = body.get("Item") or {}
+    session = body.get("Session") or {}
+
+    raw_item_id = item.get("Id") or body.get("ItemId") or body.get("Id")
+    raw_user_id = session.get("UserId") or body.get("UserId")
+    if not raw_item_id or not raw_user_id:
+        return None
+
+    # ── FIX: normalise *both* IDs consistently ────────────────────────────
+    item_id = _norm_id(str(raw_item_id))
+    user_id = _norm_id(str(raw_user_id))
+
+    runtime  = int(item.get("RunTimeTicks")  or body.get("RunTimeTicks")  or 0)
+    position = int(
+        body.get("PlaybackPositionTicks") or
+        session.get("PlayState", {}).get("PositionTicks") or 0
+    )
+
+    artists = item.get("Artists") or []
+    artist  = (
+        body.get("Artist") or
+        item.get("AlbumArtist") or
+        (artists[0] if artists else "") or ""
+    )
+
+    genre_raw = body.get("Genres") or item.get("Genres") or ""
+    if isinstance(genre_raw, str):
+        genre = genre_raw.split(",")[0].strip()
+    elif isinstance(genre_raw, list):
+        genre = genre_raw[0] if genre_raw else ""
+    else:
+        genre = ""
+
+    return {
+        "item_id":      item_id,
+        "user_id":      user_id,
+        "track_name":   item.get("Name")  or body.get("Name")  or "",
+        "artist_name":  artist,
+        "album_name":   item.get("Album") or body.get("Album") or "",
+        "genre":        genre,
+        "runtime_ticks":          runtime,
+        "position_ticks":         position,
+        "played_to_completion":   bool(body.get("PlayedToCompletion") or False),
+        "is_automated":           bool(body.get("IsAutomated") or False),
+        "is_favorite":            False,   # filled in by callers if needed
+    }
+
+
+def _is_managed(user_id: str, db: Session) -> bool:
+    normalised = _norm_id(user_id)
+    result = db.query(ManagedUser).filter_by(
+        jellyfin_user_id=normalised, is_enabled=True
+    ).first()
+    if not result:
+        all_enabled = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        result = next(
+            (u for u in all_enabled
+             if _norm_id(u.jellyfin_user_id) == normalised),
+            None,
+        )
+        if result:
+            log.warning(
+                f"Webhook user_id='{user_id}' matched '{result.username}' via normalisation. "
+                f"Consider updating the stored ID."
+            )
+    if not result:
+        all_users = db.query(ManagedUser).all()
+        exists = next(
+            (u for u in all_users if _norm_id(u.jellyfin_user_id) == normalised),
+            None,
+        )
+        if exists:
+            log.warning(f"Webhook from known user '{exists.username}' but is_enabled=False — skipping")
+        else:
+            log.warning(
+                f"Webhook from UNKNOWN user_id='{user_id}'. "
+                f"Stored IDs: {[u.jellyfin_user_id for u in db.query(ManagedUser).all()]}"
+            )
+        return False
+    return True
+
+
+def _prune(d: dict, max_age: float = 3600):
+    cutoff = time.time() - max_age
+    dead = [k for k, v in d.items()
+            if isinstance(v, tuple) and isinstance(v[0], float) and v[0] < cutoff]
+    for k in dead:
+        del d[k]
+
+
+def _write_event(db: Session, p: dict, completion: float, method: str, is_skip: bool):
+    """
+    Persist a PlaybackEvent and update the SkipPenalty row.
+    """
+    import traceback as _tb
+    try:
+        sid = _session_id(p["user_id"])
+
+        db.add(PlaybackEvent(
+            user_id=p["user_id"],
+            jellyfin_item_id=p["item_id"],
+            track_name=p["track_name"],
+            artist_name=p["artist_name"],
+            album_name=p["album_name"],
+            genre=p["genre"],
+            position_ticks=int(completion * p["runtime_ticks"]),
+            runtime_ticks=p["runtime_ticks"],
+            completion_pct=str(round(completion, 4)),
+            was_skip=is_skip,
+            received_at=datetime.utcnow(),
+            source_context=p.get("source_context"),
+            session_id=sid,
+        ))
+
+        row = db.query(SkipPenalty).filter_by(
+            user_id=p["user_id"], jellyfin_item_id=p["item_id"]
+        ).first()
+        if not row:
+            row = SkipPenalty(
+                user_id=p["user_id"], jellyfin_item_id=p["item_id"],
+                artist_name=p["artist_name"], genre=p["genre"],
+                total_events=0, skip_count=0,
+                consecutive_skips=0, skip_streak_peak=0,
+            )
+            db.add(row)
+            db.flush()
+
+        row.total_events = (row.total_events or 0) + 1
+        now = datetime.utcnow()
+
+        if is_skip:
+            row.skip_count        = (row.skip_count or 0) + 1
+            row.consecutive_skips = (row.consecutive_skips or 0) + 1
+            row.last_skip_at      = now
+
+            if p.get("is_favorite") and row.consecutive_skips > FAVORITE_CONSECUTIVE_SKIP_CAP:
+                row.consecutive_skips = FAVORITE_CONSECUTIVE_SKIP_CAP
+
+            row.skip_streak_peak = max(row.skip_streak_peak or 0, row.consecutive_skips)
+        else:
+            row.consecutive_skips  = 0
+            row.last_completed_at  = now
+
+        skip_rate  = (row.skip_count or 0) / row.total_events
+        row.skip_rate  = str(round(skip_rate, 4))
+        row.penalty    = str(_calc_penalty(row.skip_count, row.total_events))
+        row.updated_at = now
+        db.flush()
+
+        cooldown_result = None
+        if is_skip:
+            try:
+                from services.enrichment import check_and_apply_cooldown
+                cooldown_result = check_and_apply_cooldown(
+                    db=db,
+                    user_id=p["user_id"],
+                    jellyfin_item_id=p["item_id"],
+                    artist_name=p["artist_name"],
+                    track_name=p["track_name"],
+                    consecutive_skips=row.consecutive_skips,
+                )
+            except Exception as ce:
+                log.warning(f"  Cooldown check failed: {ce}")
+
+        db.commit()
+
+        outcome = "SKIP" if is_skip else "PLAYED"
+        if cooldown_result == "triggered":
+            outcome += " → COOLDOWN"
+        elif cooldown_result == "permanent":
+            outcome += " → PERMANENT DISLIKE"
+
+        log.info(
+            f"  ✓ Recorded  user={p['user_id'][:8]}  '{p['track_name']}'  "
+            f"{completion:.0%} via {method}  → {outcome}  "
+            f"(streak={row.consecutive_skips})"
+        )
+
+    except Exception as exc:
+        err_msg = (
+            f"user={p['user_id'][:8]} track='{p['track_name']}' "
+            f"{type(exc).__name__}: {exc}"
+        )
+        log.error(f"  ✗ DB WRITE FAILED  {err_msg}")
+        import traceback
+        log.error(traceback.format_exc())
+        _recent_errors.append({
+            "at":       datetime.utcnow().isoformat(),
+            "user_id":  p["user_id"],
+            "track":    p["track_name"],
+            "error":    f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        })
+        if len(_recent_errors) > 20:
+            _recent_errors.pop(0)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def _expire_pending_skips(db: Session):
+    now = time.time()
+    expired = [
+        uid for uid, entry in _pending_skips.items()
+        if now - entry["wall_time"] > SKIP_CONFIRM_SECS
+    ]
+    for uid in expired:
+        entry = _pending_skips.pop(uid)
+        log.info(
+            f"  Session end (no next track within {SKIP_CONFIRM_SECS}s) — "
+            f"NOT penalising  user={uid[:8]}  '{entry['p']['track_name']}'"
+        )
+
+
+def _finalize_progress_track(user_id: str, old_item_id: str, db: Session):
+    """
+    Called when a progress-only client moves to a new track.
+
+    FIX v2.1:
+      - Requires MIN_LISTEN_SECS of accumulated wall-clock time before writing
+        anything.  This discards stale entries left in memory after a server
+        restart (which would have no real position data).
+      - Transitions that look like skips now enter _pending_skips instead of
+        being written immediately.  This gives the same confirmation window
+        that standard clients get, so pausing then abandoning a song is NOT
+        penalised as a skip.
+    """
+    key   = f"{user_id}::{old_item_id}"
+    entry = _playback_progress.pop(key, None)
+    if not entry:
+        return
+
+    wall_start, max_pos, runtime, p = entry
+
+    # Guard: ignore entries with insufficient listen data
+    elapsed_wall = time.time() - wall_start
+    if elapsed_wall < MIN_LISTEN_SECS or max_pos < MIN_POSITION_TICKS:
+        log.debug(
+            f"  Progress finalize: discarding '{p['track_name']}' — "
+            f"only {elapsed_wall:.1f}s wall / {max_pos//10_000_000}s ticks accumulated "
+            f"(server restart guard or genuine sub-{MIN_LISTEN_SECS}s play)"
+        )
+        return
+
+    if runtime <= 0:
+        log.debug(f"  Progress finalize: skipping '{p['track_name']}' — no runtime info")
+        return
+
+    completion = min(1.0, max_pos / runtime)
+    is_skip    = completion < SKIP_THRESHOLD
+
+    log.info(
+        f"Playback TRANSITION (progress-only)  user={user_id[:8]}  "
+        f"'{p['track_name']}'  max_pos={max_pos//10_000_000}s / {runtime//10_000_000}s "
+        f"= {completion:.0%}  → {'pending skip confirmation' if is_skip else 'PLAYED'}"
+    )
+
+    if not is_skip:
+        _write_event(db, p, completion, "progress_transition", is_skip=False)
+        return
+
+    # ── FIX: route potential skips through the same confirmation window ───
+    # Only commit the skip if another track starts within SKIP_CONFIRM_SECS.
+    # This prevents paused/abandoned sessions from always counting as skips.
+    _pending_skips[user_id] = {
+        "p":          p,
+        "completion": completion,
+        "method":     "progress_transition",
+        "wall_time":  time.time(),
+    }
+    log.info(
+        f"  Skip PENDING confirmation  user={user_id[:8]}  '{p['track_name']}'  "
+        f"{completion:.0%} — waiting {SKIP_CONFIRM_SECS}s for next playback event"
+    )
+
+
+# ── Event handlers ────────────────────────────────────────────────────────────
+
+def handle_start(body: dict, db: Session):
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+
+    # Confirm any pending skip for this user (they started a new track)
+    if uid in _pending_skips:
+        entry = _pending_skips.pop(uid)
+        log.info(
+            f"  Skip CONFIRMED by next PlaybackStart  user={uid[:8]}  "
+            f"'{entry['p']['track_name']}'"
+        )
+        _write_event(db, entry["p"], entry["completion"], entry["method"], is_skip=True)
+
+    prev_item_id = _active_item.get(uid)
+    if prev_item_id and prev_item_id != p["item_id"]:
+        log.debug(f"  Start-triggered transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
+        _finalize_progress_track(uid, prev_item_id, db)
+
+    # ── FIX: preserve wall_start — do NOT reset it on every progress tick ─
+    # Initialise the progress entry only if it doesn't already exist for this key.
+    if key not in _playback_progress:
+        _playback_progress[key] = (time.time(), 0, p["runtime_ticks"], p)
+
+    _playback_starts[key] = (time.time(), p["runtime_ticks"], p["track_name"])
+    _active_item[uid]     = p["item_id"]
+
+    _prune(_playback_starts)
+    _prune(_playback_progress)
+    log.info(
+        f"Playback START  user={uid[:8]}  '{p['track_name']}'  "
+        f"runtime={p['runtime_ticks']//10_000_000}s"
+    )
+
+
+def handle_progress(body: dict, db: Session):
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+    now = time.time()
+
+    prev_item_id = _active_item.get(uid)
+    if prev_item_id and prev_item_id != p["item_id"]:
+        log.debug(f"  Track transition: {prev_item_id[:8]} → {p['item_id'][:8]}  user={uid[:8]}")
+        _finalize_progress_track(uid, prev_item_id, db)
+        # ── FIX: clear _active_item immediately after finalization so a
+        #    second heartbeat with the old item_id can't re-trigger it ──────
+        if _active_item.get(uid) == prev_item_id:
+            del _active_item[uid]
+
+    _active_item[uid] = p["item_id"]
+
+    existing    = _playback_progress.get(key)
+    current_max = existing[1] if existing else 0
+    new_max     = max(current_max, p["position_ticks"]) if p["position_ticks"] >= MIN_POSITION_TICKS else current_max
+
+    # ── FIX: preserve the original wall_start from when we first saw this
+    #    item; only update max_pos and (if missing) runtime_ticks ───────────
+    if existing:
+        wall_start, _old_max, old_runtime, _old_p = existing
+        runtime = p["runtime_ticks"] or old_runtime
+        _playback_progress[key] = (wall_start, new_max, runtime, p)
+    else:
+        _playback_progress[key] = (now, new_max, p["runtime_ticks"], p)
+
+    _prune(_playback_progress)
+
+    log.debug(
+        f"Progress: '{p['track_name']}'  "
+        f"{p['position_ticks']//10_000_000}s / {p['runtime_ticks']//10_000_000}s  "
+        f"max={new_max//10_000_000}s"
+    )
+
+
+def handle_stop(body: dict, db: Session):
+    p = _parse_body(body)
+    if not p or not _is_managed(p["user_id"], db):
+        return
+
+    _expire_pending_skips(db)
+
+    uid = p["user_id"]
+    key = f"{uid}::{p['item_id']}"
+    now = time.time()
+
+    if now - _recent_stops.get(key, 0) < DEDUP_WINDOW_SECONDS:
+        log.debug(f"Dedup: dropping duplicate stop  user={uid[:8]}  '{p['track_name']}'")
+        return
+    _recent_stops[key] = now
+    _prune(_recent_stops)
+
+    if _active_item.get(uid) == p["item_id"]:
+        del _active_item[uid]
+
+    start_entry    = _playback_starts.pop(key, None)
+    progress_entry = _playback_progress.pop(key, None)
+
+    runtime_ticks = (
+        p["runtime_ticks"]
+        or (start_entry[1]    if start_entry    else 0)
+        or (progress_entry[2] if progress_entry else 0)
+    )
+
+    if p["played_to_completion"]:
+        log.info(f"Playback STOP  user={uid[:8]}  '{p['track_name']}' — 100% (completion flag) → PLAYED")
+        _write_event(db, p, 1.0, "played_to_completion_flag", is_skip=False)
+        return
+
+    if start_entry and runtime_ticks > 0:
+        wall_start, _rt, _ = start_entry
+        elapsed_ticks = (now - wall_start) * 10_000_000
+        completion    = min(1.0, elapsed_ticks / runtime_ticks)
+        method        = "server_timing"
+
+    elif progress_entry and runtime_ticks > 0:
+        # Use max_pos directly — don't add extra wall-clock time here as
+        # it can inflate completion on paused tracks.
+        _wall_start, max_pos, _rt, _ = progress_entry
+        completion = min(1.0, max_pos / runtime_ticks)
+        method     = "progress_heartbeat"
+
+    else:
+        completion = 0.0
+        method     = "ambiguous"
+
+    is_skip = (method != "ambiguous") and (completion < SKIP_THRESHOLD)
+
+    log.info(
+        f"Playback STOP  user={uid[:8]}  '{p['track_name']}'  "
+        f"{completion:.0%} via {method}  → {'pending skip confirmation' if is_skip else 'PLAYED'}"
+    )
+
+    if not is_skip or method == "ambiguous":
+        _write_event(db, p, completion, method, is_skip=False if method == "ambiguous" else is_skip)
+        return
+
+    _pending_skips[uid] = {
+        "p":          p,
+        "completion": completion,
+        "method":     method,
+        "wall_time":  now,
+    }
+    log.info(
+        f"  Skip PENDING confirmation  user={uid[:8]}  '{p['track_name']}'  "
+        f"{completion:.0%} — waiting {SKIP_CONFIRM_SECS}s for next PlaybackStart"
+    )
+
+
+# ── API endpoint ──────────────────────────────────────────────────────────────
+
+@router.post("/jellyfin")
+async def jellyfin_webhook(request: Request, db: Session = Depends(get_db)):
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    raw_type = (
+        body.get("NotificationType") or
+        body.get("Event") or
+        body.get("Type") or ""
+    ).lower().replace(".", "").replace("_", "").replace(" ", "")
+
+    log.debug(f"Webhook event: {raw_type} — {body.get('Name')}")
+
+    try:
+        if "playbackstart" in raw_type:
+            handle_start(body, db)
+            return {"ok": True, "event": "start"}
+        elif "playbackprogress" in raw_type or "playbacktick" in raw_type:
+            handle_progress(body, db)
+            return {"ok": True, "event": "progress"}
+        elif "playbackstop" in raw_type:
+            handle_stop(body, db)
+            return {"ok": True, "event": "stop"}
+        else:
+            return {"ok": True, "processed": False, "reason": f"'{raw_type}' ignored"}
+    except Exception as e:
+        log.error(f"Webhook error ({raw_type}): {e}")
+        return {"ok": True, "processed": False, "error": str(e)}
+
+
+# ── Diagnostic / utility endpoints ───────────────────────────────────────────
+
+_debug_captures: list = []
+
+@router.post("/jellyfin/debug")
+async def debug_capture(request: Request):
+    raw  = await request.body()
+    body = {}
+    try:
+        body = json.loads(raw)
+    except Exception:
+        pass
+    session = body.get("Session") or {}
+    item    = body.get("Item")    or {}
+    capture = {
+        "NotificationType":      body.get("NotificationType"),
+        "Name":                  body.get("Name"),
+        "Artist":                body.get("Artist"),
+        "UserId_body":           body.get("UserId"),
+        "UserId_session":        session.get("UserId"),
+        "Username_session":      session.get("UserName") or session.get("Username"),
+        "ItemId_item":           item.get("Id"),
+        "ItemId_body":           body.get("ItemId"),
+        "PlaybackPositionTicks": body.get("PlaybackPositionTicks"),
+        "RunTimeTicks":          body.get("RunTimeTicks"),
+        "PlayedToCompletion":    body.get("PlayedToCompletion"),
+        "IsAutomated":           body.get("IsAutomated"),
+        "ClientName":            body.get("ClientName") or body.get("Client"),
+        "DeviceName":            body.get("DeviceName"),
+        "raw_text": raw.decode("utf-8", errors="replace")[:2000],
+    }
+    _debug_captures.append(capture)
+    if len(_debug_captures) > 20:
+        _debug_captures.pop(0)
+    print(
+        f"DEBUG: type={body.get('NotificationType')} "
+        f"track={body.get('Name')} "
+        f"pos={body.get('PlaybackPositionTicks')}",
+        flush=True,
+    )
+    return {"received": True, "capture": capture}
+
+
+@router.get("/jellyfin/debug")
+async def get_debug():
+    return {"count": len(_debug_captures), "captures": _debug_captures}
+
+
+@router.get("/pending-starts")
+def pending_starts():
+    now = time.time()
+    return {
+        k: {
+            "track_name":          v[2],
+            "started_ago_seconds": round(now - v[0], 1),
+            "runtime_seconds":     round(v[1] / 10_000_000, 0),
+        }
+        for k, v in _playback_starts.items()
+    }
+
+
+@router.get("/pending-skips")
+def pending_skips_diagnostic():
+    now = time.time()
+    return {
+        uid: {
+            "track_name":      entry["p"]["track_name"],
+            "completion":      f"{entry['completion']:.0%}",
+            "method":          entry["method"],
+            "waiting_secs":    round(now - entry["wall_time"], 1),
+            "expires_in_secs": round(SKIP_CONFIRM_SECS - (now - entry["wall_time"]), 1),
+        }
+        for uid, entry in _pending_skips.items()
+    }
+
+
+@router.get("/managed-users")
+def managed_users_diagnostic(db: Session = Depends(get_db)):
+    from models import PlaybackEvent, SkipPenalty
+    from sqlalchemy import desc
+
+    users  = db.query(ManagedUser).all()
+    result = []
+
+    for u in users:
+        uid = u.jellyfin_user_id
+
+        total_events = db.query(PlaybackEvent).filter_by(user_id=uid).count()
+        skip_events  = db.query(PlaybackEvent).filter_by(user_id=uid, was_skip=True).count()
+        ambiguous    = db.query(PlaybackEvent).filter_by(user_id=uid).filter(
+            PlaybackEvent.completion_pct == "0.0"
+        ).count()
+
+        last_event = (
+            db.query(PlaybackEvent)
+            .filter_by(user_id=uid)
+            .order_by(PlaybackEvent.received_at.desc())
+            .first()
+        )
+
+        from models import TrackCooldown
+        active_cooldowns   = db.query(TrackCooldown).filter_by(user_id=uid, status="active").count()
+        permanent_dislikes = db.query(TrackCooldown).filter_by(user_id=uid, status="permanent").count()
+
+        pending_start_keys    = [k for k in _playback_starts    if k.startswith(uid)]
+        pending_progress_keys = [k for k in _playback_progress  if k.startswith(uid)]
+        pending_skip          = _pending_skips.get(uid)
+
+        if total_events == 0:
+            diagnosis = "No events in DB — webhook user_id mismatch or events not reaching server"
+        elif skip_events == 0 and total_events > 5:
+            diagnosis = f"{total_events} events but 0 skips — progress-only client (Manet)"
+        else:
+            diagnosis = (
+                f"{total_events} events, {skip_events} skips "
+                f"({100 * skip_events // total_events if total_events else 0}%) — OK"
+            )
+
+        result.append({
+            "username":            u.username,
+            "jellyfin_user_id":    uid,
+            "is_enabled":          u.is_enabled,
+            "db_total_events":     total_events,
+            "db_skip_events":      skip_events,
+            "db_ambiguous_events": ambiguous,
+            "last_event_track":    last_event.track_name    if last_event else None,
+            "last_event_was_skip": last_event.was_skip      if last_event else None,
+            "last_event_at":       last_event.received_at.isoformat() if last_event else None,
+            "in_memory_pending_starts":   len(pending_start_keys),
+            "in_memory_pending_progress": len(pending_progress_keys),
+            "in_memory_pending_skip":     bool(pending_skip),
+            "active_cooldowns":    active_cooldowns,
+            "permanent_dislikes":  permanent_dislikes,
+            "diagnosis":           diagnosis,
+        })
+
+    return {
+        "managed_users":            result,
+        "in_memory_active_starts":  len(_playback_starts),
+        "in_memory_pending_skips":  len(_pending_skips),
+        "recent_db_errors":         _recent_errors[-5:],
+    }
+
+
+@router.get("/cooldowns/{user_id}")
+def get_cooldowns(user_id: str, db: Session = Depends(get_db)):
+    from models import TrackCooldown
+    rows = (
+        db.query(TrackCooldown)
+        .filter_by(user_id=user_id)
+        .order_by(TrackCooldown.cooldown_started_at.desc())
+        .limit(50)
+        .all()
+    )
+    now = datetime.utcnow()
+    return [
+        {
+            "track_name":     r.track_name,
+            "artist_name":    r.artist_name,
+            "status":         r.status,
+            "cooldown_count": r.cooldown_count,
+            "skip_streak":    r.skip_streak_at_trigger,
+            "cooldown_until": r.cooldown_until.isoformat() if r.cooldown_until else None,
+            "days_remaining": max(0, round((r.cooldown_until - now).total_seconds() / 86400, 1))
+                              if r.cooldown_until and r.status == "active" else 0,
+            "started_at":     r.cooldown_started_at.isoformat() if r.cooldown_started_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/setup-guide")
+def setup_guide(request: Request):
+    host = request.headers.get("host", "localhost:7879")
+    url  = f"http://{host}/api/webhooks/jellyfin"
+    return {
+        "webhook_url": url,
+        "instructions": [
+            "1. Jellyfin → Dashboard → Plugins → Webhook",
+            "2. Click 'Add Generic Destination'",
+            f"3. URL: {url}",
+            "4. Request Type: POST",
+            "5. Notification Types: enable 'Playback Start', 'Playback Progress', AND 'Playback Stop'",
+            "6. Item Type: Songs",
+            "7. Send all fields — Save",
+        ],
+        "skip_threshold":           f"{SKIP_THRESHOLD:.0%}",
+        "skip_confirm_window_secs": SKIP_CONFIRM_SECS,
+        "cooldown_threshold_skips": 3,
+    }
+
+
+@router.get("/stats/{user_id}")
+def skip_stats(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    rows = (
+        db.query(SkipPenalty)
+        .filter_by(user_id=user_id)
+        .filter(SkipPenalty.total_events >= MIN_EVENTS_FOR_PENALTY)
+        .order_by(SkipPenalty.skip_rate.desc())
+        .limit(limit).all()
+    )
+    return {
+        "user_id":       user_id,
+        "total_tracked": db.query(SkipPenalty).filter_by(user_id=user_id).count(),
+        "items": [
+            {
+                "jellyfin_item_id":   r.jellyfin_item_id,
+                "artist_name":        r.artist_name,
+                "total_events":       r.total_events,
+                "skip_count":         r.skip_count,
+                "skip_rate":          float(r.skip_rate),
+                "penalty":            float(r.penalty),
+                "consecutive_skips":  r.consecutive_skips,
+                "skip_streak_peak":   r.skip_streak_peak,
+                "last_skip_at":       r.last_skip_at.isoformat() if r.last_skip_at else None,
+                "last_completed_at":  r.last_completed_at.isoformat() if r.last_completed_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/recent/{user_id}")
+def recent_events(user_id: str, limit: int = 20, db: Session = Depends(get_db)):
+    rows = (
+        db.query(PlaybackEvent)
+        .filter_by(user_id=user_id)
+        .order_by(PlaybackEvent.received_at.desc())
+        .limit(limit).all()
+    )
+    return [
+        {
+            "track_name":     r.track_name,
+            "artist_name":    r.artist_name,
+            "completion_pct": float(r.completion_pct),
+            "was_skip":       r.was_skip,
+            "received_at":    r.received_at,
+            "source_context": r.source_context,
+            "session_id":     r.session_id,
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/penalties/{user_id}")
+def clear_penalties(user_id: str, db: Session = Depends(get_db)):
+    pc = db.query(SkipPenalty).filter_by(user_id=user_id).delete()
+    ec = db.query(PlaybackEvent).filter_by(user_id=user_id).delete()
+    db.commit()
+    return {"ok": True, "penalties_cleared": pc, "events_cleared": ec}
+</file>
+
+<file path="backend/scheduler.py">
+"""
+JellyDJ — Central background job scheduler.
+
+Uses APScheduler's AsyncIOScheduler so that scheduled jobs can be async
+coroutines and share the same event loop as FastAPI.
+
+Registered jobs
+───────────────
+  play_history_index   Run library scan + per-user play history sync + score rebuild.
+                       Default: every 6 hours. Configurable in Automation settings.
+
+  discovery_refresh    Populate the discovery queue with new album recommendations
+                       for all enabled users. Default: every 24 hours.
+
+  playlist_regen       Regenerate all Jellyfin playlists from current scores.
+                       Default: every 24 hours.
+
+  auto_download        Send top-scored pending discovery items to Lidarr.
+                       Starts paused; only runs when auto_download_enabled=True.
+                       Interval matches the cooldown_days setting.
+
+All intervals are re-read from the AutomationSettings database row on startup
+via reschedule_automation_jobs(), so changes made in the UI take effect after
+the next container restart (or immediately if the user saves settings, which
+calls reschedule_automation_jobs() again).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+log = logging.getLogger(__name__)
+
+scheduler = AsyncIOScheduler()
+
+# Stable job IDs — used to reschedule or pause individual jobs
+INDEX_JOB_ID          = "play_history_index"
+DISCOVERY_JOB_ID      = "discovery_refresh"
+PLAYLIST_JOB_ID       = "playlist_regen"
+AUTO_DOWNLOAD_JOB_ID  = "auto_download"
+BILLBOARD_JOB_ID      = "billboard_refresh"
+
+
+def _get_settings(db):
+    """
+    Read AutomationSettings from the database.
+    Returns a Defaults fallback object if the row doesn't exist yet
+    (i.e. on a fresh install before the user has visited the Automation page).
+    """
+    try:
+        from models import AutomationSettings
+        row = db.query(AutomationSettings).first()
+        if row:
+            return row
+    except Exception:
+        pass
+
+    # Inline defaults — mirrors the column defaults in models.py
+    class Defaults:
+        index_interval_hours              = 6
+        discovery_refresh_enabled         = True
+        discovery_refresh_interval_hours  = 24
+        discovery_items_per_run           = 10
+        playlist_regen_enabled            = True
+        playlist_regen_interval_hours     = 24
+        auto_download_enabled             = False
+        auto_download_cooldown_days       = 7
+    return Defaults()
+
+
+def _sync_wrap(async_fn, *args, **kwargs):
+    """
+    Run an async job function synchronously in a fresh event loop.
+
+    APScheduler's AsyncIOScheduler dispatches async jobs via
+    asyncio.ensure_future() on its internal event loop reference.
+    When that reference is None or mismatched with FastAPI's loop,
+    the coroutine is silently never awaited and the job appears permanently
+    overdue (next_run stays in the past).
+
+    Wrapping each scheduled job in a plain synchronous function that calls
+    asyncio.run() sidesteps this entirely — each job gets a clean, isolated
+    event loop that runs to completion and is then discarded.
+    This is safe because none of the job functions share state with
+    FastAPI's request-handling loop.
+    """
+    import asyncio
+    asyncio.run(async_fn(*args, **kwargs))
+
+
+def _job_run_index():
+    import asyncio
+    from services.indexer import run_full_index
+    asyncio.run(run_full_index())
+
+
+def _job_discovery_refresh():
+    from routers.automation import _run_discovery_refresh
+    _sync_wrap(_run_discovery_refresh)
+
+
+def _job_playlist_regen():
+    from routers.automation import _run_playlist_regen
+    _sync_wrap(_run_playlist_regen)
+
+
+def _job_auto_download():
+    from routers.automation import _run_auto_download
+    _sync_wrap(_run_auto_download)
+
+
+def _job_billboard_refresh():
+    """Fetch Billboard Hot 100 and update the chart entries table."""
+    from database import SessionLocal
+    from services.indexer import sync_billboard_chart
+    db = SessionLocal()
+    try:
+        sync_billboard_chart(db)
+    except Exception as e:
+        log.error(f"Billboard refresh job failed: {e}")
+    finally:
+        db.close()
+
+
+def _run_billboard_if_empty():
+    """
+    Run a billboard sync immediately if the table has never been populated.
+    This ensures the dashboard shows chart data on first launch without waiting
+    a full week for the scheduler to fire.
+    """
+    import threading
+    from database import SessionLocal
+    from models import BillboardChartEntry
+
+    def _check_and_run():
+        db = SessionLocal()
+        try:
+            count = db.query(BillboardChartEntry).count()
+            if count == 0:
+                log.info("Billboard table empty — running initial chart fetch...")
+                from services.indexer import sync_billboard_chart
+                sync_billboard_chart(db)
+        except Exception as e:
+            log.warning(f"Initial billboard fetch failed (non-fatal): {e}")
+        finally:
+            db.close()
+
+    t = threading.Thread(target=_check_and_run, daemon=True, name="billboard-init")
+    t.start()
+
+
+def start_scheduler(db_session_factory):
+    """
+    Register all four jobs and start the scheduler.
+    Called once from the FastAPI lifespan in main.py.
+
+    Jobs are registered with their default intervals first, then
+    reschedule_automation_jobs() immediately corrects them from the database.
+    The two-step approach ensures the scheduler is running before any
+    database access, which avoids startup order issues.
+
+    All scheduled functions are plain synchronous wrappers around their async
+    implementations — see _sync_wrap(). This avoids the APScheduler/asyncio
+    event loop mismatch that causes jobs to appear perpetually overdue.
+    """
+
+    # Register jobs with conservative defaults — reschedule() below will override
+    scheduler.add_job(
+        _job_run_index,
+        trigger=IntervalTrigger(hours=6),
+        id=INDEX_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        _job_discovery_refresh,
+        trigger=IntervalTrigger(hours=24),
+        id=DISCOVERY_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        _job_playlist_regen,
+        trigger=IntervalTrigger(hours=24),
+        id=PLAYLIST_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        _job_auto_download,
+        trigger=IntervalTrigger(days=1),
+        id=AUTO_DOWNLOAD_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    scheduler.add_job(
+        _job_billboard_refresh,
+        trigger=IntervalTrigger(hours=168),  # weekly default
+        id=BILLBOARD_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.start()
+
+    # Auto-download starts paused — reschedule_automation_jobs will enable it
+    # only if auto_download_enabled=True is saved in the database
+    scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
+    log.info("Scheduler started (5 jobs registered).")
+
+    # Run billboard sync immediately on first start if table is empty
+    _run_billboard_if_empty()
+
+    # Immediately apply stored settings so intervals are correct from the first run
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        reschedule_automation_jobs(db)
+    finally:
+        db.close()
+
+
+def reschedule_index_job(db):
+    """
+    Update only the indexer job interval.
+    Called when the user changes index_interval_hours in the Automation settings.
+    """
+    s = _get_settings(db)
+    scheduler.reschedule_job(
+        INDEX_JOB_ID,
+        trigger=IntervalTrigger(
+            hours=s.index_interval_hours,
+            start_date=datetime.now(timezone.utc),  # always schedule forward from now
+        ),
+    )
+    log.info(f"Index job rescheduled: every {s.index_interval_hours}h")
+
+
+def reschedule_automation_jobs(db):
+    """
+    Apply current AutomationSettings to all four scheduler jobs.
+
+    Called:
+      - On startup (after registering jobs with defaults)
+      - When the user saves Automation settings in the UI
+      - After any manual trigger that might change settings
+
+    Disabled jobs are paused rather than removed so they can be re-enabled
+    without re-registering.
+    """
+    s = _get_settings(db)
+
+    # Indexer always runs — only the interval changes
+    scheduler.reschedule_job(
+        INDEX_JOB_ID,
+        trigger=IntervalTrigger(
+            hours=s.index_interval_hours,
+            start_date=datetime.now(timezone.utc),
+        ),
+    )
+
+    # Discovery refresh — can be fully disabled
+    if s.discovery_refresh_enabled:
+        from datetime import timedelta as _td
+        _disc_interval = _td(hours=s.discovery_refresh_interval_hours)
+        _disc_last     = getattr(s, "last_discovery_refresh", None)
+        _now           = datetime.now(timezone.utc)
+        if _disc_last is None:
+            _disc_next = _now + _disc_interval
+        else:
+            if _disc_last.tzinfo is None:
+                _disc_last = _disc_last.replace(tzinfo=timezone.utc)
+            _disc_next = _disc_last + _disc_interval
+            if _disc_next < _now:
+                _disc_next = _now + _td(minutes=2)
+        scheduler.reschedule_job(
+            DISCOVERY_JOB_ID,
+            trigger=IntervalTrigger(
+                hours=s.discovery_refresh_interval_hours,
+                start_date=_disc_next,
+            ),
+        )
+        try:
+            scheduler.resume_job(DISCOVERY_JOB_ID)
+        except Exception:
+            pass
+    else:
+        try:
+            scheduler.pause_job(DISCOVERY_JOB_ID)
+        except Exception:
+            pass
+
+    # Playlist regen — can be fully disabled
+    if s.playlist_regen_enabled:
+        from datetime import timedelta as _td
+        _pl_interval = _td(hours=s.playlist_regen_interval_hours)
+        _pl_last     = getattr(s, "last_playlist_regen", None)
+        _now         = datetime.now(timezone.utc)
+        if _pl_last is None:
+            _pl_next = _now + _pl_interval
+        else:
+            if _pl_last.tzinfo is None:
+                _pl_last = _pl_last.replace(tzinfo=timezone.utc)
+            _pl_next = _pl_last + _pl_interval
+            if _pl_next < _now:
+                _pl_next = _now + _td(minutes=3)
+        scheduler.reschedule_job(
+            PLAYLIST_JOB_ID,
+            trigger=IntervalTrigger(
+                hours=s.playlist_regen_interval_hours,
+                start_date=_pl_next,
+            ),
+        )
+        try:
+            scheduler.resume_job(PLAYLIST_JOB_ID)
+        except Exception:
+            pass
+    else:
+        try:
+            scheduler.pause_job(PLAYLIST_JOB_ID)
+        except Exception:
+            pass
+
+    # Auto-download — disabled by default; interval = cooldown_days
+    # The job itself also enforces the cooldown internally as a safety net.
+    auto_dl_enabled = getattr(s, "auto_download_enabled", False)
+    cooldown_days   = getattr(s, "auto_download_cooldown_days", 7) or 1
+    if auto_dl_enabled:
+        from datetime import timedelta as _td
+        interval = _td(days=cooldown_days)
+        now      = datetime.now(timezone.utc)
+        last_run = getattr(s, "last_auto_download", None)
+
+        if last_run is None:
+            # Never run — schedule one interval from now so it doesn't fire immediately
+            next_run = now + interval
+        else:
+            # Base next run on last_run + interval, not on now + interval.
+            # This way container restarts and settings saves don't reset the clock —
+            # if the job ran 3 days ago with a 7-day cooldown it stays due in 4 days,
+            # not pushed back to 7 days from now.
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+            next_run = last_run + interval
+            # If overdue (next_run in the past), run shortly after startup
+            if next_run < now:
+                next_run = now + _td(minutes=5)
+
+        scheduler.reschedule_job(
+            AUTO_DOWNLOAD_JOB_ID,
+            trigger=IntervalTrigger(days=cooldown_days, start_date=next_run),
+        )
+        try:
+            scheduler.resume_job(AUTO_DOWNLOAD_JOB_ID)
+        except Exception:
+            pass
+        log.info(
+            f"Auto-download scheduled: every {cooldown_days}d, "
+            f"next run {next_run.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+    else:
+        try:
+            scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
+        except Exception:
+            pass
+
+    # Billboard chart refresh — weekly by default
+    billboard_enabled  = getattr(s, "billboard_refresh_enabled", True)
+    billboard_interval = getattr(s, "billboard_refresh_interval_hours", 168) or 168
+    if billboard_enabled:
+        from datetime import timedelta as _td
+        _bb_interval = _td(hours=billboard_interval)
+        _bb_last     = getattr(s, "last_billboard_refresh", None)
+        _now         = datetime.now(timezone.utc)
+        if _bb_last is None:
+            _bb_next = _now + _td(minutes=1)   # run soon if never run
+        else:
+            if _bb_last.tzinfo is None:
+                _bb_last = _bb_last.replace(tzinfo=timezone.utc)
+            _bb_next = _bb_last + _bb_interval
+            if _bb_next < _now:
+                _bb_next = _now + _td(minutes=1)
+        try:
+            scheduler.reschedule_job(
+                BILLBOARD_JOB_ID,
+                trigger=IntervalTrigger(hours=billboard_interval, start_date=_bb_next),
+            )
+            scheduler.resume_job(BILLBOARD_JOB_ID)
+        except Exception:
+            pass
+    else:
+        try:
+            scheduler.pause_job(BILLBOARD_JOB_ID)
+        except Exception:
+            pass
+
+    log.info(
+        f"Automation rescheduled: index={s.index_interval_hours}h | "
+        f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
+        f"({s.discovery_refresh_interval_hours}h) | "
+        f"playlists={'on' if s.playlist_regen_enabled else 'off'} "
+        f"({s.playlist_regen_interval_hours}h) | "
+        f"auto_download={'on' if auto_dl_enabled else 'off'} "
+        f"(every {cooldown_days}d) | "
+        f"billboard={'on' if billboard_enabled else 'off'} "
+        f"(every {billboard_interval}h)"
+    )
+
+
+async def trigger_index_now():
+    """
+    Immediately fire the indexer outside of its normal schedule.
+    Called by the manual "Index Now" button in the UI via the automation router.
+    """
+    from services.indexer import run_full_index
+    log.info("Manual index triggered.")
+    await run_full_index()
+
+
+def get_job_status() -> dict:
+    """
+    Return the next scheduled run time for all registered jobs.
+    next_run is None when a job is paused.
+    Used by the Dashboard and the Automation page to show upcoming run times.
+    """
+    statuses = {}
+    for job in scheduler.get_jobs():
+        statuses[job.id] = {
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            "paused":   job.next_run_time is None,
+            "name":     job.name or job.id,
+        }
+    return statuses
 </file>
 
 <file path="README.md">

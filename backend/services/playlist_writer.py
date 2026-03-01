@@ -35,6 +35,20 @@ from models import (
 from services.events import log_event
 from crypto import decrypt
 
+from sqlalchemy import or_ as _sa_or_
+
+
+def _holiday_ok():
+    """
+    SQLAlchemy filter: pass through tracks that have no holiday tag, or whose
+    holiday season is currently active.  Blocks out-of-season holiday tracks.
+    """
+    return _sa_or_(
+        TrackScore.holiday_tag.is_(None),
+        TrackScore.holiday_exclude == False,  # noqa: E712
+    )
+
+
 log = logging.getLogger(__name__)
 
 # Track counts per playlist type.
@@ -229,6 +243,7 @@ def _get_tracks_for_playlist(
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(TrackScore.is_played == True)
+            .filter(_holiday_ok())
             .order_by(TrackScore.play_count.desc())
             .limit(limit * 6)
             .all()
@@ -243,6 +258,7 @@ def _get_tracks_for_playlist(
                 TrackScore.is_played == True,
                 TrackScore.last_played.isnot(None),
             )
+            .filter(_holiday_ok())
             .order_by(TrackScore.last_played.desc())
             .limit(limit * 4)
             .all()
@@ -275,6 +291,7 @@ def _get_tracks_for_playlist(
         core_pool = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
+            .filter(_holiday_ok())
             .order_by(satext("CAST(final_score AS REAL) DESC"))
             .limit(n_core * 8)
             .all()
@@ -288,6 +305,7 @@ def _get_tracks_for_playlist(
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(TrackScore.is_played == False)
+            .filter(_holiday_ok())
             .order_by(satext("CAST(final_score AS REAL) DESC"))
             .limit(n_discovery * 8)
             .all()
@@ -306,6 +324,7 @@ def _get_tracks_for_playlist(
                 TrackScore.is_played == True,
                 TrackScore.last_played < cutoff,
             )
+            .filter(_holiday_ok())
             .order_by(satext("CAST(artist_affinity AS REAL) DESC"))
             .limit(n_deep_cuts * 8)
             .all()
@@ -358,6 +377,7 @@ def _get_tracks_for_playlist(
         all_unplayed = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
+            .filter(_holiday_ok())
             .filter(
                 TrackScore.is_played == False,
                 TrackScore.auto_skip == False if hasattr(TrackScore, 'auto_skip') else True,

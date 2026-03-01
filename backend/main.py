@@ -1,4 +1,3 @@
-
 """
 JellyDJ — FastAPI application entry point.
 
@@ -86,6 +85,11 @@ def _run_migrations():
         ("library_tracks", "tags",              "TEXT",     "NULL"),
         ("library_tracks", "enriched_at",       "DATETIME", "NULL"),
         ("library_tracks", "enrichment_source", "TEXT",     "NULL"),
+        # v4: holiday tagging
+        ("library_tracks", "holiday_tag",     "TEXT",    "NULL"),
+        ("library_tracks", "holiday_exclude", "BOOLEAN", "0"),
+        ("track_scores",   "holiday_tag",     "TEXT",    "NULL"),
+        ("track_scores",   "holiday_exclude", "BOOLEAN", "0"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:

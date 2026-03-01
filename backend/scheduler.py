@@ -1,4 +1,3 @@
-
 """
 JellyDJ — Central background job scheduler.
 
@@ -126,6 +125,20 @@ def _job_billboard_refresh():
         db.close()
 
 
+def _job_holiday_flags():
+    """Nightly job: flip holiday_exclude flags as seasons open and close."""
+    from database import SessionLocal
+    from services.holiday import refresh_exclude_flags
+    db = SessionLocal()
+    try:
+        result = refresh_exclude_flags(db)
+        log.info(f"Holiday flags refreshed: {result}")
+    except Exception as e:
+        log.error(f"Holiday flags refresh failed: {e}")
+    finally:
+        db.close()
+
+
 def _run_billboard_if_empty():
     """
     Run a billboard sync immediately if the table has never been populated.
@@ -204,6 +217,14 @@ def start_scheduler(db_session_factory):
         id=BILLBOARD_JOB_ID,
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        _job_holiday_flags,
+        trigger=IntervalTrigger(hours=24, start_date=datetime.now(timezone.utc)),
+        id="holiday_flags",
+        name="Holiday Flag Refresh",
+        replace_existing=True,
     )
 
     scheduler.start()

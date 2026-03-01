@@ -49,6 +49,7 @@ def get_tracks(
     played_filter: str = Query("all", description="all|played|unplayed"),
     cooldown_filter: str = Query("all", description="all|active|clear"),
     artist_filter: Optional[str] = Query(None),
+    holiday_filter: str = Query("all", description="all|holiday|excluded|normal"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
     db: Session = Depends(get_db),
@@ -74,6 +75,14 @@ def get_tracks(
 
     if artist_filter:
         q = q.filter(TrackScore.artist_name.ilike(f"%{artist_filter}%"))
+
+    # v4: holiday filter
+    if holiday_filter == "holiday":
+        q = q.filter(TrackScore.holiday_tag.isnot(None))
+    elif holiday_filter == "excluded":
+        q = q.filter(TrackScore.holiday_tag.isnot(None), TrackScore.holiday_exclude == True)
+    elif holiday_filter == "normal":
+        q = q.filter(TrackScore.holiday_tag.is_(None))
 
     from sqlalchemy import text as satext
 
@@ -156,6 +165,8 @@ def get_tracks(
                 "global_popularity": r.global_popularity,
                 "cooldown_until":    r.cooldown_until.isoformat() if r.cooldown_until else None,
                 "on_cooldown":       bool(r.cooldown_until and r.cooldown_until > now),
+                "holiday_tag":       getattr(r, "holiday_tag", None),
+                "holiday_exclude":   bool(getattr(r, "holiday_exclude", False)),
             }
             for r in rows
         ],
@@ -544,3 +555,57 @@ def get_summary(
             "last_7_days": recent_replays,
         },
     }
+
+
+@router.get("/holiday")
+def get_holiday_summary(db: Session = Depends(get_db)):
+    """
+    v4: Holiday detection summary.
+    Returns per-holiday track counts, season windows, and the full tagged
+    track list so the UI can show exactly which songs were identified.
+    """
+    from models import LibraryTrack
+    from services.holiday import is_in_season, HOLIDAY_RULES
+    from datetime import date
+
+    today = date.today()
+
+    tagged = db.query(LibraryTrack).filter(
+        LibraryTrack.holiday_tag.isnot(None),
+        LibraryTrack.missing_since.is_(None),
+    ).order_by(LibraryTrack.holiday_tag, LibraryTrack.artist_name, LibraryTrack.track_name).all()
+
+    total_tagged       = len(tagged)
+    currently_excluded = sum(1 for t in tagged if t.holiday_exclude)
+    currently_included = total_tagged - currently_excluded
+
+    by_holiday: dict[str, int] = {}
+    for t in tagged:
+        by_holiday[t.holiday_tag] = by_holiday.get(t.holiday_tag, 0) + 1
+
+    season_status = {
+        slug: is_in_season(slug, today)
+        for slug, _kw, _s, _e in HOLIDAY_RULES
+    }
+
+    return {
+        "summary": {
+            "total_tagged":       total_tagged,
+            "currently_excluded": currently_excluded,
+            "currently_included": currently_included,
+            "by_holiday":         by_holiday,
+        },
+        "season_status": season_status,
+        "tracks": [
+            {
+                "jellyfin_item_id": t.jellyfin_item_id,
+                "track_name":       t.track_name,
+                "artist_name":      t.artist_name,
+                "album_name":       t.album_name,
+                "holiday_tag":      t.holiday_tag,
+                "holiday_exclude":  bool(t.holiday_exclude),
+            }
+            for t in tagged
+        ],
+    }
+

@@ -1,9 +1,8 @@
-
 import { useState, useEffect } from 'react'
 import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
   ChevronUp, ChevronDown, ChevronsUpDown, Star, Loader2,
-  AlertCircle, Play, SkipForward, Heart
+  AlertCircle, Play, SkipForward, Heart, Snowflake
 } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -44,6 +43,26 @@ function StatPill({ label, value, color = 'text-[var(--text-primary)]' }) {
   )
 }
 
+
+const HOLIDAY_COLORS = {
+  christmas:    { bg: 'bg-red-900/40',    text: 'text-red-300',    label: '🎄 Christmas'   },
+  hanukkah:     { bg: 'bg-blue-900/40',   text: 'text-blue-300',   label: '🕎 Hanukkah'    },
+  halloween:    { bg: 'bg-orange-900/40', text: 'text-orange-300', label: '🎃 Halloween'   },
+  thanksgiving: { bg: 'bg-amber-900/40',  text: 'text-amber-300',  label: '🦃 Thanksgiving'},
+  easter:       { bg: 'bg-pink-900/40',   text: 'text-pink-300',   label: '🐣 Easter'      },
+  valentines:   { bg: 'bg-rose-900/40',   text: 'text-rose-300',   label: "💝 Valentine's" },
+  new_year:     { bg: 'bg-purple-900/40', text: 'text-purple-300', label: '🎆 New Year'    },
+}
+function HolidayBadge({ tag, exclude }) {
+  if (!tag) return null
+  const c = HOLIDAY_COLORS[tag] || { bg: 'bg-[var(--bg-overlay)]', text: 'text-[var(--text-secondary)]', label: tag }
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold ${c.bg} ${c.text}`}
+          title={exclude ? 'Out of season — excluded from playlists' : 'In season — included in playlists'}>
+      {c.label}{exclude && <span className="opacity-60"> ✗</span>}
+    </span>
+  )
+}
 function SortHeader({ label, field, currentSort, currentOrder, onSort }) {
   const active = currentSort === field
   return (
@@ -167,12 +186,13 @@ function TrackTable({ userId }) {
   const [sort, setSort] = useState('final_score')
   const [order, setOrder] = useState('desc')
   const [playedFilter, setPlayedFilter] = useState('all')
+  const [holidayFilter, setHolidayFilter] = useState('all')
   const [artistFilter, setArtistFilter] = useState('')
   const [artistInput, setArtistInput] = useState('')
   const [page, setPage] = useState(1)
   const [expandedRow, setExpandedRow] = useState(null)
 
-  const doFetch = (uid, sb, ord, pf, af, pg) => {
+  const doFetch = (uid, sb, ord, pf, af, pg, hf) => {
     if (!uid) return
     setLoading(true)
     const params = new URLSearchParams({
@@ -180,6 +200,7 @@ function TrackTable({ userId }) {
       played_filter: pf, page: pg,
       page_size: 50,
       ...(af ? { artist_filter: af } : {}),
+      ...(hf && hf !== 'all' ? { holiday_filter: hf } : {}),
     })
     fetch(`/api/insights/tracks?${params}`)
       .then(r => r.json()).then(d => { setData(d); setLoading(false) })
@@ -187,8 +208,8 @@ function TrackTable({ userId }) {
   }
 
   useEffect(() => {
-    doFetch(userId, sort, order, playedFilter, artistFilter, page)
-  }, [userId, sort, order, playedFilter, artistFilter, page])
+    doFetch(userId, sort, order, playedFilter, artistFilter, page, holidayFilter)
+  }, [userId, sort, order, playedFilter, artistFilter, page, holidayFilter])
 
   const handleSort = (field) => {
     const newOrder = sort === field ? (order === 'desc' ? 'asc' : 'desc') : 'desc'
@@ -232,6 +253,24 @@ function TrackTable({ userId }) {
                                            rounded-lg text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors">
             Go
           </button>
+          {/* Holiday filter */}
+          <div className="flex gap-1 flex-wrap">
+            {[
+              { v: 'all',      label: 'All songs'      },
+              { v: 'holiday',  label: '🎄 Holiday only' },
+              { v: 'excluded', label: '✗ Out of season' },
+              { v: 'normal',   label: '✓ Non-holiday'  },
+            ].map(({ v, label }) => (
+              <button key={v} type="button"
+                onClick={() => { setHolidayFilter(v); setPage(1) }}
+                className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors
+                  ${holidayFilter === v
+                    ? 'bg-[var(--accent)] text-[var(--bg)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] bg-[var(--bg-surface)]'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
           {artistFilter && (
             <button type="button" onClick={() => { setArtistFilter(''); setArtistInput(''); setPage(1) }}
               className="px-2 py-1.5 text-xs text-[var(--danger)] hover:text-[#ff7b72] transition-colors">
@@ -270,6 +309,9 @@ function TrackTable({ userId }) {
                 </th>
                 <th className="px-2 py-2.5 hidden md:table-cell">
                   <SortHeader label="Skips" field="skip_count" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                </th>
+                <th className="px-2 py-2.5 hidden xl:table-cell">
+                  <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]">Holiday</span>
                 </th>
                 <th className="px-2 py-2.5 hidden lg:table-cell">
                   <SortHeader label="Artist aff." field="artist_affinity" currentSort={sort} currentOrder={order} onSort={handleSort} />
@@ -327,6 +369,9 @@ function TrackTable({ userId }) {
                           </span>
                         : <span className="text-[var(--text-secondary)]">—</span>}
                     </td>
+                    <td className="px-2 py-2.5 hidden xl:table-cell">
+                      <HolidayBadge tag={t.holiday_tag} exclude={t.holiday_exclude} />
+                    </td>
                     <td className="px-2 py-2.5 hidden lg:table-cell text-xs text-[var(--text-secondary)] tabular-nums">
                       {t.artist_affinity.toFixed(1)}
                     </td>
@@ -336,6 +381,12 @@ function TrackTable({ userId }) {
                       <td colSpan={8} className="px-4 py-3">
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                           <StatPill label="Album" value={t.album_name || '—'} />
+                          {t.holiday_tag && (
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Holiday</span>
+                              <HolidayBadge tag={t.holiday_tag} exclude={t.holiday_exclude} />
+                            </div>
+                          )}
                           <StatPill label="Genre" value={t.genre || '—'} />
                           <StatPill label="Play score" value={t.play_score.toFixed(1)} />
                           <StatPill label="Recency score" value={t.recency_score.toFixed(1)} />
@@ -512,6 +563,150 @@ function ArtistTable({ userId }) {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+
+// ── Holiday Table ─────────────────────────────────────────────────────────────
+const SEASON_LABELS = {
+  christmas:    { label: 'Christmas',    window: 'Nov 25 – Jan 5',  emoji: '🎄' },
+  hanukkah:     { label: 'Hanukkah',     window: 'Dec 1 – Jan 5',   emoji: '🕎' },
+  halloween:    { label: 'Halloween',    window: 'Oct 1 – Nov 5',   emoji: '🎃' },
+  thanksgiving: { label: 'Thanksgiving', window: 'Nov 1 – Nov 30',  emoji: '🦃' },
+  easter:       { label: 'Easter',       window: 'Mar 15 – Apr 30', emoji: '🐣' },
+  valentines:   { label: "Valentine's",  window: 'Feb 1 – Feb 20',  emoji: '💝' },
+  new_year:     { label: 'New Year',     window: 'Dec 26 – Jan 10', emoji: '🎆' },
+}
+
+function HolidayTable() {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [expanded, setExpanded] = useState(null)
+
+  useEffect(() => {
+    fetch('/api/insights/holiday')
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false) })
+      .catch(e => { setError(e.message); setLoading(false) })
+  }, [])
+
+  if (loading) return <div className="flex items-center gap-2 p-8 text-[var(--text-secondary)]"><Loader2 size={16} className="animate-spin" /> Loading holiday data...</div>
+  if (error)   return <div className="flex items-center gap-2 p-8 text-[var(--danger)]"><AlertCircle size={16} /> {error}</div>
+  if (!data)   return null
+
+  const { summary, tracks, season_status } = data
+
+  return (
+    <div className="space-y-6 pt-2">
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label: 'Tagged tracks',       val: summary.total_tagged,        color: 'text-[var(--text-primary)]' },
+          { label: 'Currently excluded',  val: summary.currently_excluded,  color: 'text-[var(--danger)]' },
+          { label: 'In season now',       val: summary.currently_included,  color: 'text-green-400' },
+          { label: 'Holidays detected',   val: Object.keys(summary.by_holiday || {}).length, color: 'text-[var(--text-primary)]' },
+        ].map(({ label, val, color }) => (
+          <div key={label} className="bg-[var(--bg-surface)] rounded-lg p-3 border border-[var(--bg-overlay)]">
+            <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-1">{label}</div>
+            <div className={`text-2xl font-bold ${color}`}>{val}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Season windows */}
+      <div>
+        <div className="text-[11px] text-[var(--text-secondary)] uppercase tracking-wider mb-2 font-semibold">Season windows</div>
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(SEASON_LABELS).map(([slug, { label, window: win, emoji }]) => {
+            const active = season_status && season_status[slug]
+            const count  = summary.by_holiday && summary.by_holiday[slug] || 0
+            return (
+              <div key={slug} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border
+                ${active ? 'bg-green-900/30 border-green-700/50 text-green-300' : 'bg-[var(--bg-surface)] border-[var(--bg-overlay)] text-[var(--text-secondary)]'}`}>
+                <span>{emoji}</span>
+                <span className="font-medium">{label}</span>
+                <span className="opacity-50 hidden sm:inline">{win}</span>
+                {count > 0 && <span className={`font-bold ${active ? 'text-green-200' : ''}`}>{count}</span>}
+                {active && <span className="text-green-400 font-bold text-[10px]">● IN SEASON</span>}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Per-holiday accordion */}
+      {!summary.by_holiday || Object.keys(summary.by_holiday).length === 0 ? (
+        <div className="p-10 text-center text-[var(--text-secondary)] bg-[var(--bg-surface)] rounded-lg border border-[var(--bg-overlay)]">
+          <Snowflake size={32} className="mx-auto mb-3 opacity-30" />
+          <div className="font-medium">No holiday tracks detected yet</div>
+          <div className="text-xs mt-1 opacity-60">Run a library scan — holiday songs are tagged automatically</div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {Object.entries(summary.by_holiday).map(([slug, count]) => {
+            const meta = SEASON_LABELS[slug] || { label: slug, emoji: '🎵', window: '' }
+            const active = season_status && season_status[slug]
+            const slugTracks = (tracks || []).filter(t => t.holiday_tag === slug)
+            const isOpen = expanded === slug
+            return (
+              <div key={slug} className="bg-[var(--bg-surface)] rounded-lg border border-[var(--bg-overlay)] overflow-hidden">
+                <button onClick={() => setExpanded(isOpen ? null : slug)}
+                  className="w-full flex items-center justify-between px-4 py-3 hover:bg-[var(--bg-overlay)] transition-colors text-left">
+                  <div className="flex items-center gap-3">
+                    <span className="text-xl">{meta.emoji}</span>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-sm text-[var(--text-primary)]">{meta.label}</span>
+                        {active
+                          ? <span className="text-[10px] font-bold text-green-400 bg-green-900/30 px-1.5 py-0.5 rounded">IN SEASON</span>
+                          : <span className="text-[10px] text-[var(--text-secondary)] bg-[var(--bg-overlay)] px-1.5 py-0.5 rounded">out of season</span>}
+                      </div>
+                      <div className="text-xs text-[var(--text-secondary)] mt-0.5">{count} track{count !== 1 ? 's' : ''} · {meta.window}</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {!active && count > 0 && <span className="text-[10px] text-[var(--danger)] opacity-70 hidden sm:inline">excluded from playlists</span>}
+                    {isOpen ? <ChevronUp size={14} className="text-[var(--text-secondary)]" /> : <ChevronDown size={14} className="text-[var(--text-secondary)]" />}
+                  </div>
+                </button>
+                {isOpen && (
+                  <div className="border-t border-[var(--bg-overlay)]">
+                    <table className="w-full text-left">
+                      <thead>
+                        <tr className="border-b border-[var(--bg-overlay)] bg-[var(--bg-overlay)]/30">
+                          <th className="px-4 py-2 text-[10px] uppercase tracking-wider text-[var(--text-secondary)]">Track</th>
+                          <th className="px-4 py-2 text-[10px] uppercase tracking-wider text-[var(--text-secondary)] hidden sm:table-cell">Artist</th>
+                          <th className="px-4 py-2 text-[10px] uppercase tracking-wider text-[var(--text-secondary)] hidden md:table-cell">Album</th>
+                          <th className="px-4 py-2 text-[10px] uppercase tracking-wider text-[var(--text-secondary)]">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {slugTracks.slice(0, 200).map(t => (
+                          <tr key={t.jellyfin_item_id} className="border-b border-[var(--bg-overlay)] last:border-0 hover:bg-[var(--bg-overlay)]/20">
+                            <td className="px-4 py-2 text-xs text-[var(--text-primary)] max-w-[180px] truncate">{t.track_name}</td>
+                            <td className="px-4 py-2 text-xs text-[var(--text-secondary)] hidden sm:table-cell max-w-[140px] truncate">{t.artist_name}</td>
+                            <td className="px-4 py-2 text-xs text-[var(--text-secondary)] hidden md:table-cell max-w-[160px] truncate">{t.album_name}</td>
+                            <td className="px-4 py-2">
+                              {t.holiday_exclude
+                                ? <span className="text-[10px] text-[var(--danger)] font-medium">✗ excluded</span>
+                                : <span className="text-[10px] text-green-400 font-medium">✓ in season</span>}
+                            </td>
+                          </tr>
+                        ))}
+                        {slugTracks.length > 200 && (
+                          <tr><td colSpan={4} className="px-4 py-2 text-xs text-[var(--text-secondary)] italic">…and {slugTracks.length - 200} more</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Insights() {
   const [users, setUsers] = useState([])
   const [selectedUser, setSelectedUser] = useState(null)
@@ -577,6 +772,7 @@ export default function Insights() {
             {[
               { key: 'tracks', label: 'Tracks', icon: Music2 },
               { key: 'artists', label: 'Artists', icon: Mic2 },
+              { key: 'holiday', label: 'Holiday', icon: Snowflake },
             ].map(({ key, label, icon: Icon }) => (
               <button key={key} onClick={() => setTab(key)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all
@@ -591,6 +787,7 @@ export default function Insights() {
 
           {tab === 'tracks' && <TrackTable userId={selectedUser} key={selectedUser} />}
           {tab === 'artists' && <ArtistTable userId={selectedUser} key={selectedUser} />}
+          {tab === 'holiday' && <HolidayTable />}
         </>
       )}
     </div>

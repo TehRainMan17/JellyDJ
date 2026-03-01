@@ -235,6 +235,9 @@ class LibraryTrack(Base):
     tags = Column(Text, nullable=True)
     enriched_at = Column(DateTime, nullable=True)
     enrichment_source = Column(String, nullable=True)
+    # v4: holiday tagging
+    holiday_tag     = Column(String,  nullable=True)
+    holiday_exclude = Column(Boolean, nullable=False, default=False)
 
 
 class ArtistProfile(Base):
@@ -304,6 +307,9 @@ class TrackScore(Base):
     replay_boost = Column(Float, nullable=True, default=0.0)
     global_popularity = Column(Float, nullable=True)
     skip_streak = Column(Integer, nullable=True, default=0)
+    # v4: holiday tagging (denormalised from LibraryTrack for fast filtering)
+    holiday_tag     = Column(String,  nullable=True)
+    holiday_exclude = Column(Boolean, nullable=False, default=False)
 
 
 class AutomationSettings(Base):
