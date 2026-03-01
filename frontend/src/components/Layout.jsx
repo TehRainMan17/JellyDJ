@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, ListMusic, Telescope, Settings,
-  Plug, Radio, BarChart2, Menu, X, ChevronRight,
+  Plug, Radio, BarChart2, Menu, X, ChevronRight, Ban,
 } from 'lucide-react'
 
 const NAV = [
@@ -10,6 +10,7 @@ const NAV = [
   { to: '/playlists',   icon: ListMusic,        label: 'Playlists'       },
   { to: '/discovery',   icon: Telescope,        label: 'Discovery'       },
   { to: '/insights',    icon: BarChart2,        label: 'Insights'        },
+  { to: '/exclusions',  icon: Ban,              label: 'Exclusions'      },
   { to: '/connections', icon: Plug,             label: 'Connections'     },
   { to: '/settings',    icon: Settings,         label: 'Settings'        },
 ]
@@ -17,7 +18,7 @@ const NAV = [
 const PAGE_LABELS = {
   dashboard: 'Dashboard', playlists: 'Playlists',
   discovery: 'Discovery', insights: 'Insights',
-  connections: 'Connections', settings: 'Settings',
+  connections: 'Connections', settings: 'Settings', exclusions: 'Exclusions',
 }
 
 function SidebarContent({ onClose }) {

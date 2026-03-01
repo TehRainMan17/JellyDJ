@@ -609,3 +609,181 @@ def get_holiday_summary(db: Session = Depends(get_db)):
         ],
     }
 
+
+@router.get("/holiday-debug")
+def holiday_debug(
+    sample_artist: Optional[str] = Query(None, description="Artist name to check, e.g. 'Mariah Carey'"),
+    user_id: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    v4: Holiday filter diagnostic endpoint.
+    Checks every layer of the holiday pipeline so you can see exactly where
+    things are breaking if holiday tracks are still appearing in playlists.
+    """
+    from models import LibraryTrack
+    from sqlalchemy import text, and_, func
+
+    # ── 1. LibraryTrack holiday counts ────────────────────────────────────────
+    lt_total   = db.query(LibraryTrack).filter(LibraryTrack.missing_since.is_(None)).count()
+    lt_tagged  = db.query(LibraryTrack).filter(
+        LibraryTrack.holiday_tag.isnot(None),
+        LibraryTrack.missing_since.is_(None),
+    ).count()
+    lt_excluded = db.query(LibraryTrack).filter(
+        LibraryTrack.holiday_tag.isnot(None),
+        LibraryTrack.holiday_exclude == True,
+        LibraryTrack.missing_since.is_(None),
+    ).count()
+    lt_null_exclude = db.query(LibraryTrack).filter(
+        LibraryTrack.holiday_tag.isnot(None),
+        LibraryTrack.holiday_exclude.is_(None),
+        LibraryTrack.missing_since.is_(None),
+    ).count()
+
+    # ── 2. TrackScore holiday counts (any user) ───────────────────────────────
+    ts_total    = db.query(TrackScore).count()
+    ts_tagged   = db.query(TrackScore).filter(TrackScore.holiday_tag.isnot(None)).count()
+    ts_excluded = db.query(TrackScore).filter(
+        TrackScore.holiday_tag.isnot(None),
+        TrackScore.holiday_exclude == True,
+    ).count()
+    ts_null_tag = db.query(TrackScore).filter(
+        TrackScore.holiday_tag.is_(None),
+    ).count()
+    ts_null_exclude = db.query(TrackScore).filter(
+        TrackScore.holiday_tag.isnot(None),
+        TrackScore.holiday_exclude.is_(None),
+    ).count()
+
+    # ── 3. Check column existence via raw SQL ─────────────────────────────────
+    col_check = {}
+    for table in ["library_tracks", "track_scores"]:
+        try:
+            result = db.execute(text(f"SELECT holiday_tag, holiday_exclude FROM {table} LIMIT 1")).fetchall()
+            col_check[table] = "columns exist"
+        except Exception as e:
+            col_check[table] = f"ERROR: {e}"
+
+    # ── 4. Sample mismatched tracks (tagged in LT but not in TS) ─────────────
+    lt_christmas = db.query(LibraryTrack.jellyfin_item_id).filter(
+        LibraryTrack.holiday_tag == "christmas",
+        LibraryTrack.holiday_exclude == True,
+        LibraryTrack.missing_since.is_(None),
+    ).limit(5).all()
+    lt_ids = [r.jellyfin_item_id for r in lt_christmas]
+
+    ts_mismatch = []
+    for jid in lt_ids:
+        ts_row = db.query(TrackScore).filter_by(jellyfin_item_id=jid).first()
+        ts_mismatch.append({
+            "jellyfin_item_id": jid,
+            "ts_found": ts_row is not None,
+            "ts_holiday_tag": ts_row.holiday_tag if ts_row else "NO ROW",
+            "ts_holiday_exclude": ts_row.holiday_exclude if ts_row else "NO ROW",
+        })
+
+    # ── 5. Artist-specific check ──────────────────────────────────────────────
+    artist_sample = []
+    if sample_artist:
+        lt_rows = db.query(LibraryTrack).filter(
+            LibraryTrack.artist_name.ilike(f"%{sample_artist}%"),
+            LibraryTrack.missing_since.is_(None),
+        ).limit(10).all()
+        for lt in lt_rows:
+            ts = db.query(TrackScore).filter_by(jellyfin_item_id=lt.jellyfin_item_id).first()
+            artist_sample.append({
+                "track_name":        lt.track_name,
+                "album_name":        lt.album_name,
+                "lt_holiday_tag":    lt.holiday_tag,
+                "lt_holiday_exclude": lt.holiday_exclude,
+                "ts_holiday_tag":    ts.holiday_tag if ts else "NO SCORE ROW",
+                "ts_holiday_exclude": ts.holiday_exclude if ts else "NO SCORE ROW",
+                "would_be_excluded": (
+                    ts is not None and
+                    ts.holiday_tag is not None and
+                    ts.holiday_exclude == True
+                ),
+            })
+
+    # ── 6. User-specific: how many holiday tracks pass the filter ─────────────
+    user_check = None
+    if user_id or username:
+        try:
+            uid = _resolve_user(user_id, username, db)
+            total_for_user = db.query(TrackScore).filter_by(user_id=uid).count()
+            holiday_for_user = db.query(TrackScore).filter_by(user_id=uid).filter(
+                TrackScore.holiday_tag.isnot(None)
+            ).count()
+            excluded_for_user = db.query(TrackScore).filter_by(user_id=uid).filter(
+                TrackScore.holiday_tag.isnot(None),
+                TrackScore.holiday_exclude == True,
+            ).count()
+
+            # Simulate _holiday_ok filter
+            from sqlalchemy import and_ as _and_
+            passing_holiday = db.query(TrackScore).filter_by(user_id=uid).filter(
+                TrackScore.holiday_tag.isnot(None),
+                TrackScore.holiday_exclude == True,
+            ).count()
+            # These should be blocked — if > 0, filter is broken
+            leaking = db.query(TrackScore).filter_by(user_id=uid).filter(
+                TrackScore.holiday_tag.isnot(None),
+                TrackScore.holiday_exclude == True,
+            ).limit(5).all()
+
+            user_check = {
+                "user_id": uid,
+                "total_track_scores": total_for_user,
+                "holiday_tagged_scores": holiday_for_user,
+                "excluded_scores": excluded_for_user,
+                "should_be_blocked_count": excluded_for_user,
+                "sample_should_be_blocked": [
+                    {
+                        "track_name": r.track_name,
+                        "artist_name": r.artist_name,
+                        "holiday_tag": r.holiday_tag,
+                        "holiday_exclude": r.holiday_exclude,
+                    }
+                    for r in leaking
+                ],
+            }
+        except Exception as e:
+            user_check = {"error": str(e)}
+
+    return {
+        "column_check": col_check,
+        "library_tracks": {
+            "total": lt_total,
+            "holiday_tagged": lt_tagged,
+            "holiday_excluded": lt_excluded,
+            "tagged_but_null_exclude": lt_null_exclude,
+            "diagnosis": (
+                "OK" if lt_null_exclude == 0
+                else f"PROBLEM: {lt_null_exclude} tracks have a holiday_tag but holiday_exclude=NULL — tag_library() may have failed"
+            ),
+        },
+        "track_scores": {
+            "total": ts_total,
+            "holiday_tagged": ts_tagged,
+            "holiday_excluded": ts_excluded,
+            "tagged_but_null_exclude": ts_null_exclude,
+            "diagnosis": (
+                "OK" if ts_null_exclude == 0 and (ts_tagged >= lt_tagged or lt_tagged == 0)
+                else f"PROBLEM: ts_tagged={ts_tagged} vs lt_tagged={lt_tagged}, null_exclude={ts_null_exclude}"
+            ),
+        },
+        "christmas_track_sample_in_track_scores": ts_mismatch,
+        "artist_sample": artist_sample,
+        "user_check": user_check,
+        "instructions": {
+            "step1": "Check column_check — both tables must say 'columns exist'",
+            "step2": "Check library_tracks.tagged_but_null_exclude — must be 0",
+            "step3": "Check track_scores.holiday_tagged — must equal library_tracks.holiday_tagged",
+            "step4": "Check christmas_track_sample — ts_holiday_exclude must be true for all",
+            "step5": "Pass ?user_id=XXX to check per-user scores",
+            "step6": "Pass ?sample_artist=Mariah+Carey to check a specific artist",
+        },
+    }
+

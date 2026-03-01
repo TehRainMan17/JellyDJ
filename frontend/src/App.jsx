@@ -12,6 +12,7 @@
  *   /settings       → indexer intervals, external API keys, webhook setup
  *   /connections    → Jellyfin + Lidarr connection credentials
  *   /insights       → listening statistics and charts
+ *   /exclusions     → manual album exclusions
  */
 
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
@@ -22,6 +23,7 @@ import DiscoveryQueue from './pages/DiscoveryQueue.jsx'
 import Settings from './pages/Settings.jsx'
 import Connections from './pages/Connections.jsx'
 import Insights from './pages/Insights.jsx'
+import AlbumExclusions from './pages/AlbumExclusions.jsx'
 
 export default function App() {
   return (
@@ -34,7 +36,8 @@ export default function App() {
           <Route path="discovery"   element={<DiscoveryQueue />} />
           <Route path="settings"    element={<Settings />} />
           <Route path="connections" element={<Connections />} />
-          <Route path="insights"    element={<Insights />} />
+          <Route path="insights"      element={<Insights />} />
+          <Route path="exclusions"    element={<AlbumExclusions />} />
         </Route>
       </Routes>
     </BrowserRouter>

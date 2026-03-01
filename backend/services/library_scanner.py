@@ -1,3 +1,4 @@
+
 """
 JellyDJ Library Scanner — Module 8a
 
@@ -52,7 +53,7 @@ async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
                 "IncludeItemTypes": "Audio",
                 "Recursive": "true",
                 "Fields": "DateCreated,Genres,Album,AlbumArtist,Artists,"
-                          "IndexNumber,ParentIndexNumber,RunTimeTicks,ProductionYear",
+                          "IndexNumber,ParentIndexNumber,RunTimeTicks,ProductionYear,AlbumId",
                 "StartIndex": start_index,
                 "Limit": BATCH_SIZE,
                 "SortBy": "AlbumArtist,Album,IndexNumber",
@@ -148,6 +149,7 @@ def scan_library(db: Session, items: list[dict]) -> dict:
             row.year = item.get("ProductionYear")
             row.last_seen = now
             row.missing_since = None   # clear any soft-delete
+            row.jellyfin_album_id = item.get("AlbumId") or None
             updated += 1
         else:
             db.add(LibraryTrack(
@@ -165,6 +167,7 @@ def scan_library(db: Session, items: list[dict]) -> dict:
                 first_seen=now,
                 last_seen=now,
                 missing_since=None,
+                jellyfin_album_id=item.get("AlbumId") or None,
             ))
             added += 1
 

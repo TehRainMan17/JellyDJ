@@ -1,3 +1,4 @@
+
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3).
 
@@ -238,6 +239,9 @@ class LibraryTrack(Base):
     # v4: holiday tagging
     holiday_tag     = Column(String,  nullable=True)
     holiday_exclude = Column(Boolean, nullable=False, default=False)
+    # v5: Jellyfin album container ID — enables reliable album exclusion matching
+    # regardless of how album_name is tagged in the audio file metadata.
+    jellyfin_album_id = Column(String, nullable=True, index=True)
 
 
 class ArtistProfile(Base):
@@ -461,3 +465,21 @@ class BillboardChartEntry(Base):
     __table_args__ = (
         Index("ix_billboard_rank_fetched", "rank", "fetched_at"),
     )
+
+
+# ── v4: manual album exclusions ───────────────────────────────────────────────
+
+class ExcludedAlbum(Base):
+    """
+    Manually excluded albums — kept out of all playlist generation regardless
+    of score.  One row per album.  User-managed via the Exclusions UI.
+    """
+    __tablename__ = "excluded_albums"
+    id                = Column(Integer, primary_key=True, index=True)
+    jellyfin_album_id = Column(String, unique=True, nullable=False, index=True)
+    album_name        = Column(String, nullable=False, default="")
+    artist_name       = Column(String, nullable=False, default="")
+    reason            = Column(String, nullable=True)
+    cover_image_url   = Column(String, nullable=True)
+    excluded_at       = Column(DateTime, default=datetime.utcnow)
+    track_count       = Column(Integer, nullable=False, default=0)

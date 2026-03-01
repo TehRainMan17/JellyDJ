@@ -1,3 +1,4 @@
+
 """
 JellyDJ Playlist Writer — Module 7
 
@@ -30,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from models import (
     ConnectionSettings, ManagedUser, Play,
-    PlaylistRun, PlaylistRunItem, TrackScore,
+    PlaylistRun, PlaylistRunItem, TrackScore, ExcludedAlbum, LibraryTrack,
 )
 from services.events import log_event
 from crypto import decrypt
@@ -43,20 +44,110 @@ def _holiday_ok():
     SQLAlchemy filter: exclude tracks that are definitively marked as
     out-of-season holiday content.
 
-    Logic: block the track ONLY when BOTH conditions are true:
-      1. holiday_tag IS NOT NULL  (it was detected as a holiday track)
-      2. holiday_exclude == True  (its season window is currently closed)
+    IMPORTANT: We query LibraryTrack.holiday_exclude directly via a subquery
+    rather than relying on the denormalized TrackScore.holiday_exclude field.
+    The reason: holiday season windows are re-evaluated daily by
+    holiday.refresh_exclude_flags(), which updates LibraryTrack but does NOT
+    update TrackScore (that only happens on a full score rebuild, which runs
+    every 6 hours).  Relying on TrackScore means holiday tracks can leak into
+    playlists for up to 6 hours after a season ends/begins.
 
-    Using the negative form (~) makes NULL handling explicit: tracks where
-    either column is NULL (untagged, or not yet scored) are never blocked.
-    This is safer than the OR(is_null, ==False) form, which can pass through
-    tracks incorrectly if holiday_exclude is NULL due to a tagging failure.
+    Reading from LibraryTrack guarantees we always use the current season
+    state with zero stale-data risk.
     """
     from sqlalchemy import and_ as _sa_and_
-    return ~_sa_and_(
-        TrackScore.holiday_tag.isnot(None),
-        TrackScore.holiday_exclude == True,  # noqa: E712
+
+    # Subquery: IDs of tracks that are currently out-of-season holiday content
+    holiday_excluded_ids = (
+        LibraryTrack.__table__.select()
+        .with_only_columns(LibraryTrack.__table__.c.jellyfin_item_id)
+        .where(
+            _sa_and_(
+                LibraryTrack.__table__.c.holiday_tag.isnot(None),
+                LibraryTrack.__table__.c.holiday_exclude == True,  # noqa: E712
+            )
+        )
     )
+    return TrackScore.jellyfin_item_id.notin_(holiday_excluded_ids)
+
+
+def _get_excluded_item_ids(db) -> frozenset:
+    """
+    Return a frozenset of jellyfin_item_ids whose album has been manually excluded.
+
+    Matching strategy (two passes, unioned):
+
+    Pass 1 — jellyfin_album_id (exact, reliable):
+      LibraryTrack.jellyfin_album_id == ExcludedAlbum.jellyfin_album_id
+      This is the canonical match. Jellyfin's AlbumId is a stable UUID that
+      never changes regardless of how the album_name tag is written in the
+      audio file. Works for virtual albums like "Other" where every track has
+      a different album_name tag but the same AlbumId container.
+      Requires library_scanner v5+ (AlbumId stored during scan).
+
+    Pass 2 — album_name LOWER() match (fallback for pre-v5 rows):
+      Matches ExcludedAlbum.album_name → LibraryTrack.album_name case-insensitively.
+      Catches tracks scanned before jellyfin_album_id was introduced (i.e. before
+      the user runs their first library scan after this update).
+      Also catches TrackScore rows via a second sub-pass.
+
+    The union of both passes is returned. After the first post-update library
+    scan, Pass 1 alone will handle everything correctly.
+    """
+    try:
+        from sqlalchemy import func as _func
+
+        excl_rows = db.query(ExcludedAlbum).all()
+        if not excl_rows:
+            return frozenset()
+
+        excl_album_ids = [r.jellyfin_album_id for r in excl_rows if r.jellyfin_album_id]
+        excl_names_lower = [r.album_name.lower() for r in excl_rows if r.album_name]
+
+        result: set[str] = set()
+
+        # Pass 1: match via jellyfin_album_id (exact, most reliable)
+        if excl_album_ids:
+            id_rows = db.query(LibraryTrack.jellyfin_item_id).filter(
+                LibraryTrack.jellyfin_album_id.in_(excl_album_ids),
+                LibraryTrack.missing_since.is_(None),
+            ).all()
+            for r in id_rows:
+                result.add(r.jellyfin_item_id)
+
+        # Pass 2: match via album_name (fallback for tracks not yet rescanned)
+        if excl_names_lower:
+            name_rows = db.query(LibraryTrack.jellyfin_item_id).filter(
+                _func.lower(LibraryTrack.album_name).in_(excl_names_lower),
+                LibraryTrack.missing_since.is_(None),
+            ).all()
+            for r in name_rows:
+                result.add(r.jellyfin_item_id)
+
+            # Also catch via TrackScore.album_name for any score rows
+            # whose LibraryTrack row may have been updated with a different name
+            ts_rows = db.query(TrackScore.jellyfin_item_id).filter(
+                _func.lower(TrackScore.album_name).in_(excl_names_lower),
+            ).all()
+            for r in ts_rows:
+                result.add(r.jellyfin_item_id)
+
+        frozen = frozenset(result)
+        log.debug(
+            f"Excluded album filter: {len(excl_rows)} excluded album(s) → "
+            f"{len(frozen)} track IDs blocked"
+        )
+        if excl_rows and not frozen:
+            log.warning(
+                f"Excluded album filter matched 0 track IDs! "
+                f"Excluded album IDs: {excl_album_ids} | "
+                f"Excluded album names: {excl_names_lower[:5]} — "
+                f"Run a library scan to populate jellyfin_album_id on existing tracks."
+            )
+        return frozen
+    except Exception as _e:
+        log.warning(f"Failed to load excluded album item IDs: {_e}")
+        return frozenset()
 
 
 log = logging.getLogger(__name__)
@@ -232,11 +323,22 @@ def _get_tracks_for_playlist(
     from sqlalchemy import text as satext
 
     limit = PLAYLIST_SIZES.get(playlist_type, 50)
+
+    # v4: load excluded album item IDs once — frozenset of jellyfin_item_ids
+    _excl_item_ids = _get_excluded_item_ids(db)
+
+    def _album_ok():
+        """Exclude tracks belonging to manually excluded albums.
+        Uses a pre-loaded frozenset of item IDs — no subquery, no case issues."""
+        from sqlalchemy import literal
+        if not _excl_item_ids:
+            return literal(True)   # nothing excluded — pass everything through
+        return TrackScore.jellyfin_item_id.notin_(_excl_item_ids)
+
     score_count = db.query(TrackScore).filter_by(user_id=user_id).count()
 
     if score_count == 0:
         log.warning(f"  No TrackScores for {username} — falling back to plays table")
-        from models import LibraryTrack
         # Exclude out-of-season holiday tracks even in the fallback path
         excluded_ids = {
             r.jellyfin_item_id
@@ -255,7 +357,9 @@ def _get_tracks_for_playlist(
             .limit(limit * 4)
             .all()
         )
-        return [r.jellyfin_item_id for r in rows if r.jellyfin_item_id not in excluded_ids][:limit]
+        all_excluded = excluded_ids | _excl_item_ids
+        return [r.jellyfin_item_id for r in rows if r.jellyfin_item_id not in all_excluded][:limit]
+
 
     # ── Deterministic types — no jitter ──────────────────────────────────────
 
@@ -265,6 +369,7 @@ def _get_tracks_for_playlist(
             .filter_by(user_id=user_id)
             .filter(TrackScore.is_played == True)
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .order_by(TrackScore.play_count.desc())
             .limit(limit * 6)
             .all()
@@ -280,6 +385,7 @@ def _get_tracks_for_playlist(
                 TrackScore.last_played.isnot(None),
             )
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .order_by(TrackScore.last_played.desc())
             .limit(limit * 4)
             .all()
@@ -313,6 +419,7 @@ def _get_tracks_for_playlist(
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .order_by(satext("CAST(final_score AS REAL) DESC"))
             .limit(n_core * 8)
             .all()
@@ -327,6 +434,7 @@ def _get_tracks_for_playlist(
             .filter_by(user_id=user_id)
             .filter(TrackScore.is_played == False)
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .order_by(satext("CAST(final_score AS REAL) DESC"))
             .limit(n_discovery * 8)
             .all()
@@ -346,6 +454,7 @@ def _get_tracks_for_playlist(
                 TrackScore.last_played < cutoff,
             )
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .order_by(satext("CAST(artist_affinity AS REAL) DESC"))
             .limit(n_deep_cuts * 8)
             .all()
@@ -399,6 +508,7 @@ def _get_tracks_for_playlist(
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .filter(
                 TrackScore.is_played == False,
                 TrackScore.auto_skip == False if hasattr(TrackScore, 'auto_skip') else True,
@@ -413,6 +523,7 @@ def _get_tracks_for_playlist(
             db.query(TrackScore)
             .filter_by(user_id=user_id)
             .filter(_holiday_ok())
+            .filter(_album_ok())
             .filter(
                 TrackScore.is_played == False,
             )
@@ -529,11 +640,12 @@ def _get_tracks_for_playlist(
         random.shuffle(result)
         return result
 
-    # Fallback
+    # Fallback — applies both holiday and user-exclusion filters
     rows = (
         db.query(TrackScore)
         .filter_by(user_id=user_id)
         .filter(_holiday_ok())
+        .filter(_album_ok())
         .order_by(satext("CAST(final_score AS REAL) DESC"))
         .limit(limit)
         .all()

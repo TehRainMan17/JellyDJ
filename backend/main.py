@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -20,7 +21,7 @@ from database import engine, Base, SessionLocal
 import models  # noqa: F401 — imported so SQLAlchemy registers all table definitions
 from routers import (
     connections, external_apis, indexer, recommender,
-    webhooks, discovery, playlists, insights, automation,
+    webhooks, discovery, playlists, insights, automation, exclusions,
 )
 
 
@@ -90,6 +91,8 @@ def _run_migrations():
         ("library_tracks", "holiday_exclude", "BOOLEAN", "0"),
         ("track_scores",   "holiday_tag",     "TEXT",    "NULL"),
         ("track_scores",   "holiday_exclude", "BOOLEAN", "0"),
+        # v5: Jellyfin album container ID for reliable album exclusion matching
+        ("library_tracks", "jellyfin_album_id", "TEXT", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -160,6 +163,7 @@ app.include_router(discovery.router)      # /api/discovery      — new album re
 app.include_router(playlists.router)      # /api/playlists      — playlist generation + history
 app.include_router(insights.router)       # /api/insights       — listening stats + charts
 app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
+app.include_router(exclusions.router)     # /api/exclusions     — manual album exclusions
 
 
 @app.get("/api/health")
