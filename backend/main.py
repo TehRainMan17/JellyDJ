@@ -1,4 +1,3 @@
-
 """
 JellyDJ — FastAPI application entry point.
 
@@ -93,6 +92,20 @@ def _run_migrations():
         ("track_scores",   "holiday_exclude", "BOOLEAN", "0"),
         # v5: Jellyfin album container ID for reliable album exclusion matching
         ("library_tracks", "jellyfin_album_id", "TEXT", "NULL"),
+        # v6: fix missing columns on track_enrichments — their absence caused
+        # enrich_tracks() to crash on the expires_at staleness-check query,
+        # preventing popularity_score from ever reaching TrackScore.global_popularity.
+        ("track_enrichments",  "album_name",          "TEXT",     "NULL"),
+        ("track_enrichments",  "source",              "TEXT",     "NULL"),
+        ("track_enrichments",  "expires_at",          "DATETIME", "NULL"),
+        ("track_enrichments",  "enriched_at",         "DATETIME", "NULL"),
+        ("track_enrichments",  "enrichment_source",   "TEXT",     "NULL"),
+        ("artist_enrichments", "top_tracks",          "TEXT",     "NULL"),
+        # v6b: same bug in artist_enrichments — expires_at missing caused
+        # enrich_artists() to crash, leaving artist popularity always empty.
+        ("artist_enrichments", "expires_at",          "DATETIME", "NULL"),
+        ("artist_enrichments", "source",              "TEXT",     "NULL"),
+        ("artist_enrichments", "listeners_previous",  "INTEGER",  "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -103,6 +116,63 @@ def _run_migrations():
                 conn.commit()
             except Exception:
                 pass  # column already exists — expected on every startup after the first
+
+
+def _fix_various_artists_enrichment():
+    """
+    One-time (idempotent) data fix: nulls out popularity_score and expires_at
+    on TrackEnrichment rows whose artist_name is a compilation catch-all.
+    On the next enrichment run, _resolve_track_artist() will use the correct
+    per-track artist (from LibraryTrack.album_artist or a re-index) and
+    fetch real scores from Last.fm.
+    Safe to run on every startup — only touches rows that still have the problem.
+    """
+    db = SessionLocal()
+    try:
+        va_names = [
+            "various artists", "various", "va", "v.a.", "v/a",
+            "multiple artists", "assorted artists", "unknown artist", "unknown",
+        ]
+        from models import TrackEnrichment
+        import sqlalchemy as _sa
+        # Expire rows still named "Various Artists" (library_scanner fix may not
+        # have run yet on their index pass)
+        updated = (
+            db.query(TrackEnrichment)
+            .filter(
+                _sa.func.lower(TrackEnrichment.artist_name).in_(va_names)
+            )
+            .update(
+                {"expires_at": None, "popularity_score": None, "source": None},
+                synchronize_session=False,
+            )
+        )
+        # Also expire rows that were "enriched" but came back with null scores
+        # (source="none" means Last.fm returned nothing — retry after artist fix)
+        updated_nulls = (
+            db.query(TrackEnrichment)
+            .filter(
+                TrackEnrichment.source == "none",
+                TrackEnrichment.popularity_score.is_(None),
+            )
+            .update(
+                {"expires_at": None},
+                synchronize_session=False,
+            )
+        )
+        updated += updated_nulls
+        if updated:
+            db.commit()
+            import logging
+            logging.getLogger(__name__).info(
+                f"VA fix: expired {updated} 'Various Artists' track enrichment rows "
+                f"— they will be re-enriched with correct artist on next run"
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"VA enrichment fix skipped: {e}")
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -122,6 +192,10 @@ async def lifespan(app: FastAPI):
 
     # Backfill any stale popularity cache entries (one-time, safe to repeat)
     _backfill_top_album_cache()
+
+    # Expire TrackEnrichment rows stored under "Various Artists" so they
+    # get re-fetched with the real track artist on the next enrichment run.
+    _fix_various_artists_enrichment()
 
     # Start the APScheduler background job scheduler
     from scheduler import start_scheduler

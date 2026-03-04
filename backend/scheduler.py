@@ -42,6 +42,7 @@ DISCOVERY_JOB_ID      = "discovery_refresh"
 PLAYLIST_JOB_ID       = "playlist_regen"
 AUTO_DOWNLOAD_JOB_ID  = "auto_download"
 BILLBOARD_JOB_ID      = "billboard_refresh"
+ENRICHMENT_JOB_ID     = "enrichment"
 
 
 def _get_settings(db):
@@ -121,6 +122,20 @@ def _job_billboard_refresh():
         sync_billboard_chart(db)
     except Exception as e:
         log.error(f"Billboard refresh job failed: {e}")
+    finally:
+        db.close()
+
+
+def _job_enrichment():
+    """Periodic job: fetch per-song and per-artist Last.fm data (listeners, tags, similar)."""
+    from database import SessionLocal
+    from services.enrichment import run_enrichment
+    db = SessionLocal()
+    try:
+        result = run_enrichment(db)
+        log.info(f"Enrichment job complete: {result}")
+    except Exception as e:
+        log.error(f"Enrichment job failed: {e}")
     finally:
         db.close()
 
@@ -215,6 +230,14 @@ def start_scheduler(db_session_factory):
         _job_billboard_refresh,
         trigger=IntervalTrigger(hours=168),  # weekly default
         id=BILLBOARD_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        _job_enrichment,
+        trigger=IntervalTrigger(hours=6),
+        id=ENRICHMENT_JOB_ID,
         replace_existing=True,
         misfire_grace_time=3600,
     )
@@ -420,6 +443,17 @@ def reschedule_automation_jobs(db):
         except Exception:
             pass
 
+    # Enrichment — always enabled, interval from AutomationSettings
+    enrich_interval = getattr(s, "enrichment_interval_hours", 48) or 48
+    try:
+        scheduler.reschedule_job(
+            ENRICHMENT_JOB_ID,
+            trigger=IntervalTrigger(hours=enrich_interval),
+        )
+        scheduler.resume_job(ENRICHMENT_JOB_ID)
+    except Exception:
+        pass
+
     log.info(
         f"Automation rescheduled: index={s.index_interval_hours}h | "
         f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
@@ -429,7 +463,8 @@ def reschedule_automation_jobs(db):
         f"auto_download={'on' if auto_dl_enabled else 'off'} "
         f"(every {cooldown_days}d) | "
         f"billboard={'on' if billboard_enabled else 'off'} "
-        f"(every {billboard_interval}h)"
+        f"(every {billboard_interval}h) | "
+        f"enrichment=on (every {enrich_interval}h)"
     )
 
 

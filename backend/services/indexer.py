@@ -1,4 +1,3 @@
-
 """
 Jellyfin play history indexer.
 
@@ -28,6 +27,27 @@ from services.library_scanner import run_library_scan
 from services.scoring_engine import rebuild_all_scores
 from services.events import log_event
 from crypto import decrypt
+
+# ── Various Artists resolution ────────────────────────────────────────────────
+# Compilation albums use "Various Artists" as AlbumArtist, but the individual
+# track artist is in the "Artists" array. Using "Various Artists" for enrichment
+# returns nothing from Last.fm — we need the real track artist.
+_VARIOUS_ARTISTS = {
+    "various artists", "various", "va", "v.a.", "v/a",
+    "multiple artists", "assorted artists", "unknown artist", "unknown",
+}
+
+def _resolve_track_artist(item: dict) -> str:
+    """Return the specific track artist, not the compilation album artist."""
+    album_artist = (item.get("AlbumArtist") or "").strip()
+    track_artists = item.get("Artists") or []
+    if album_artist and album_artist.lower() not in _VARIOUS_ARTISTS:
+        return album_artist
+    real = [a for a in track_artists if a.strip().lower() not in _VARIOUS_ARTISTS]
+    if real:
+        return real[0]
+    return track_artists[0] if track_artists else album_artist
+
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +147,7 @@ async def _fetch_played_items(
                 "SortBy": "DatePlayed",
                 "SortOrder": "Descending",
                 # UserData includes PlayCount, IsFavorite, LastPlayedDate per user
-            "Fields": "DateCreated,Genres,UserData,AlbumArtist,Album,ParentId",
+            "Fields": "DateCreated,Genres,UserData,AlbumArtist,Artists,Album,ParentId",
                 "StartIndex": start_index,
                 "Limit": limit,
             }
@@ -207,16 +227,11 @@ def _upsert_play(db: Session, user_id: str, item: dict):
         existing.is_favorite = is_favorite
         existing.genre = genre
         existing.track_name = item.get("Name", existing.track_name)
-        existing.artist_name = (
-            item.get("AlbumArtist", "") or
-            (item.get("Artists", [""])[0] if item.get("Artists") else existing.artist_name)
-        )
+        existing.artist_name = _resolve_track_artist(item) or existing.artist_name
         existing.album_name = item.get("Album", existing.album_name)
         existing.synced_at = datetime.utcnow()
     else:
-        artist = item.get("AlbumArtist", "")
-        if not artist and item.get("Artists"):
-            artist = item["Artists"][0]
+        artist = _resolve_track_artist(item)
         db.add(Play(
             user_id=user_id,
             jellyfin_item_id=jellyfin_id,
@@ -733,7 +748,7 @@ def _run_cache_refresh_sync(caller_db: Session):
             stats = artist_data.get("stats", {})
             listeners = int(stats.get("listeners", 0) or 0)
             pop_score = (
-                min(100.0, (math.log1p(listeners) / math.log1p(10_000_000)) * 100)
+                min(100.0, max(0.0, (math.log(max(listeners, 1)) - math.log(1_000)) / (math.log(10_000_000) - math.log(1_000)) * 100))
                 if listeners > 0 else 0.0
             )
             tags = [t["name"] for t in (artist_data.get("tags") or {}).get("tag", [])[:10]]

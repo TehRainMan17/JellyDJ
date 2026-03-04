@@ -1,4 +1,3 @@
-
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
 plus the activity feed endpoint.
@@ -18,6 +17,37 @@ from models import AutomationSettings, SystemEvent, ManagedUser
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/automation", tags=["automation"])
+
+# ── Enrichment job state ─────────────────────────────────────────────────────
+_enrichment_state: dict = {
+    "running": False,
+    "phase": "",           # "Fetching song data" | "Fetching artist data" | "Complete" | "Error"
+    "current_item": "",    # name of track/artist currently being fetched
+    # Track phase
+    "tracks_done": 0,
+    "tracks_total": 0,
+    "tracks_enriched": 0,
+    "tracks_failed": 0,
+    # Artist phase
+    "artists_done": 0,
+    "artists_total": 0,
+    "artists_enriched": 0,
+    "artists_failed": 0,
+    # Timing
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+def _set_enrichment_state(**kwargs):
+    from datetime import datetime as _dt
+    _enrichment_state.update(kwargs)
+    if kwargs.get("running") and not _enrichment_state.get("started_at"):
+        _enrichment_state["started_at"] = _dt.utcnow().isoformat()
+        _enrichment_state["finished_at"] = None
+    if kwargs.get("running") is False:
+        _enrichment_state["finished_at"] = _dt.utcnow().isoformat()
+        _enrichment_state["started_at"] = None
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -145,6 +175,98 @@ async def trigger_index(db: Session = Depends(get_db)):
         asyncio.run(run_full_index())
     threading.Thread(target=_run, daemon=True, name="manual-index").start()
     return {"ok": True, "message": "Index started in background"}
+
+
+@router.post("/trigger/enrichment")
+async def trigger_enrichment(db: Session = Depends(get_db)):
+    """
+    Manually trigger a full enrichment run (tracks + artists) immediately.
+    Fetches per-song and per-artist Last.fm data: listener counts, tags, similar artists.
+    This populates the song popularity and artist popularity columns in Insights.
+    Runs in a background thread — poll /trigger/enrichment/status for progress.
+    """
+    import threading
+    state = _enrichment_state.copy()
+    if state.get("running"):
+        return {"ok": False, "message": "Enrichment already running", "state": state}
+
+    def _run():
+        _set_enrichment_state(
+            running=True, phase="Fetching song data",
+            current_item="",
+            tracks_done=0, tracks_total=0, tracks_enriched=0, tracks_failed=0,
+            artists_done=0, artists_total=0, artists_enriched=0, artists_failed=0,
+            error=None,
+        )
+        db2 = SessionLocal()
+        try:
+            from services.enrichment import enrich_tracks, enrich_artists
+
+            def track_progress(done, total, track, artist, enriched, failed):
+                _enrichment_state.update(
+                    tracks_done=done,
+                    tracks_total=total,
+                    tracks_enriched=enriched,
+                    tracks_failed=failed,
+                    current_item=f"{track}" + (f" — {artist}" if artist else ""),
+                )
+
+            def artist_progress(done, total, artist, enriched, failed):
+                _enrichment_state.update(
+                    artists_done=done,
+                    artists_total=total,
+                    artists_enriched=enriched,
+                    artists_failed=failed,
+                    current_item=artist,
+                )
+
+            # Manual trigger = catchup mode: no limit, process full library.
+            # run_enrichment()'s smart dispatcher also auto-detects catchup,
+            # but passing limit=None directly ensures manual runs are always full.
+            track_result = enrich_tracks(db2, force=False, limit=None, progress_callback=track_progress)
+
+            _set_enrichment_state(
+                running=True, phase="Fetching artist data",
+                current_item="",
+                tracks_enriched=track_result.get("enriched", 0),
+                tracks_failed=track_result.get("failed", 0),
+            )
+
+            artist_result = enrich_artists(db2, force=False, limit=None, progress_callback=artist_progress)
+
+            try:
+                from models import AutomationSettings
+                from datetime import datetime as _dt
+                s = db2.query(AutomationSettings).first()
+                if s:
+                    s.last_enrichment = _dt.utcnow()
+                    db2.commit()
+            except Exception:
+                pass
+
+            _set_enrichment_state(
+                running=False, phase="Complete",
+                current_item="",
+                tracks_enriched=track_result.get("enriched", 0),
+                tracks_failed=track_result.get("failed", 0),
+                artists_enriched=artist_result.get("enriched", 0),
+                artists_failed=artist_result.get("failed", 0),
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Manual enrichment failed: {e}", exc_info=True)
+            _set_enrichment_state(running=False, phase="Error", error=str(e))
+        finally:
+            db2.close()
+
+    threading.Thread(target=_run, daemon=True, name="manual-enrichment").start()
+    return {"ok": True, "message": "Enrichment started in background — poll /trigger/enrichment/status"}
+
+
+@router.get("/trigger/enrichment/status")
+def enrichment_trigger_status():
+    """Poll this to get live progress of the enrichment run."""
+    return dict(_enrichment_state)
 
 
 @router.post("/trigger/popularity-cache")

@@ -22,6 +22,8 @@ hogging the server for hours. A full library enrichment may take several runs.
 from __future__ import annotations
 
 import json
+import requests
+import re
 import logging
 import math
 import time
@@ -33,21 +35,47 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-LASTFM_DELAY   = 0.22   # seconds between Last.fm calls
+LASTFM_DELAY   = 0.22   # seconds between calls (rate limit: ~4 rps safe)
+LASTFM_BASE    = "https://ws.audioscrobbler.com/2.0/"  # direct REST — 1 call/track
 MB_DELAY       = 1.1    # seconds between MusicBrainz calls
 
 # ── Enrichment TTL ────────────────────────────────────────────────────────────
 TRACK_TTL_DAYS  = 30    # re-enrich tracks after this many days
 ARTIST_TTL_DAYS = 14    # re-enrich artists more frequently (trends change)
 
-# ── Batch sizes per scheduler run ────────────────────────────────────────────
-TRACKS_PER_RUN  = 100   # tracks to enrich per scheduler invocation
-ARTISTS_PER_RUN = 50    # artists to enrich per scheduler invocation
+# ── Batch sizes ──────────────────────────────────────────────────────────────
+# Maintenance runs (scheduler, every 6h): process only TTL-expired items.
+# 500 tracks/run keeps any library size fresh within a 30-day TTL:
+#   - 10,000-track library expires ~83 tracks/6h → 500/run gives 6x headroom.
+# Catchup runs (first launch, or manual "Run Now"): no limit, full library pass.
+#   - 10,000 tracks takes ~37min at 0.22s/track. Runs in background.
+TRACKS_PER_RUN  = 500   # tracks per maintenance run
+ARTISTS_PER_RUN = 200   # artists per maintenance run
+
+# If >10% of library is unenriched, auto-switch to catchup (no batch limit).
+CATCHUP_THRESHOLD = 0.10
 
 # ── Popularity scoring ────────────────────────────────────────────────────────
 # Log-scale Last.fm listeners → 0-100. Reference points:
 #   10M listeners → ~95,  1M → ~80,  100K → ~65,  10K → ~50,  1K → ~35
-LISTENER_SCALE = 10_000_000   # listeners at which score approaches 100
+# Popularity scoring — linear spread in log space.
+#
+# Track listeners and artist listeners live on very different scales:
+#   - Artists: 1K (tiny) to 80M (Taylor Swift). Reference ceiling: 10M.
+#   - Tracks:  <500 (obscure) to 3M+ (Bohemian Rhapsody). Reference ceiling: 3M.
+#
+# Using the same formula for both meant tracks always looked low and artists
+# always looked high. Separate functions with calibrated floors/ceilings fix this.
+
+# Artist-level calibration: 1K listeners → 0, 10M → 100
+ARTIST_LISTENER_FLOOR   = 1_000
+ARTIST_LISTENER_CEILING = 10_000_000
+
+# Track-level calibration: 500 listeners → 0, 3M → 100
+# This spreads the realistic track range properly:
+#   600K → ~82 (popular hit), 60K → ~55 (solid track), 12K → ~37 (deep cut)
+TRACK_LISTENER_FLOOR   = 500
+TRACK_LISTENER_CEILING = 3_000_000
 
 # ── Cooldown skip threshold ───────────────────────────────────────────────────
 COOLDOWN_SKIP_STREAK_THRESHOLD = 3   # consecutive skips to trigger cooldown
@@ -63,11 +91,24 @@ REPLAY_BOOST_ARTIST  = 4.0  # score pts for same-artist return (different track)
 REPLAY_BOOST_SESSION = 6.0  # score pts for same-session artist return
 
 
-def _listeners_to_score(listeners: Optional[int]) -> float:
-    """Log-scale Last.fm listener count → 0-100 popularity score."""
+def _listeners_to_score(listeners: Optional[int], floor: int = ARTIST_LISTENER_FLOOR,
+                        ceiling: int = ARTIST_LISTENER_CEILING) -> float:
+    """Linear-in-log-space listener count → 0-100 popularity score.
+
+    Call with default args for artist-level scoring (floor=1K, ceiling=10M).
+    Pass floor=TRACK_LISTENER_FLOOR, ceiling=TRACK_LISTENER_CEILING for tracks.
+    """
     if not listeners or listeners <= 0:
         return 0.0
-    return round(min(100.0, (math.log1p(listeners) / math.log1p(LISTENER_SCALE)) * 100), 1)
+    log_l = math.log(max(listeners, 1))
+    log_floor = math.log(floor)
+    log_ceil  = math.log(ceiling)
+    return round(min(100.0, max(0.0, (log_l - log_floor) / (log_ceil - log_floor) * 100)), 1)
+
+
+def _track_listeners_to_score(listeners: Optional[int]) -> float:
+    """Track-level listener count → 0-100. Calibrated for per-song Last.fm counts."""
+    return _listeners_to_score(listeners, floor=TRACK_LISTENER_FLOOR, ceiling=TRACK_LISTENER_CEILING)
 
 
 def _get_lastfm_net(db: Session):
@@ -92,8 +133,65 @@ def _get_lastfm_net(db: Session):
 
 # ── Track enrichment ──────────────────────────────────────────────────────────
 
+def _clean_track_name(name: str) -> str:
+    """Strip Jellyfin suffixes that prevent Last.fm matching.
+
+    Handles: (Remastered 2011), - 2014 Remaster, (Explicit Version),
+    (feat. X), [2024 Mix], (MTV Unplugged), (Live at ...), [Bonus Track], etc.
+    Returns the raw name unchanged if it contains no known suffixes.
+    """
+    # (Remastered YYYY) / (YYYY Remaster) / (Remastered)
+    name = re.sub(r'\s*\(\s*(?:\d{4}\s+)?[Rr]emaster(?:ed)?\s*(?:\d{4})?\s*\)', '', name)
+    # "- 2014 Remaster" / "- Remastered 2011" / "- Remastered" at end of string
+    name = re.sub(r'\s*[-–]\s+(?:\d{4}\s+)?[Rr]emaster(?:ed)?(?:\s+\d{4})?$', '', name)
+    # (Live ...) / [Live ...] / "- Live" at end
+    name = re.sub(r'\s*\(\s*[Ll]ive[^)]*\)', '', name)
+    name = re.sub(r'\s*\[\s*[Ll]ive[^\]]*\]', '', name)
+    name = re.sub(r'\s*[-–]\s+[Ll]ive(?:\s+\w+)*$', '', name)
+    # [Bonus Track] / (Bonus)
+    name = re.sub(r'\s*[\(\[]\s*[Bb]onus[^\)\]]*[\)\]]', '', name)
+    # (Explicit Version) / (Clean) / (Radio Edit) / (Single/Album Version) / (Acoustic)
+    name = re.sub(r'\s*\(\s*(?:Explicit|Clean|Radio Edit|Single Version|Album Version|Acoustic)(?:\s+Version)?\s*\)', '', name, flags=re.IGNORECASE)
+    # (feat. ...) / (ft. ...) / (featuring ...)
+    name = re.sub(r'\s*\(\s*(?:feat(?:uring)?|ft)\.?\s[^)]+\)', '', name, flags=re.IGNORECASE)
+    # [Mix / Version / Edit / Remix / Acoustic / Demo / Remaster / Unplugged in brackets]
+    name = re.sub(r'\s*\[\s*(?:\d{4}\s+)?(?:Mix|Version|Edit|Remix|Acoustic|Demo|Remaster|Unplugged)[^\]]*\]', '', name, flags=re.IGNORECASE)
+    # (MTV Unplugged) / (Unplugged ...)
+    name = re.sub(r'\s*\(\s*(?:MTV\s+)?Unplugged[^)]*\)', '', name, flags=re.IGNORECASE)
+    return name.strip()
+
+
+def _clean_artist_for_lastfm(artist: str) -> str:
+    """
+    Strip featured/collaborator suffixes so Last.fm can match the primary artist.
+
+    "Ed Sheeran feat. Khalid"  → "Ed Sheeran"
+    "Ed Sheeran & Rudimental"  → "Ed Sheeran"
+    "Eminem ft. Ed Sheeran"    → "Eminem"
+    "Simon & Garfunkel"        → "Simon & Garfunkel"  (single word before &, preserved)
+    "Florence + the Machine"   → "Florence + the Machine"  (single word before +, preserved)
+    """
+    # feat. / ft. / featuring — most unambiguous collab marker
+    artist = re.sub(r'\s+(?:feat(?:uring)?\.?|ft\.?)\s+.+$', '', artist, flags=re.IGNORECASE)
+    # parenthetical collab: (feat. X), (ft. X), (with X)
+    artist = re.sub(r'\s*\(\s*(?:feat(?:uring)?\.?|ft\.?|with)\s+[^)]+\)', '', artist, flags=re.IGNORECASE)
+    # "& X" or "+ X" — only strip when there are already 2+ words before it
+    # (preserves "Simon & Garfunkel", "Florence + the Machine")
+    parts = re.split(r'\s+[&+]\s+', artist)
+    if len(parts) > 1 and len(parts[0].split()) >= 2:
+        artist = parts[0]
+    return artist.strip()
+
+
 def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
-    """Fetch track data from Last.fm. Returns dict of enrichment fields."""
+    """
+    Fetch track data from Last.fm using a single track.getInfo REST call.
+
+    One HTTP request returns: listeners, playcount, url, mbid, toptags.
+    This replaces the previous approach of 6 separate pylast lazy-eval calls
+    (each triggering its own HTTP round-trip), cutting time from 3-5s to ~0.3s.
+    Similar tracks are skipped — not worth an extra call for what we need.
+    """
     result = {
         "mbid": None,
         "lastfm_url": None,
@@ -104,65 +202,106 @@ def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
         "popularity_score": None,
         "source": "lastfm",
     }
+    cleaned_name = _clean_track_name(track_name)
+    lookup_name = cleaned_name if cleaned_name else track_name
+    if lookup_name != track_name:
+        log.debug(f"  Cleaned track: {track_name!r} → {lookup_name!r}")
+
+    # Clean the artist name too — "Ed Sheeran feat. Khalid" → "Ed Sheeran"
+    lookup_artist = _clean_artist_for_lastfm(artist_name)
+    if lookup_artist != artist_name:
+        log.debug(f"  Cleaned artist: {artist_name!r} → {lookup_artist!r}")
+
+    # Get the API key from the pylast network object
     try:
-        track = net.get_track(artist_name, track_name)
+        api_key = net.api_key
+    except AttributeError:
+        api_key = getattr(net, "_api_key", None)
+    if not api_key:
+        result["source"] = "none"
+        return result
 
+    def _getinfo(artist: str, title: str) -> dict:
         try:
-            result["global_playcount"] = int(track.get_playcount() or 0)
-        except Exception:
-            pass
-        try:
-            result["global_listeners"] = int(track.get_listener_count() or 0)
-        except Exception:
-            pass
-        try:
-            result["lastfm_url"] = track.get_url()
-        except Exception:
-            pass
-        try:
-            result["mbid"] = track.get_mbid()
-        except Exception:
-            pass
+            r = requests.get(
+                LASTFM_BASE,
+                params={
+                    "method":      "track.getInfo",
+                    "api_key":     api_key,
+                    "artist":      artist,
+                    "track":       title,
+                    "autocorrect": 1,
+                    "format":      "json",
+                },
+                timeout=8,
+            )
+            if r.status_code == 200:
+                return r.json().get("track", {})
+        except Exception as e:
+            log.debug(f"  track.getInfo request failed: {e}")
+        return {}
 
-        # Tags (top 5)
+    data = _getinfo(lookup_artist, lookup_name)
+
+    # If lookup returned nothing, try fallback combinations
+    if not data and lookup_name != track_name:
+        log.debug(f"  Retrying with original track name: {track_name!r}")
+        data = _getinfo(lookup_artist, track_name)
+    if not data and lookup_artist != artist_name:
+        log.debug(f"  Retrying with original artist: {artist_name!r}")
+        data = _getinfo(artist_name, lookup_name)
+
+    if data:
         try:
-            raw_tags = track.get_top_tags(limit=5)
+            # Use explicit None check — "0" is falsy but valid (genuinely 0 listeners)
+            listeners_raw = data.get("listeners")
+            if listeners_raw is None:
+                listeners_raw = (data.get("stats") or {}).get("listeners")
+            result["global_listeners"] = int(listeners_raw or 0)
+        except Exception:
+            pass
+        try:
+            pc_raw = data.get("playcount")
+            if pc_raw is None:
+                pc_raw = (data.get("stats") or {}).get("playcount")
+            result["global_playcount"] = int(pc_raw or 0)
+        except Exception:
+            pass
+        result["lastfm_url"] = data.get("url")
+        result["mbid"]       = data.get("mbid") or None
+        try:
+            raw_tags = (data.get("toptags") or {}).get("tag", [])
             result["tags"] = json.dumps([
-                {"name": t.item.get_name(), "count": int(t.weight or 0)}
-                for t in raw_tags
+                {"name": t["name"], "count": int(t.get("count", 0))}
+                for t in raw_tags[:5]
             ])
         except Exception:
             pass
-
-        # Similar tracks (top 5)
-        try:
-            similar = track.get_similar(limit=5)
-            result["similar_tracks"] = json.dumps([
-                {
-                    "name": s.item.get_name(),
-                    "artist": s.item.get_artist().get_name(),
-                    "match": float(s.match or 0),
-                }
-                for s in similar
-            ])
-        except Exception:
-            pass
-
-        result["popularity_score"] = _listeners_to_score(result["global_listeners"])
-
-    except Exception as e:
-        log.debug(f"  Last.fm track lookup failed for '{artist_name}' — '{track_name}': {e}")
+        result["popularity_score"] = _track_listeners_to_score(result["global_listeners"])
+    else:
+        log.warning(
+            f"  track.getInfo returned nothing for {lookup_artist!r} — {lookup_name!r}"
+            + (f" (original artist: {artist_name!r})" if lookup_artist != artist_name else "")
+            + (f" (original track: {track_name!r})" if lookup_name != track_name else "")
+        )
         result["source"] = "none"
 
     return result
 
 
-def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN) -> dict:
+def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
+                  progress_callback=None) -> dict:
     """
-    Enrich the next batch of unenriched (or stale) tracks with Last.fm data.
-    Returns stats dict.
+    Enrich unenriched/stale tracks with Last.fm data.
+
+    limit=None means no limit (catchup mode — process entire library).
+    limit=N processes only the next N expired tracks (maintenance mode).
+
+    progress_callback(done, total, current_track, current_artist, enriched, failed)
+    is called after each track if provided — use this for live UI progress.
     """
     from models import LibraryTrack, TrackEnrichment
+    from sqlalchemy import text as _satext
 
     net = _get_lastfm_net(db)
     if not net:
@@ -170,41 +309,75 @@ def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN)
         return {"skipped": True, "reason": "lastfm_not_configured"}
 
     now = datetime.utcnow()
-    expires_threshold = now  # anything with expires_at < now is stale
 
-    # Select tracks needing enrichment: no enrichment row, or expired
-    existing_enriched_ids = {
-        row.jellyfin_item_id
-        for row in db.query(TrackEnrichment.jellyfin_item_id)
-        .filter(TrackEnrichment.expires_at > expires_threshold)
-        .all()
-    }
-
+    # Use LEFT JOIN instead of notin_() to avoid SQLite's large IN-clause limit.
+    # Selects LibraryTracks that have no fresh TrackEnrichment row (expires_at > now).
     if force:
-        existing_enriched_ids = set()
-
-    tracks = (
-        db.query(LibraryTrack)
-        .filter(LibraryTrack.missing_since.is_(None))
-        .filter(LibraryTrack.jellyfin_item_id.notin_(existing_enriched_ids))
-        .order_by(LibraryTrack.first_seen.asc())
-        .limit(limit)
-        .all()
-    )
+        q = (
+            db.query(LibraryTrack)
+            .filter(LibraryTrack.missing_since.is_(None))
+            .order_by(LibraryTrack.first_seen.asc())
+        )
+        if limit is not None:
+            q = q.limit(limit)
+        tracks = q.all()
+    else:
+        q = (
+            db.query(LibraryTrack)
+            .outerjoin(
+                TrackEnrichment,
+                (LibraryTrack.jellyfin_item_id == TrackEnrichment.jellyfin_item_id) &
+                (TrackEnrichment.expires_at.isnot(None)) &
+                (TrackEnrichment.expires_at > now)
+            )
+            .filter(LibraryTrack.missing_since.is_(None))
+            .filter(TrackEnrichment.jellyfin_item_id.is_(None))
+            .order_by(LibraryTrack.first_seen.asc())
+        )
+        if limit is not None:
+            q = q.limit(limit)
+        tracks = q.all()
 
     if not tracks:
         log.info("Enrichment: all tracks are fresh — nothing to enrich")
+        if progress_callback:
+            progress_callback(0, 0, "", "", 0, 0)
         return {"enriched": 0, "skipped": 0, "failed": 0}
 
-    log.info(f"Enrichment: enriching {len(tracks)} tracks from Last.fm...")
+    total = len(tracks)
+    log.info(f"Enrichment: enriching {total} tracks from Last.fm...")
     enriched = failed = 0
 
-    for lt in tracks:
+    for i, lt in enumerate(tracks):
         if not lt.artist_name or not lt.track_name:
             failed += 1
+            if progress_callback:
+                progress_callback(i + 1, total, lt.track_name or "?", lt.artist_name or "?", enriched, failed)
             continue
 
-        data = _enrich_track_lastfm(net, lt.artist_name, lt.track_name)
+        # Resolve the real track artist — compilation albums store "Various Artists"
+        # as artist_name in the DB (from old index runs before the fix). Use the
+        # track's own artist field if available, otherwise skip — Last.fm will
+        # return nothing for "Various Artists" and we'd score 0 incorrectly.
+        _VA = {"various artists", "various", "va", "v.a.", "v/a",
+               "multiple artists", "assorted artists", "unknown artist", "unknown"}
+        lookup_artist = lt.artist_name
+        if lookup_artist.strip().lower() in _VA:
+            # Try the album_artist field as a fallback (some tracks store real artist there)
+            real = getattr(lt, "album_artist", None) or ""
+            if real and real.strip().lower() not in _VA:
+                lookup_artist = real.strip()
+            else:
+                log.debug(f"  Skipping '{lt.track_name}' — artist is '{lt.artist_name}' (compilation catch-all)")
+                failed += 1
+                if progress_callback:
+                    progress_callback(i + 1, total, lt.track_name, lt.artist_name, enriched, failed)
+                continue
+
+        if progress_callback:
+            progress_callback(i, total, lt.track_name, lookup_artist, enriched, failed)
+
+        data = _enrich_track_lastfm(net, lookup_artist, lt.track_name)
         time.sleep(LASTFM_DELAY)
 
         try:
@@ -220,6 +393,11 @@ def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN)
                     album_name=lt.album_name,
                 )
                 db.add(existing)
+            else:
+                # Always update artist_name in case it was stored as "Various Artists"
+                # before the library_scanner fix corrected LibraryTrack.artist_name
+                existing.artist_name = lt.artist_name
+                existing.track_name  = lt.track_name
 
             existing.mbid = data["mbid"]
             existing.lastfm_url = data["lastfm_url"]
@@ -232,7 +410,6 @@ def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN)
             existing.enriched_at = now
             existing.expires_at = now + timedelta(days=TRACK_TTL_DAYS)
 
-            # Denormalise key fields onto LibraryTrack for fast SQL queries
             lt.global_playcount = data["global_playcount"]
             lt.global_listeners = data["global_listeners"]
             lt.tags = data["tags"]
@@ -240,7 +417,7 @@ def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN)
             lt.enriched_at = now
             lt.enrichment_source = data["source"]
 
-            db.commit()
+            db.flush()   # stage to transaction but don't fsync yet
             enriched += 1
 
         except Exception as e:
@@ -248,14 +425,40 @@ def enrich_tracks(db: Session, force: bool = False, limit: int = TRACKS_PER_RUN)
             db.rollback()
             failed += 1
 
+        # Commit every 25 tracks — one fsync per 25 writes instead of per 1.
+        # Reduces SSD wear ~25× with no meaningful data-loss risk
+        # (worst case: lose the last <25 enrichment rows on crash, re-enriched next run).
+        if (enriched + failed) % 25 == 0:
+            try:
+                db.commit()
+            except Exception as e:
+                log.warning(f"  Batch commit failed: {e}")
+                db.rollback()
+
+        if progress_callback:
+            progress_callback(i + 1, total, lt.track_name, lt.artist_name, enriched, failed)
+
+    # Final commit for the last partial batch
+    try:
+        db.commit()
+    except Exception as e:
+        log.warning(f"  Final commit failed: {e}")
+        db.rollback()
+
     log.info(f"Track enrichment complete: {enriched} enriched, {failed} failed")
-    return {"enriched": enriched, "failed": failed}
+    return {"enriched": enriched, "failed": failed, "total": total}
 
 
 # ── Artist enrichment ─────────────────────────────────────────────────────────
 
 def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[int]) -> dict:
-    """Fetch artist data from Last.fm including similar artists and tags."""
+    """
+    Fetch artist data from Last.fm using a single artist.getInfo REST call.
+
+    artist.getInfo returns in one response: listeners, playcount, url, mbid,
+    biography, image, tags, and up to 5 similar artists.
+    Replaces the previous 7-call pylast approach.
+    """
     result = {
         "mbid": None,
         "lastfm_url": None,
@@ -265,91 +468,150 @@ def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[in
         "biography": None,
         "tags": None,
         "similar_artists": None,
+        "top_tracks": None,
         "popularity_score": None,
         "trend_direction": "stable",
         "trend_pct": 0.0,
         "source": "lastfm",
     }
+
     try:
-        artist = net.get_artist(artist_name)
-
-        try:
-            result["global_listeners"] = int(artist.get_listener_count() or 0)
-        except Exception:
-            pass
-        try:
-            result["global_playcount"] = int(artist.get_playcount() or 0)
-        except Exception:
-            pass
-        try:
-            result["lastfm_url"] = artist.get_url()
-        except Exception:
-            pass
-        try:
-            result["mbid"] = artist.get_mbid()
-        except Exception:
-            pass
-
-        # Biography (trimmed)
-        try:
-            bio = artist.get_bio_summary(language="en") or ""
-            result["biography"] = bio[:500] if bio else None
-        except Exception:
-            pass
-
-        # Image
-        try:
-            import pylast
-            result["image_url"] = artist.get_cover_image(pylast.SIZE_LARGE)
-        except Exception:
-            pass
-
-        # Tags (top 5 names only for compact storage)
-        try:
-            raw_tags = artist.get_top_tags(limit=5)
-            result["tags"] = json.dumps([t.item.get_name() for t in raw_tags])
-        except Exception:
-            pass
-
-        # Similar artists (up to 10, with match score)
-        try:
-            similar = artist.get_similar(limit=10)
-            result["similar_artists"] = json.dumps([
-                {
-                    "name": s.item.get_name(),
-                    "match": round(float(s.match or 0), 4),
-                }
-                for s in similar
-            ])
-        except Exception:
-            pass
-
-        # Popularity score
-        result["popularity_score"] = _listeners_to_score(result["global_listeners"])
-
-        # Trend direction
-        cur = result["global_listeners"]
-        if cur and previous_listeners and previous_listeners > 0:
-            pct_change = (cur - previous_listeners) / previous_listeners * 100
-            result["trend_pct"] = round(pct_change, 1)
-            if pct_change > 5:
-                result["trend_direction"] = "rising"
-            elif pct_change < -5:
-                result["trend_direction"] = "falling"
-            else:
-                result["trend_direction"] = "stable"
-
-    except Exception as e:
-        log.debug(f"  Last.fm artist lookup failed for '{artist_name}': {e}")
+        api_key = net.api_key
+    except AttributeError:
+        api_key = getattr(net, "_api_key", None)
+    if not api_key:
         result["source"] = "none"
+        return result
+
+    def _lastfm_get(method: str, params: dict) -> dict:
+        try:
+            r = requests.get(
+                LASTFM_BASE,
+                params={"method": method, "api_key": api_key, "format": "json", **params},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log.debug(f"  {method} request failed: {e}")
+        return {}
+
+    info_data = _lastfm_get("artist.getInfo", {"artist": artist_name, "autocorrect": 1})
+    data = info_data.get("artist", {})
+    if not data:
+        log.warning(f"  artist.getInfo returned nothing for {artist_name!r}")
+        result["source"] = "none"
+        return result
+
+    # Fetch top tracks + resolve which album each belongs to.
+    # artist.getTopTracks gives name+listeners but no album field.
+    # We call track.getInfo for the top 3 tracks to get their album names —
+    # this lets us recommend "the album containing their biggest hit" rather
+    # than "their album with the most total plays" (which favours long albums).
+    time.sleep(LASTFM_DELAY)
+    tracks_data = _lastfm_get("artist.getTopTracks", {"artist": artist_name, "autocorrect": 1, "limit": 10})
+    try:
+        raw_tracks = tracks_data.get("toptracks", {}).get("track", [])
+        enriched_tracks = []
+        for i, t in enumerate(raw_tracks[:10]):
+            if not t.get("name"):
+                continue
+            track_entry = {
+                "name":      t["name"],
+                "listeners": int(t.get("listeners", 0) or 0),
+                "rank":      int((t.get("@attr") or {}).get("rank", i + 1)),
+                "album":     None,
+            }
+            # Resolve album for top 3 tracks via track.getInfo
+            if i < 3:
+                time.sleep(LASTFM_DELAY)
+                ti = _lastfm_get("track.getInfo", {
+                    "artist": artist_name,
+                    "track":  t["name"],
+                    "autocorrect": 1,
+                })
+                track_data = ti.get("track", {})
+                album_title = (track_data.get("album") or {}).get("title")
+                if album_title:
+                    track_entry["album"] = album_title
+            enriched_tracks.append(track_entry)
+        result["top_tracks"] = json.dumps(enriched_tracks)
+    except Exception as e:
+        log.debug(f"  top tracks fetch failed for {artist_name!r}: {e}")
+
+    if not data:
+        log.warning(f"  artist.getInfo returned nothing for {artist_name!r}")
+        result["source"] = "none"
+        return result
+
+    # Core stats
+    stats = data.get("stats", {})
+    try:
+        result["global_listeners"] = int(stats.get("listeners") or 0)
+    except Exception:
+        pass
+    try:
+        result["global_playcount"] = int(stats.get("playcount") or 0)
+    except Exception:
+        pass
+
+    result["lastfm_url"] = data.get("url")
+    result["mbid"]       = data.get("mbid") or None
+
+    # Biography (strip trailing "Read more on Last.fm" link noise)
+    bio_raw = (data.get("bio") or {}).get("summary", "") or ""
+    bio_clean = bio_raw.split('<a href="https://www.last.fm')[0].strip()
+    result["biography"] = bio_clean[:500] if bio_clean else None
+
+    # Image — take the largest available
+    images = data.get("image", [])
+    for img in reversed(images):
+        url = img.get("#text", "")
+        if url and not url.endswith("2a96cbd8b46e442fc41c2b86b821562f.png"):  # skip default placeholder
+            result["image_url"] = url
+            break
+
+    # Tags (up to 5)
+    try:
+        raw_tags = (data.get("tags") or {}).get("tag", [])
+        result["tags"] = json.dumps([t["name"] for t in raw_tags[:5]])
+    except Exception:
+        pass
+
+    # Similar artists embedded in getInfo (up to 5 — enough for recommendations)
+    try:
+        similar_raw = (data.get("similar") or {}).get("artist", [])
+        result["similar_artists"] = json.dumps([
+            {"name": s["name"], "match": 1.0}   # getInfo doesn't include match score
+            for s in similar_raw[:5]
+            if s.get("name")
+        ])
+    except Exception:
+        pass
+
+    # Popularity + trend
+    result["popularity_score"] = _listeners_to_score(result["global_listeners"])
+    cur = result["global_listeners"]
+    if cur and previous_listeners and previous_listeners > 0:
+        pct_change = (cur - previous_listeners) / previous_listeners * 100
+        result["trend_pct"] = round(pct_change, 1)
+        result["trend_direction"] = (
+            "rising"  if pct_change >  5 else
+            "falling" if pct_change < -5 else
+            "stable"
+        )
 
     return result
 
 
-def enrich_artists(db: Session, force: bool = False, limit: int = ARTISTS_PER_RUN) -> dict:
+def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
+                   progress_callback=None) -> dict:
     """
     Enrich the next batch of unenriched/stale artists with Last.fm data.
     Also populates/updates ArtistRelation rows from similar_artists.
+
+    progress_callback(done, total, current_artist, enriched, failed) is called
+    after each artist if provided.
     """
     from models import LibraryTrack, ArtistEnrichment, ArtistRelation
 
@@ -383,16 +645,21 @@ def enrich_artists(db: Session, force: bool = False, limit: int = ARTISTS_PER_RU
     to_enrich = [
         name for name in all_artist_names
         if name.lower() not in fresh_artists
-    ][:limit]
+    ]
+    if limit is not None:
+        to_enrich = to_enrich[:limit]
 
     if not to_enrich:
         log.info("Enrichment: all artists are fresh")
         return {"enriched": 0, "failed": 0}
 
-    log.info(f"Enrichment: enriching {len(to_enrich)} artists from Last.fm...")
+    total_artists = len(to_enrich)
+    log.info(f"Enrichment: enriching {total_artists} artists from Last.fm...")
     enriched = failed = relations_added = 0
 
-    for artist_name in to_enrich:
+    for i, artist_name in enumerate(to_enrich):
+        if progress_callback:
+            progress_callback(i, total_artists, artist_name, enriched, failed)
         existing = db.query(ArtistEnrichment).filter_by(
             artist_name_lower=artist_name.lower()
         ).first()
@@ -421,6 +688,7 @@ def enrich_artists(db: Session, force: bool = False, limit: int = ARTISTS_PER_RU
             existing.listeners_previous = prev_listeners
             existing.trend_direction = data["trend_direction"]
             existing.trend_pct = data["trend_pct"]
+            existing.top_tracks = data.get("top_tracks")
             existing.source = data["source"]
             existing.enriched_at = now
             existing.expires_at = now + timedelta(days=ARTIST_TTL_DAYS)
@@ -452,13 +720,29 @@ def enrich_artists(db: Session, force: bool = False, limit: int = ARTISTS_PER_RU
                 except Exception as e:
                     log.debug(f"  ArtistRelation upsert failed for {artist_name}: {e}")
 
-            db.commit()
+            db.flush()
             enriched += 1
 
         except Exception as e:
             log.warning(f"  Artist enrichment DB write failed for '{artist_name}': {e}")
             db.rollback()
             failed += 1
+
+        if (enriched + failed) % 25 == 0:
+            try:
+                db.commit()
+            except Exception as e:
+                log.warning(f"  Artist batch commit failed: {e}")
+                db.rollback()
+
+        if progress_callback:
+            progress_callback(i + 1, total_artists, artist_name, enriched, failed)
+
+    try:
+        db.commit()
+    except Exception as e:
+        log.warning(f"  Artist final commit failed: {e}")
+        db.rollback()
 
     log.info(
         f"Artist enrichment complete: {enriched} enriched, {failed} failed, "
@@ -878,6 +1162,63 @@ def archive_old_play_events(db: Session) -> int:
 # ── Top-level enrichment job ──────────────────────────────────────────────────
 
 def run_enrichment(db: Session, force: bool = False) -> dict:
+    """
+    Smart enrichment dispatcher: auto-detects first-launch catchup vs maintenance.
+
+    Catchup mode  — triggered when >CATCHUP_THRESHOLD of library is unenriched.
+      No batch limit. Processes the entire library in one background pass.
+      A 10,000-track library takes ~37min at 0.22s/track.
+
+    Maintenance mode — normal scheduler runs.
+      Processes up to TRACKS_PER_RUN expired tracks and ARTISTS_PER_RUN expired
+      artists. 500 tracks every 6h keeps any library size fully current.
+    """
+    from models import LibraryTrack, TrackEnrichment
+
+    now = datetime.utcnow()
+
+    # Count how many library tracks have no fresh enrichment
+    total_tracks = (
+        db.query(LibraryTrack)
+        .filter(LibraryTrack.missing_since.is_(None))
+        .count()
+    )
+    fresh_count = (
+        db.query(TrackEnrichment)
+        .filter(TrackEnrichment.expires_at > now)
+        .count()
+    )
+    unenriched_fraction = 1.0 - (fresh_count / total_tracks) if total_tracks > 0 else 1.0
+
+    if force or unenriched_fraction > CATCHUP_THRESHOLD:
+        mode = "catchup"
+        track_limit = None   # no limit — process everything
+        artist_limit = None
+        log.info(
+            f"Enrichment: CATCHUP mode "
+            f"({fresh_count}/{total_tracks} tracks fresh, {unenriched_fraction*100:.0f}% unenriched)"
+        )
+    else:
+        mode = "maintenance"
+        track_limit = TRACKS_PER_RUN
+        artist_limit = ARTISTS_PER_RUN
+        log.info(
+            f"Enrichment: MAINTENANCE mode "
+            f"({fresh_count}/{total_tracks} tracks fresh — processing up to "
+            f"{track_limit} expired tracks)"
+        )
+
+    track_result  = enrich_tracks(db, force=force, limit=track_limit)
+    artist_result = enrich_artists(db, force=force, limit=artist_limit)
+
+    return {
+        "mode": mode,
+        "tracks":  track_result,
+        "artists": artist_result,
+    }
+
+
+def run_enrichment_legacy(db: Session, force: bool = False) -> dict:
     """
     Full enrichment pass: tracks + artists + archival.
     Called by the scheduler every 48 hours (configurable).

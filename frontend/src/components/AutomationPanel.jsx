@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight } from 'lucide-react'
+import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database } from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
 // Python's datetime.utcnow().isoformat() produces "2026-02-24T14:30:00" with no
@@ -114,10 +114,13 @@ export default function AutomationPanel() {
   const [autoCooldown,  setAutoCooldown]  = useState(7)
 
   // Trigger states
-  const [trigIndex,  setTrigIndex]  = useState(false)
-  const [trigDisc,   setTrigDisc]   = useState(false)
-  const [trigPl,     setTrigPl]     = useState(false)
-  const [trigAuto,   setTrigAuto]   = useState(false)
+  const [trigIndex,     setTrigIndex]     = useState(false)
+  const [trigDisc,      setTrigDisc]      = useState(false)
+  const [trigPl,        setTrigPl]        = useState(false)
+  const [trigAuto,      setTrigAuto]      = useState(false)
+  const [trigEnrich,    setTrigEnrich]    = useState(false)
+  const [trigPopCache,  setTrigPopCache]  = useState(false)
+  const [enrichStatus,  setEnrichStatus]  = useState(null)
 
   useEffect(() => {
     fetch('/api/automation/settings').then(r=>r.json()).then(d => {
@@ -133,6 +136,14 @@ export default function AutomationPanel() {
       setAutoCooldown(d.auto_download_cooldown_days ?? 7)
     }).catch(() => {})
     fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
+    // Poll enrichment status if running
+    const pollEnrich = setInterval(() => {
+      fetch('/api/automation/trigger/enrichment/status').then(r=>r.json()).then(d => {
+        setEnrichStatus(d)
+        if (!d.running) clearInterval(pollEnrich)
+      }).catch(() => {})
+    }, 3000)
+    return () => clearInterval(pollEnrich)
   }, [])
 
   const save = async () => {
@@ -166,6 +177,20 @@ export default function AutomationPanel() {
     setLoading(true)
     try { await fetch(path, { method:'POST' }) }
     finally { setLoading(false); setTimeout(() => fetch('/api/automation/settings').then(r=>r.json()).then(setSettings).catch(()=>{}), 2000) }
+  }
+
+  const triggerEnrichment = async () => {
+    setTrigEnrich(true)
+    try {
+      await fetch('/api/automation/trigger/enrichment', { method: 'POST' })
+      // Start polling status
+      const poll = setInterval(() => {
+        fetch('/api/automation/trigger/enrichment/status').then(r=>r.json()).then(d => {
+          setEnrichStatus(d)
+          if (!d.running) { clearInterval(poll); setTrigEnrich(false) }
+        }).catch(() => {})
+      }, 2000)
+    } catch { setTrigEnrich(false) }
   }
 
   const s = settings
@@ -269,6 +294,129 @@ export default function AutomationPanel() {
               </div>
             </>
           )}
+        </div>
+      </TaskCard>
+
+      {/* Enrichment */}
+      <TaskCard icon={Star} color="#a78bfa" title="Track & Artist Enrichment"
+                description="Fetches per-song and per-artist Last.fm data — populates Song Popularity and Artist Popularity in Insights"
+                lastRun={s?.last_enrichment}
+                triggerLabel={enrichStatus?.running ? "Running…" : "Run Now"}
+                triggering={enrichStatus?.running}
+                onTrigger={triggerEnrichment}>
+        <div className="space-y-3">
+
+          {/* Idle info */}
+          {(!enrichStatus || (!enrichStatus.running && enrichStatus.phase !== 'Complete' && enrichStatus.phase !== 'Error')) && (
+            <div className="text-[11px] px-3 py-2.5 rounded-xl space-y-1.5"
+                 style={{ background:'rgba(167,139,250,0.06)', border:'1px solid rgba(167,139,250,0.18)', color:'var(--text-secondary)' }}>
+              <div><strong style={{ color:'#a78bfa' }}>Run Now</strong> — processes your entire library with no limit. A 5,000-track library takes ~18 minutes.</div>
+              <div><strong style={{ color:'#a78bfa' }}>Automatic</strong> — runs every 6h, processing up to 500 expired songs + 200 artists per pass. Any library stays fully current within its 30-day refresh cycle.</div>
+              <div>After enrichment finishes, run <strong style={{ color:'#a78bfa' }}>Library Index</strong> to apply the new popularity scores to recommendations.</div>
+            </div>
+          )}
+
+          {/* Error state */}
+          {enrichStatus?.phase === 'Error' && (
+            <div className="text-[11px] px-3 py-2.5 rounded-xl"
+                 style={{ background:'rgba(248,113,113,0.08)', border:'1px solid rgba(248,113,113,0.25)', color:'#f87171' }}>
+              ✗ {enrichStatus.error || 'Unknown error'}
+            </div>
+          )}
+
+          {/* Live progress — song phase */}
+          {enrichStatus?.running && enrichStatus.phase === 'Fetching song data' && (() => {
+            const done  = enrichStatus.tracks_done  ?? 0
+            const total = enrichStatus.tracks_total ?? 0
+            const pct   = total > 0 ? Math.round(done / total * 100) : 0
+            return (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span style={{ color:'#a78bfa' }}>Fetching song data from Last.fm</span>
+                  <span className="font-mono tabular-nums" style={{ color:'var(--text-secondary)' }}>
+                    {done} / {total || '…'}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full overflow-hidden" style={{ background:'var(--bg-overlay)' }}>
+                  <div className="h-full rounded-full transition-all duration-500"
+                       style={{ width: total > 0 ? `${pct}%` : '0%', background:'linear-gradient(90deg,#7c3aed,#a78bfa)' }} />
+                </div>
+                {enrichStatus.current_item && (
+                  <div className="text-[10px] truncate" style={{ color:'var(--text-muted)' }}>
+                    ↳ {enrichStatus.current_item}
+                  </div>
+                )}
+                <div className="flex gap-3 text-[10px]" style={{ color:'var(--text-muted)' }}>
+                  <span>✓ {enrichStatus.tracks_enriched ?? 0} enriched</span>
+                  {(enrichStatus.tracks_failed ?? 0) > 0 && (
+                    <span style={{ color:'#f87171' }}>✗ {enrichStatus.tracks_failed} name not matched — check server logs</span>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Live progress — artist phase */}
+          {enrichStatus?.running && enrichStatus.phase === 'Fetching artist data' && (() => {
+            const done  = enrichStatus.artists_done  ?? 0
+            const total = enrichStatus.artists_total ?? 0
+            const pct   = total > 0 ? Math.round(done / total * 100) : 0
+            return (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span style={{ color:'#a78bfa' }}>Fetching artist data from Last.fm</span>
+                  <span className="font-mono tabular-nums" style={{ color:'var(--text-secondary)' }}>
+                    {done} / {total || '…'}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full overflow-hidden" style={{ background:'var(--bg-overlay)' }}>
+                  <div className="h-full rounded-full transition-all duration-500"
+                       style={{ width: total > 0 ? `${pct}%` : '15%', background:'linear-gradient(90deg,#7c3aed,#a78bfa)' }} />
+                </div>
+                {enrichStatus.current_item && (
+                  <div className="text-[10px] truncate" style={{ color:'var(--text-muted)' }}>
+                    ↳ {enrichStatus.current_item}
+                  </div>
+                )}
+                <div className="flex gap-3 text-[10px]" style={{ color:'var(--text-muted)' }}>
+                  <span>✓ Songs done: {enrichStatus.tracks_enriched ?? 0}</span>
+                  <span>✓ {enrichStatus.artists_enriched ?? 0} artists enriched</span>
+                  {(enrichStatus.artists_failed ?? 0) > 0 && (
+                    <span style={{ color:'#f87171' }}>✗ {enrichStatus.artists_failed} not found</span>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Complete summary */}
+          {enrichStatus?.phase === 'Complete' && (
+            <div className="space-y-1.5 px-3 py-2.5 rounded-xl"
+                 style={{ background:'rgba(167,139,250,0.06)', border:'1px solid rgba(167,139,250,0.2)' }}>
+              <div className="text-[11px] font-semibold" style={{ color:'#a78bfa' }}>✓ Enrichment complete</div>
+              <div className="flex gap-4 text-[11px]" style={{ color:'var(--text-secondary)' }}>
+                <span>{enrichStatus.tracks_enriched ?? 0} songs enriched{enrichStatus.tracks_failed > 0 ? `, ${enrichStatus.tracks_failed} not on Last.fm` : ''}</span>
+                <span>{enrichStatus.artists_enriched ?? 0} artists enriched{enrichStatus.artists_failed > 0 ? `, ${enrichStatus.artists_failed} not found` : ''}</span>
+              </div>
+              <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>
+                Scores are live immediately — new playlists will use them now.
+                Run Library Index only if you want artist affinity scores updated too.
+              </div>
+            </div>
+          )}
+
+        </div>
+      </TaskCard>
+
+      {/* Popularity Cache */}
+      <TaskCard icon={Database} color="#38bdf8" title="Popularity Cache Refresh"
+                description="Fetches artist-level listener counts, tags, similar artists and top albums from Last.fm"
+                triggerLabel="Refresh Now" triggering={trigPopCache}
+                onTrigger={() => trigger('/api/automation/trigger/popularity-cache', setTrigPopCache)}>
+        <div className="text-[11px] px-3 py-2.5 rounded-xl"
+             style={{ background:'rgba(56,189,248,0.06)', border:'1px solid rgba(56,189,248,0.18)', color:'var(--text-secondary)' }}>
+          Feeds Discovery Refresh and the Artist Popularity column. Run this first if you just set up Last.fm credentials.
+          Enrichment (above) populates song-level data; this populates artist-level data.
         </div>
       </TaskCard>
 

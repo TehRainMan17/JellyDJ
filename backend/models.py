@@ -1,4 +1,3 @@
-
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3).
 
@@ -358,6 +357,13 @@ class TrackEnrichment(Base):
     tags = Column(Text, nullable=True)            # JSON list of tag strings
     similar_tracks = Column(Text, nullable=True)  # JSON list of {title, artist}
     popularity_score = Column(Float, nullable=True)  # 0–100 log-normalised
+    # These three were missing from the original model but written by enrichment.py --
+    # their absence caused TrackEnrichment.expires_at to raise AttributeError on the
+    # staleness-check query, crashing enrich_tracks() before any track was processed,
+    # which meant global_popularity was never written to TrackScore.
+    album_name = Column(String, nullable=True, default="")
+    source = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
     enriched_at = Column(DateTime, nullable=True)
     enrichment_source = Column(String, nullable=True)
 
@@ -380,6 +386,13 @@ class ArtistEnrichment(Base):
     trend_direction = Column(String, nullable=True)  # "rising"|"falling"|"stable"
     trend_pct = Column(Float, nullable=True)
     enriched_at = Column(DateTime, nullable=True)
+    # Missing columns written by enrich_artists() — same bug class as TrackEnrichment.
+    # Without expires_at, ArtistEnrichment.expires_at > now raises AttributeError,
+    # crashing enrich_artists() before any artist is processed.
+    expires_at = Column(DateTime, nullable=True)
+    source = Column(String, nullable=True)
+    listeners_previous = Column(Integer, nullable=True)
+    top_tracks = Column(Text, nullable=True)      # JSON list of {name, listeners, rank}
 
 
 class ArtistRelation(Base):

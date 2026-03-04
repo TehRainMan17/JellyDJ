@@ -1,4 +1,3 @@
-
 """
 JellyDJ Library Scanner — Module 8a
 
@@ -98,12 +97,28 @@ def _extract_genre(item: dict) -> str:
     return genres[0] if genres else ""
 
 
+_VARIOUS_ARTISTS = {
+    "various artists", "various", "va", "v.a.", "v/a",
+    "multiple artists", "assorted artists", "unknown artist", "unknown",
+}
+
 def _extract_artist(item: dict) -> str:
-    artist = item.get("AlbumArtist", "")
-    if not artist:
-        artists = item.get("Artists", [])
-        artist = artists[0] if artists else ""
-    return artist
+    """
+    Return the best artist name for a track.
+    Prefers AlbumArtist unless it's a compilation catch-all (e.g. "Various Artists"),
+    in which case falls back to the track-specific Artists[0].
+    """
+    album_artist = (item.get("AlbumArtist") or "").strip()
+    track_artists = item.get("Artists") or []
+
+    if album_artist and album_artist.lower() not in _VARIOUS_ARTISTS:
+        return album_artist
+
+    # AlbumArtist is a catch-all — use the track-level artist instead
+    real = [a for a in track_artists if a.strip().lower() not in _VARIOUS_ARTISTS]
+    if real:
+        return real[0]
+    return track_artists[0] if track_artists else album_artist
 
 
 def scan_library(db: Session, items: list[dict]) -> dict:

@@ -1,4 +1,3 @@
-
 """
 Discovery Queue router — Module 6
 

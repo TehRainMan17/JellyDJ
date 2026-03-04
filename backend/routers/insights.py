@@ -1,12 +1,16 @@
 """
-JellyDJ Insights router — v2
+JellyDJ Insights router — v3
 
-New in v2:
-  - /tracks now includes cooldown_until, skip_streak, replay_boost, global_popularity
-  - /artists now includes related_artists, tags, replay_boost
-  - /cooldowns/{user_id}  — browse all active/historical cooldowns
-  - /enrichment/status    — see enrichment progress across the library
-  - /summary              — adds cooldown counts, replay signal counts
+New in v3 (UI column expansion):
+  - /tracks: exposes all score components as sortable fields:
+      play_score, recency_score, genre_affinity, novelty_bonus,
+      last_played, global_popularity, replay_boost, skip_streak,
+      cooldown_until (on_cooldown), holiday_tag
+  - /artists: adds popularity_score sort (from ArtistEnrichment),
+      trend_direction now always returned, related_artists parsed
+      with match scores
+  - Both endpoints: cooldown_filter (all|active|clear) already wired
+    in /tracks
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -48,7 +52,8 @@ def get_tracks(
     order: str = Query("desc"),
     played_filter: str = Query("all", description="all|played|unplayed"),
     cooldown_filter: str = Query("all", description="all|active|clear"),
-    artist_filter: Optional[str] = Query(None),
+    artist_filter: Optional[str] = Query(None),   # kept for back-compat
+    search_filter: Optional[str] = Query(None),    # artist OR track OR album
     holiday_filter: str = Query("all", description="all|holiday|excluded|normal"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
@@ -63,7 +68,6 @@ def get_tracks(
     elif played_filter == "unplayed":
         q = q.filter(TrackScore.is_played == False)
 
-    # v2: cooldown filter
     now = datetime.utcnow()
     if cooldown_filter == "active":
         q = q.filter(TrackScore.cooldown_until > now)
@@ -73,10 +77,15 @@ def get_tracks(
             (TrackScore.cooldown_until <= now)
         )
 
-    if artist_filter:
-        q = q.filter(TrackScore.artist_name.ilike(f"%{artist_filter}%"))
+    _search = search_filter or artist_filter
+    if _search:
+        from sqlalchemy import or_
+        q = q.filter(or_(
+            TrackScore.artist_name.ilike(f"%{_search}%"),
+            TrackScore.track_name.ilike(f"%{_search}%"),
+            TrackScore.album_name.ilike(f"%{_search}%"),
+        ))
 
-    # v4: holiday filter
     if holiday_filter == "holiday":
         q = q.filter(TrackScore.holiday_tag.isnot(None))
     elif holiday_filter == "excluded":
@@ -89,7 +98,28 @@ def get_tracks(
     def _order_expr(raw_sql):
         return satext(f"{raw_sql} DESC" if order == "desc" else f"{raw_sql} ASC")
 
+    # All sortable fields — covers every column exposed in the UI
+    sql_sort_map = {
+        "final_score":        "CAST(final_score AS REAL)",
+        "play_score":         "CAST(play_score AS REAL)",
+        "recency_score":      "CAST(recency_score AS REAL)",
+        "artist_affinity":    "CAST(artist_affinity AS REAL)",
+        "genre_affinity":     "CAST(genre_affinity AS REAL)",
+        "skip_penalty":       "CAST(skip_penalty AS REAL)",
+        "novelty_bonus":      "CAST(novelty_bonus AS REAL)",
+        "play_count":         "play_count",
+        "last_played":        "last_played",
+        "artist_name":        "artist_name",
+        "track_name":         "track_name",
+        "skip_streak":        "skip_streak",
+        "replay_boost":       "replay_boost",
+        "global_popularity":  "global_popularity",
+        "cooldown_until":     "cooldown_until",
+        "holiday_tag":        "holiday_tag",
+    }
+
     if sort_by == "skip_count":
+        # skip_count lives in SkipPenalty — sort in Python
         total = q.count()
         all_skip_rows = db.query(SkipPenalty).filter(SkipPenalty.user_id == uid).all()
         pre_skip_map = {sk.jellyfin_item_id: sk.skip_count or 0 for sk in all_skip_rows}
@@ -100,18 +130,6 @@ def get_tracks(
         )
         rows = all_rows[(page - 1) * page_size: page * page_size]
     else:
-        sql_sort_map = {
-            "final_score":        "CAST(final_score AS REAL)",
-            "play_count":         "play_count",
-            "last_played":        "last_played",
-            "artist_name":        "artist_name",
-            "track_name":         "track_name",
-            "skip_penalty":       "CAST(skip_penalty AS REAL)",
-            "artist_affinity":    "CAST(artist_affinity AS REAL)",
-            "skip_streak":        "skip_streak",          # v2
-            "replay_boost":       "replay_boost",          # v2
-            "global_popularity":  "global_popularity",     # v2
-        }
         raw = sql_sort_map.get(sort_by, "CAST(final_score AS REAL)")
         q = q.order_by(_order_expr(raw))
         total = q.count()
@@ -130,6 +148,88 @@ def get_tracks(
         )
         skip_map = {sr.jellyfin_item_id: sr for sr in skip_rows}
 
+    # ── Popularity resolution (three-tier fallback) ───────────────────────────
+    # Tier 1: TrackScore.global_popularity  — written by scoring_engine after enrichment
+    # Tier 2: TrackEnrichment.popularity_score — written by enrich_tracks()
+    # Tier 3: PopularityCache artist:{name}  — written by popularity cache refresh
+    #
+    # Tiers 2 and 3 handle the common case where the user has run a popularity
+    # cache refresh but not yet a full enrichment + index cycle, so TrackScore
+    # rows still have global_popularity=NULL.
+
+    # Build tier-2 map from TrackEnrichment for just this page's item IDs
+    te_pop_map: dict[str, float] = {}
+    te_listeners_map: dict[str, int] = {}
+    te_playcount_map: dict[str, int] = {}
+    if item_ids:
+        try:
+            from models import TrackEnrichment
+            te_rows = (
+                db.query(
+                    TrackEnrichment.jellyfin_item_id,
+                    TrackEnrichment.popularity_score,
+                    TrackEnrichment.global_listeners,
+                    TrackEnrichment.global_playcount,
+                )
+                .filter(TrackEnrichment.jellyfin_item_id.in_(item_ids))
+                .all()
+            )
+            for row in te_rows:
+                if row.popularity_score is not None:
+                    te_pop_map[row.jellyfin_item_id] = row.popularity_score
+                if row.global_listeners is not None:
+                    te_listeners_map[row.jellyfin_item_id] = row.global_listeners
+                if row.global_playcount is not None:
+                    te_playcount_map[row.jellyfin_item_id] = row.global_playcount
+        except Exception:
+            pass
+
+    # Build tier-3 map from PopularityCache for distinct artist names on this page
+    artist_pop_map: dict[str, float] = {}
+    try:
+        import json as _json
+        from models import PopularityCache
+        artist_names = list({r.artist_name.lower() for r in rows if r.artist_name})
+        cache_keys = [f"artist:{a}" for a in artist_names]
+        if cache_keys:
+            cache_rows = (
+                db.query(PopularityCache)
+                .filter(PopularityCache.cache_key.in_(cache_keys))
+                .all()
+            )
+            for cr in cache_rows:
+                try:
+                    payload = _json.loads(cr.payload)
+                    score = payload.get("popularity_score")
+                    if score is not None:
+                        # strip "artist:" prefix to get bare lowercase name
+                        artist_pop_map[cr.cache_key[7:]] = float(score)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    def _resolve_track_popularity(r) -> float | None:
+        """Best available per-song popularity: TrackScore → TrackEnrichment → None."""
+        if r.global_popularity is not None:
+            return r.global_popularity
+        if r.jellyfin_item_id in te_pop_map:
+            return te_pop_map[r.jellyfin_item_id]
+        return None  # no track-level data yet
+
+    def _resolve_artist_popularity(r) -> float | None:
+        """Artist-level popularity from PopularityCache."""
+        if r.artist_name:
+            return artist_pop_map.get(r.artist_name.lower())
+        return None
+
+    def _resolve_popularity(r) -> float | None:
+        """Track-level popularity only — no artist fallback.
+        Returns None if enrichment hasn't run yet for this track.
+        Callers can check artist_popularity separately for context.
+        """
+        return _resolve_track_popularity(r)
+
     return {
         "total": total,
         "page": page,
@@ -143,9 +243,10 @@ def get_tracks(
                 "album_name":        r.album_name,
                 "genre":             r.genre,
                 "play_count":        r.play_count,
-                "last_played":       r.last_played,
+                "last_played":       r.last_played.isoformat() if r.last_played else None,
                 "is_played":         r.is_played,
                 "is_favorite":       r.is_favorite,
+                # Score components
                 "final_score":       float(r.final_score),
                 "play_score":        float(r.play_score),
                 "recency_score":     float(r.recency_score),
@@ -153,18 +254,28 @@ def get_tracks(
                 "genre_affinity":    float(r.genre_affinity),
                 "skip_penalty":      float(r.skip_penalty),
                 "novelty_bonus":     float(r.novelty_bonus),
+                # Popularity — track-level (song-specific Last.fm listeners)
+                # and artist-level (from popularity cache) kept separate so the
+                # UI can show which source was used and avoid confusing the two.
+                "track_popularity":       _resolve_track_popularity(r),
+                "artist_popularity":      _resolve_artist_popularity(r),
+                "global_popularity":      _resolve_popularity(r),   # best available (back-compat)
+                "track_listeners":        te_listeners_map.get(r.jellyfin_item_id),
+                "track_playcount":        te_playcount_map.get(r.jellyfin_item_id),
+                # Replay signal
+                "replay_boost":      round(r.replay_boost or 0.0, 2),
+                # Skip / cooldown signals
+                "skip_streak":       r.skip_streak or 0,
+                "cooldown_until":    r.cooldown_until.isoformat() if r.cooldown_until else None,
+                "on_cooldown":       bool(r.cooldown_until and r.cooldown_until > now),
+                # Live skip events (from SkipPenalty)
                 "skip_count": skip_map[r.jellyfin_item_id].skip_count
                     if r.jellyfin_item_id in skip_map else 0,
                 "total_events": skip_map[r.jellyfin_item_id].total_events
                     if r.jellyfin_item_id in skip_map else 0,
                 "skip_rate": float(skip_map[r.jellyfin_item_id].skip_rate)
                     if r.jellyfin_item_id in skip_map else 0.0,
-                # v2 fields
-                "skip_streak":       r.skip_streak or 0,
-                "replay_boost":      round(r.replay_boost or 0.0, 2),
-                "global_popularity": r.global_popularity,
-                "cooldown_until":    r.cooldown_until.isoformat() if r.cooldown_until else None,
-                "on_cooldown":       bool(r.cooldown_until and r.cooldown_until > now),
+                # Holiday
                 "holiday_tag":       getattr(r, "holiday_tag", None),
                 "holiday_exclude":   bool(getattr(r, "holiday_exclude", False)),
             }
@@ -209,7 +320,7 @@ def get_artists(
         for r in live_skips_q
     }
 
-    # Load enrichment data
+    # Load enrichment data (ArtistEnrichment)
     try:
         from models import ArtistEnrichment
         import json as _json
@@ -231,12 +342,21 @@ def get_artists(
             reverse=(order == "desc")
         )
         rows = all_rows[(page - 1) * page_size: page * page_size]
+    elif sort_by == "popularity_score":
+        # popularity lives in ArtistEnrichment — sort in Python
+        total = q.count()
+        all_rows = q.order_by(satext("CAST(affinity_score AS REAL) DESC")).all()
+        all_rows.sort(
+            key=lambda r: (enc_map.get(r.artist_name.lower()) and enc_map[r.artist_name.lower()].popularity_score) or 0.0,
+            reverse=(order == "desc")
+        )
+        rows = all_rows[(page - 1) * page_size: page * page_size]
     else:
         sql_map = {
             "affinity_score": "CAST(affinity_score AS REAL)",
             "total_plays":    "total_plays",
             "artist_name":    "artist_name",
-            "replay_boost":   "replay_boost",   # v2
+            "replay_boost":   "replay_boost",
         }
         raw = sql_map.get(sort_by, "CAST(affinity_score AS REAL)")
         q = q.order_by(_aord(raw))
@@ -244,6 +364,23 @@ def get_artists(
         rows = q.offset((page - 1) * page_size).limit(page_size).all()
 
     import json as _json
+
+    def _parse_related(raw):
+        """Return list of {name, match} dicts regardless of stored format."""
+        if not raw:
+            return []
+        try:
+            parsed = _json.loads(raw)
+            if not parsed:
+                return []
+            # Already list of dicts
+            if isinstance(parsed[0], dict):
+                return [{"name": item.get("name", ""), "match": item.get("match")} for item in parsed[:15]]
+            # List of strings
+            return [{"name": str(item), "match": None} for item in parsed[:15]]
+        except Exception:
+            return []
+
     return {
         "total": total,
         "page": page,
@@ -251,24 +388,26 @@ def get_artists(
         "pages": max(1, (total + page_size - 1) // page_size),
         "artists": [
             {
-                "artist_name":       r.artist_name,
-                "affinity_score":    float(r.affinity_score),
-                "total_plays":       r.total_plays,
-                "total_tracks_played": r.total_tracks_played,
-                "total_skips":       live_skip_map.get(r.artist_name, {}).get("skip_count", 0),
-                "total_events":      live_skip_map.get(r.artist_name, {}).get("total_events", 0),
-                "skip_rate":         live_skip_map.get(r.artist_name, {}).get("skip_rate", 0.0),
-                "has_favorite":      r.has_favorite,
-                "primary_genre":     r.primary_genre,
-                # v2
-                "replay_boost":      round(r.replay_boost or 0.0, 2),
-                "related_artists":   _json.loads(r.related_artists)
-                    if r.related_artists else [],
-                "tags":              _json.loads(r.tags) if r.tags else [],
-                "popularity_score":  enc_map.get(r.artist_name.lower(), None) and
-                    enc_map[r.artist_name.lower()].popularity_score,
-                "trend_direction":   enc_map.get(r.artist_name.lower(), None) and
-                    enc_map[r.artist_name.lower()].trend_direction,
+                "artist_name":          r.artist_name,
+                "affinity_score":       float(r.affinity_score),
+                "total_plays":          r.total_plays,
+                "total_tracks_played":  r.total_tracks_played,
+                "total_skips":          live_skip_map.get(r.artist_name, {}).get("skip_count", 0),
+                "total_events":         live_skip_map.get(r.artist_name, {}).get("total_events", 0),
+                "skip_rate":            live_skip_map.get(r.artist_name, {}).get("skip_rate", 0.0),
+                "has_favorite":         r.has_favorite,
+                "primary_genre":        r.primary_genre,
+                # Replay signal
+                "replay_boost":         round(r.replay_boost or 0.0, 2),
+                # Enrichment
+                "related_artists":      _parse_related(r.related_artists),
+                "tags":                 _json.loads(r.tags) if r.tags else [],
+                "popularity_score":     (enc_map.get(r.artist_name.lower()) and
+                                         enc_map[r.artist_name.lower()].popularity_score),
+                "trend_direction":      (enc_map.get(r.artist_name.lower()) and
+                                         enc_map[r.artist_name.lower()].trend_direction),
+                "global_listeners":     (enc_map.get(r.artist_name.lower()) and
+                                         enc_map[r.artist_name.lower()].global_listeners),
             }
             for r in rows
         ],
@@ -376,7 +515,7 @@ def get_replay_signals(
 
 @router.get("/enrichment/status")
 def get_enrichment_status(db: Session = Depends(get_db)):
-    """Library-wide enrichment progress — useful for checking how much has been indexed."""
+    """Library-wide enrichment progress."""
     from models import LibraryTrack, TrackEnrichment, ArtistEnrichment, ArtistRelation
     from datetime import datetime
 
@@ -385,7 +524,6 @@ def get_enrichment_status(db: Session = Depends(get_db)):
     enriched_artists = db.query(ArtistEnrichment).count()
     total_relations = db.query(ArtistRelation).count()
 
-    # Most recently enriched
     latest_track = (
         db.query(TrackEnrichment)
         .order_by(TrackEnrichment.enriched_at.desc())
@@ -397,7 +535,6 @@ def get_enrichment_status(db: Session = Depends(get_db)):
         .first()
     )
 
-    # Next enrichment time from AutomationSettings
     from models import AutomationSettings
     settings = db.query(AutomationSettings).first()
     next_run = None
@@ -490,7 +627,6 @@ def get_summary(
         func.sum(SkipPenalty.skip_count)
     ).filter_by(user_id=uid).scalar() or 0
 
-    # v2: cooldown counts
     now = datetime.utcnow()
     try:
         from models import TrackCooldown
@@ -504,7 +640,6 @@ def get_summary(
         active_cooldowns = 0
         permanent_dislikes = 0
 
-    # v2: replay signal count
     try:
         from models import UserReplaySignal
         from datetime import timedelta
@@ -546,7 +681,6 @@ def get_summary(
             "tracks_with_events": total_skip_events,
             "total_skips_recorded": int(total_skips_recorded),
         },
-        # v2
         "cooldowns": {
             "active": active_cooldowns,
             "permanent_dislikes": permanent_dislikes,
@@ -559,11 +693,6 @@ def get_summary(
 
 @router.get("/holiday")
 def get_holiday_summary(db: Session = Depends(get_db)):
-    """
-    v4: Holiday detection summary.
-    Returns per-holiday track counts, season windows, and the full tagged
-    track list so the UI can show exactly which songs were identified.
-    """
     from models import LibraryTrack
     from services.holiday import is_in_season, HOLIDAY_RULES
     from datetime import date
@@ -617,15 +746,9 @@ def holiday_debug(
     username: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    v4: Holiday filter diagnostic endpoint.
-    Checks every layer of the holiday pipeline so you can see exactly where
-    things are breaking if holiday tracks are still appearing in playlists.
-    """
     from models import LibraryTrack
     from sqlalchemy import text, and_, func
 
-    # ── 1. LibraryTrack holiday counts ────────────────────────────────────────
     lt_total   = db.query(LibraryTrack).filter(LibraryTrack.missing_since.is_(None)).count()
     lt_tagged  = db.query(LibraryTrack).filter(
         LibraryTrack.holiday_tag.isnot(None),
@@ -642,31 +765,26 @@ def holiday_debug(
         LibraryTrack.missing_since.is_(None),
     ).count()
 
-    # ── 2. TrackScore holiday counts (any user) ───────────────────────────────
     ts_total    = db.query(TrackScore).count()
     ts_tagged   = db.query(TrackScore).filter(TrackScore.holiday_tag.isnot(None)).count()
     ts_excluded = db.query(TrackScore).filter(
         TrackScore.holiday_tag.isnot(None),
         TrackScore.holiday_exclude == True,
     ).count()
-    ts_null_tag = db.query(TrackScore).filter(
-        TrackScore.holiday_tag.is_(None),
-    ).count()
+    ts_null_tag = db.query(TrackScore).filter(TrackScore.holiday_tag.is_(None)).count()
     ts_null_exclude = db.query(TrackScore).filter(
         TrackScore.holiday_tag.isnot(None),
         TrackScore.holiday_exclude.is_(None),
     ).count()
 
-    # ── 3. Check column existence via raw SQL ─────────────────────────────────
     col_check = {}
     for table in ["library_tracks", "track_scores"]:
         try:
-            result = db.execute(text(f"SELECT holiday_tag, holiday_exclude FROM {table} LIMIT 1")).fetchall()
+            db.execute(text(f"SELECT holiday_tag, holiday_exclude FROM {table} LIMIT 1")).fetchall()
             col_check[table] = "columns exist"
         except Exception as e:
             col_check[table] = f"ERROR: {e}"
 
-    # ── 4. Sample mismatched tracks (tagged in LT but not in TS) ─────────────
     lt_christmas = db.query(LibraryTrack.jellyfin_item_id).filter(
         LibraryTrack.holiday_tag == "christmas",
         LibraryTrack.holiday_exclude == True,
@@ -684,7 +802,6 @@ def holiday_debug(
             "ts_holiday_exclude": ts_row.holiday_exclude if ts_row else "NO ROW",
         })
 
-    # ── 5. Artist-specific check ──────────────────────────────────────────────
     artist_sample = []
     if sample_artist:
         lt_rows = db.query(LibraryTrack).filter(
@@ -707,7 +824,6 @@ def holiday_debug(
                 ),
             })
 
-    # ── 6. User-specific: how many holiday tracks pass the filter ─────────────
     user_check = None
     if user_id or username:
         try:
@@ -720,14 +836,6 @@ def holiday_debug(
                 TrackScore.holiday_tag.isnot(None),
                 TrackScore.holiday_exclude == True,
             ).count()
-
-            # Simulate _holiday_ok filter
-            from sqlalchemy import and_ as _and_
-            passing_holiday = db.query(TrackScore).filter_by(user_id=uid).filter(
-                TrackScore.holiday_tag.isnot(None),
-                TrackScore.holiday_exclude == True,
-            ).count()
-            # These should be blocked — if > 0, filter is broken
             leaking = db.query(TrackScore).filter_by(user_id=uid).filter(
                 TrackScore.holiday_tag.isnot(None),
                 TrackScore.holiday_exclude == True,
@@ -761,7 +869,7 @@ def holiday_debug(
             "tagged_but_null_exclude": lt_null_exclude,
             "diagnosis": (
                 "OK" if lt_null_exclude == 0
-                else f"PROBLEM: {lt_null_exclude} tracks have a holiday_tag but holiday_exclude=NULL — tag_library() may have failed"
+                else f"PROBLEM: {lt_null_exclude} tracks have a holiday_tag but holiday_exclude=NULL"
             ),
         },
         "track_scores": {
@@ -787,3 +895,81 @@ def holiday_debug(
         },
     }
 
+
+@router.get("/debug/jellyfin-track")
+async def debug_jellyfin_track(
+    track_name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Fetch raw Jellyfin metadata for a track by name so you can see exactly
+    what fields Jellyfin is returning (AlbumArtist, Artists, etc.).
+    Usage: /api/debug/jellyfin-track?track_name=Castle+on+the+Hill
+    """
+    import httpx
+    from models import ConnectionSettings, ManagedUser, LibraryTrack
+    from crypto import decrypt
+
+    conn = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+    if not conn or not conn.base_url:
+        return {"error": "Jellyfin not configured"}
+
+    base_url = conn.base_url.rstrip("/")
+    api_key  = decrypt(conn.api_key_encrypted)
+    headers  = {"X-Emby-Token": api_key}
+
+    # Also show what's in the local DB for this track
+    db_rows = (
+        db.query(LibraryTrack)
+        .filter(LibraryTrack.track_name.ilike(f"%{track_name}%"))
+        .limit(5)
+        .all()
+    )
+    db_info = [
+        {
+            "track_name":    r.track_name,
+            "artist_name":   r.artist_name,
+            "album_name":    r.album_name,
+            "jellyfin_item_id": r.jellyfin_item_id,
+        }
+        for r in db_rows
+    ]
+
+    # Fetch live from Jellyfin with ALL fields including Artists
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{base_url}/Items",
+                headers=headers,
+                params={
+                    "IncludeItemTypes": "Audio",
+                    "Recursive": "true",
+                    "SearchTerm": track_name,
+                    "Fields": "DateCreated,Genres,UserData,AlbumArtist,Artists,Album,ParentId,MediaSources",
+                    "Limit": 5,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return {"error": str(e), "db_rows": db_info}
+
+    items = data.get("Items", [])
+    simplified = [
+        {
+            "Name":        item.get("Name"),
+            "Album":       item.get("Album"),
+            "AlbumArtist": item.get("AlbumArtist"),
+            "Artists":     item.get("Artists"),
+            "AlbumArtists": item.get("AlbumArtists"),
+            "Id":          item.get("Id"),
+            # Raw keys present — helps spot unexpected field names
+            "all_keys":    sorted(item.keys()),
+        }
+        for item in items
+    ]
+
+    return {
+        "db_rows":       db_info,
+        "jellyfin_live": simplified,
+    }

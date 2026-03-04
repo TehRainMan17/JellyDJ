@@ -72,6 +72,15 @@ FAVORITE_ARTIST_BOOST = 15.0
 # 90+ favourites purely from one enthusiastic week of replaying.
 REPLAY_BOOST_CAP      = 12.0
 
+# v3: song-level popularity influence on final_score.
+# For PLAYED tracks: small nudge — your listening behaviour already captured
+# quality, so this just breaks ties toward globally loved tracks. Max +5 pts.
+# For UNPLAYED tracks: stronger weight — it's the only external quality signal
+# for a song you've never heard, so it meaningfully influences surfacing.
+# A song with 80/100 popularity gets the full bonus; 0/100 gets nothing.
+POPULARITY_PLAYED_MAX   = 5.0   # max pts added for a played track
+POPULARITY_UNPLAYED_MAX = 10.0  # max pts added for an unplayed track
+
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -441,6 +450,11 @@ def rebuild_track_scores(
             # v2: add replay boost (additive, capped)
             final = round(min(99.0, final + replay_boost), 2)
 
+            # v3: song popularity nudge — small tie-breaker for played tracks
+            if global_pop is not None:
+                pop_nudge = round((global_pop / 100.0) * POPULARITY_PLAYED_MAX, 2)
+                final = round(min(99.0, final + pop_nudge), 2)
+
             # v2: permanent dislike — score capped at 20 so it essentially
             # never surfaces in any playlist
             if is_permanent_dislike:
@@ -493,6 +507,13 @@ def rebuild_track_scores(
             # heard a track in a playlist, sought out more by the artist (artist_return
             # signal fires), and we haven't fully indexed that track as played yet
             final = round(min(UNPLAYED_CAP, final + replay_boost), 2)
+
+            # v3: song popularity is the primary external quality signal for
+            # unplayed tracks — it's the best available hint that a song is
+            # worth surfacing before the user has formed an opinion on it.
+            if global_pop is not None:
+                pop_nudge = round((global_pop / 100.0) * POPULARITY_UNPLAYED_MAX, 2)
+                final = round(min(UNPLAYED_CAP, final + pop_nudge), 2)
 
             if is_permanent_dislike:
                 final = min(final, 20.0)

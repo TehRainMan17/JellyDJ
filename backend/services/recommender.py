@@ -1,4 +1,3 @@
-
 """
 JellyDJ Recommendation Engine — Module 5
 
@@ -171,20 +170,41 @@ def _fetch_all_library_tracks(db: Session, user_id: str) -> list:
 
 def _get_popularity(artist: str, db: Session) -> float:
     """
-    Pull cached popularity score for an artist (0–100, normalised to 0–1).
-    Doesn't trigger live API calls — uses only what's already cached.
+    Pull cached artist-level popularity score (0–100, normalised to 0–1).
+    Used as fallback when no track-level enrichment exists.
     """
     from models import PopularityCache
     import json
     key = f"artist:{artist.lower()}"
     row = db.query(PopularityCache).filter_by(cache_key=key).first()
     if not row:
-        return 0.5   # neutral fallback when no cache data
+        return 0.5
     try:
         data = json.loads(row.payload)
         return min(1.0, float(data.get("popularity_score", 50)) / 100.0)
     except Exception:
         return 0.5
+
+
+def _get_track_popularity(jellyfin_item_id: str, artist: str, db: Session) -> float:
+    """
+    Per-track popularity score (0–1), sourced from TrackEnrichment.
+
+    Uses the actual Last.fm listener count for this specific song — so
+    'Creep' by Radiohead scores far higher than an obscure B-side by the
+    same artist, even though _get_popularity() would give them equal scores.
+
+    Falls back to artist-level PopularityCache if no track enrichment exists
+    (e.g. enrichment hasn't run yet, or the track wasn't found on Last.fm).
+    """
+    from models import TrackEnrichment
+    row = db.query(TrackEnrichment).filter_by(
+        jellyfin_item_id=jellyfin_item_id
+    ).first()
+    if row and row.popularity_score is not None:
+        return min(1.0, float(row.popularity_score) / 100.0)
+    # Fallback: artist-level score — better than nothing
+    return _get_popularity(artist, db)
 
 
 def _get_skip_penalty(jellyfin_item_id: str, user_id: str, db: Session) -> float:
@@ -230,6 +250,19 @@ def recommend_library_tracks(
         log.warning(f"No tracks indexed for user {user_id}")
         return []
 
+    # Bulk-load all TrackEnrichment popularity scores in one query to avoid
+    # N+1 DB calls (one per track) inside the scoring loop.
+    # Falls back to artist-level PopularityCache for any un-enriched tracks.
+    from models import TrackEnrichment
+    track_ids = [t.jellyfin_item_id for t in tracks]
+    enrichment_scores: dict[str, float] = {}
+    for row in db.query(
+        TrackEnrichment.jellyfin_item_id,
+        TrackEnrichment.popularity_score
+    ).filter(TrackEnrichment.jellyfin_item_id.in_(track_ids)).all():
+        if row.popularity_score is not None:
+            enrichment_scores[row.jellyfin_item_id] = min(1.0, float(row.popularity_score) / 100.0)
+
     now = datetime.utcnow()
     results: list[TrackResult] = []
 
@@ -239,8 +272,14 @@ def recommend_library_tracks(
         g_score = genre_aff.get(t.genre.lower(), 0.0)
         affinity = max(a_score, g_score * 0.7)
 
-        # ── Popularity component ──────────────────────────────────────────
-        popularity = _get_popularity(t.artist_name, db)
+        # ── Popularity component — per-track from bulk-loaded enrichment ──
+        # Uses actual Last.fm listener count for this specific song so that
+        # popular hits score higher than B-sides from the same artist.
+        # Falls back to artist-level cache for un-enriched tracks.
+        if t.jellyfin_item_id in enrichment_scores:
+            popularity = enrichment_scores[t.jellyfin_item_id]
+        else:
+            popularity = _get_popularity(t.artist_name, db)
 
         # ── Recency inverse ───────────────────────────────────────────────
         recency_inv = _recency_score(t.last_played)
@@ -339,25 +378,82 @@ def recommend_library_tracks(
     return combined[:limit]
 
 
-def _get_top_album_from_cache(artist_name: str, db) -> tuple[str, Optional[int], Optional[str]]:
+def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int], Optional[str]]:
     """
-    Look up the most popular album for an artist from the popularity cache.
+    Return the album most worth recommending for a given artist.
+
+    Priority order:
+      1. Album containing the artist's most-listened-to track (from ArtistEnrichment.top_tracks).
+         This is "the album with their biggest hit" — the most accurate signal for
+         which album a new listener should start with.
+      2. PopularityCache "top_album" key (artist.getTopAlbums #1 non-compilation).
+         This is "album with most total plays" — still good, just less precise.
+      3. Empty — caller handles gracefully.
+
     Returns (album_name, release_year, image_url).
-    Falls back to empty strings if not cached.
     """
-    from models import PopularityCache
     import json
-    # Check for a cached top-album key first
+    from models import ArtistEnrichment, PopularityCache
+
+    # ── Priority 1: album of the most-listened track ──────────────────────────
+    ae = db.query(ArtistEnrichment).filter_by(
+        artist_name_lower=artist_name.lower()
+    ).first()
+    if ae and ae.top_tracks:
+        try:
+            tracks = json.loads(ae.top_tracks)
+            # Find the track with an album resolved AND the highest listener count
+            tracks_with_album = [t for t in tracks if t.get("album")]
+            if tracks_with_album:
+                best = max(tracks_with_album, key=lambda t: t.get("listeners", 0))
+                album_name = best["album"]
+                # Skip obvious compilations
+                skip = ["greatest hits", "best of", "collection", "essential",
+                        "platinum", "gold", "anthology", "singles", "ultimate"]
+                if not any(w in album_name.lower() for w in skip):
+                    # Try to get image from PopularityCache discography
+                    image_url = _get_album_image(artist_name, album_name, db)
+                    return album_name, None, image_url
+        except Exception:
+            pass
+
+    # ── Priority 2: top_album from popularity cache ───────────────────────────
     key = f"top_album:{artist_name.lower()}"
     row = db.query(PopularityCache).filter_by(cache_key=key).first()
     if row:
         try:
             d = json.loads(row.payload)
-            # Last.fm adapter stores the album name under "name", not "album"
-            return d.get("name") or d.get("album", ""), d.get("year"), d.get("image_url")
+            name = d.get("name") or d.get("album", "")
+            return name, d.get("year"), d.get("image_url")
         except Exception:
             pass
+
     return "", None, None
+
+
+def _get_album_image(artist_name: str, album_name: str, db) -> Optional[str]:
+    """Try to find an image URL for a specific album from the discography cache."""
+    import json
+    from models import PopularityCache
+    try:
+        key = f"discography:{artist_name.lower()}"
+        row = db.query(PopularityCache).filter_by(cache_key=key).first()
+        if row:
+            albums = json.loads(row.payload).get("albums", [])
+            for alb in albums:
+                if alb.get("name", "").lower() == album_name.lower():
+                    return alb.get("image_url")
+    except Exception:
+        pass
+    # Fall back to artist image from ArtistEnrichment
+    from models import ArtistEnrichment
+    ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist_name.lower()).first()
+    return ae.image_url if ae else None
+
+
+# Keep old name as alias so any other callers don't break
+def _get_top_album_from_cache(artist_name: str, db) -> tuple[str, Optional[int], Optional[str]]:
+    return _get_best_album_for_artist(artist_name, db)
 
 
 def recommend_new_albums(
@@ -696,9 +792,47 @@ def recommend_new_albums(
             use_image = album_image or image_url
 
             genre_hint = f" ({', '.join(tags[:2])})" if tags else ""
+
+            # Pull top tracks from ArtistEnrichment for the "why" text —
+            # this tells the user what the best-known songs by this artist are
+            # so they know what they're getting before they download the album.
+            top_track_names = []
+            try:
+                from models import ArtistEnrichment
+                ae = db.query(ArtistEnrichment).filter_by(
+                    artist_name_lower=similar.lower()
+                ).first()
+                if ae and ae.top_tracks:
+                    import json as _json
+                    tt = _json.loads(ae.top_tracks)
+                    top_track_names = [t["name"] for t in tt[:3] if t.get("name")]
+            except Exception:
+                pass
+
+            # Find the specific hit track that this album was chosen for
+            top_hit = ""
+            try:
+                if ae and ae.top_tracks:
+                    import json as _json2
+                    tt2 = _json2.loads(ae.top_tracks)
+                    # If album_name is set, find the track from that album
+                    if album_name:
+                        for t in tt2:
+                            if t.get("album", "").lower() == album_name.lower():
+                                top_hit = t["name"]
+                                break
+                    # Fallback: just the overall #1 track
+                    if not top_hit and tt2:
+                        top_hit = tt2[0].get("name", "")
+            except Exception:
+                pass
+
+            known_for = (f" Known for: {', '.join(top_track_names)}." if top_track_names else "")
+            hit_note  = (f" Start with '{top_hit}'." if top_hit else "")
             why = (
-                f"Similar to {seed_name}{genre_hint}, an artist you love. "
-                f"{'Album: ' + album_name + '. ' if album_name else ''}"
+                f"Similar to {seed_name}{genre_hint}, an artist you love.{known_for}"
+                f"{hit_note} "
+                f"{'Recommended album: ' + album_name + '. ' if album_name else ''}"
                 f"Popularity: {pop_score:.0f}/100."
             )
 
@@ -768,9 +902,40 @@ def recommend_new_albums(
             use_image_g = album_image_g or image_url_g
             genre_hint_g = f" ({', '.join(tags[:2])})" if tags else ""
 
+            top_track_names_g = []
+            try:
+                from models import ArtistEnrichment
+                ae_g = db.query(ArtistEnrichment).filter_by(
+                    artist_name_lower=artist_name_g.lower()
+                ).first()
+                if ae_g and ae_g.top_tracks:
+                    import json as _json
+                    tt_g = _json.loads(ae_g.top_tracks)
+                    top_track_names_g = [t["name"] for t in tt_g[:3] if t.get("name")]
+            except Exception:
+                pass
+
+            top_hit_g = ""
+            try:
+                if ae_g and ae_g.top_tracks:
+                    import json as _json3
+                    tt3 = _json3.loads(ae_g.top_tracks)
+                    if album_name_g:
+                        for t in tt3:
+                            if t.get("album", "").lower() == album_name_g.lower():
+                                top_hit_g = t["name"]
+                                break
+                    if not top_hit_g and tt3:
+                        top_hit_g = tt3[0].get("name", "")
+            except Exception:
+                pass
+
+            known_for_g = (f" Known for: {', '.join(top_track_names_g)}." if top_track_names_g else "")
+            hit_note_g  = (f" Start with '{top_hit_g}'." if top_hit_g else "")
             why_g = (
-                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score. "
-                f"{'Album: ' + album_name_g + '. ' if album_name_g else ''}"
+                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score."
+                f"{known_for_g}{hit_note_g} "
+                f"{'Recommended album: ' + album_name_g + '. ' if album_name_g else ''}"
                 f"Not yet in your library."
             )
 

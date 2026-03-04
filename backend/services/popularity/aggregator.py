@@ -1,4 +1,3 @@
-
 """
 PopularityAggregator — unified interface over all adapters.
 Results are cached in SQLite for 24 hours to avoid hammering external APIs.
@@ -211,7 +210,11 @@ class PopularityAggregator:
         for r in results:
             if r.listeners and r.listeners > 0:
                 import math
-                s = min(100.0, (math.log1p(r.listeners) / math.log1p(10_000_000)) * 100)
+                # Linear-in-log-space: floor=1K listeners → 0, ceiling=10M → 100
+                log_l = math.log(max(r.listeners, 1))
+                s = min(100.0, max(0.0,
+                    (log_l - math.log(1_000)) / (math.log(10_000_000) - math.log(1_000)) * 100
+                ))
                 scores.append(s)
         pop = sum(scores) / len(scores) if scores else 0.0
 
