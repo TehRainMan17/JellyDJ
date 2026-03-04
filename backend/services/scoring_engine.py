@@ -1,27 +1,48 @@
-"""
-JellyDJ Scoring Engine — v2
 
-Changes from v1:
+"""
+JellyDJ Scoring Engine — v5
+
+Changes from v4:
+  Scoring normalisation overhaul to fix top-tier compression.
+
+  After popularity enrichment was improved, many tracks started scoring 93-99
+  because additive bonuses (popularity +5, replay +12, favorite +6) stacked on
+  top of a raw score that was already near-ceilinged by the old constants:
+
+    - SCORE_RESCALE_MAX was 91: any raw_base ≥ 91 clamped to compressed=100
+      before bonuses, collapsing all high-scoring tracks to a flat ceiling.
+    - COMPRESSION_EXP was 0.75: too aggressive — pulled moderate scores toward
+      the top and compressed the gap between "good" and "great".
+    - Popularity and replay bonuses were flat-additive, so a 93 + 5 pop = 98
+      regardless of how little headroom was left.
+
+  v5 fixes:
+    1. SCORE_RESCALE_MAX raised 91 → 100: eliminates the premature ceiling so
+       the full raw_base range (0–100) maps cleanly to the compressed range.
+    2. COMPRESSION_EXP raised 0.75 → 0.85: closer to linear in the upper range,
+       giving meaningful point-gap between "frequently played" and "top track".
+    3. Popularity and replay bonuses are now proportional: each bonus is scaled
+       by the remaining headroom (1 - score/99) so a track at 90 receives less
+       absolute benefit than a track at 70. This prevents stacking bonuses from
+       pushing large swaths of the catalogue to 98-99.
+
+  Resulting tiers (approximate, no bonuses):
+    38–45  barely liked
+    46–62  occasionally played
+    63–76  regularly played
+    77–86  frequently played
+    87–94  heavily played / top-affinity artist
+    95–99  favorites or max-played top-artist tracks (requires stacking)
+
+Changes from v3 (kept from v4):
   Phase 1 (ArtistProfile): now pulls replay_boost from UserReplaySignal and
     stamps it onto ArtistProfile.replay_boost. Also copies related_artists and
     tags from ArtistEnrichment for use by Discover Weekly.
 
   Phase 2 (GenreProfile): unchanged logic, kept for compatibility.
 
-  Phase 3 (TrackScore): now factors in:
-    - replay_boost  (per-track and per-artist voluntary replay signal)
-    - global_popularity  (from TrackEnrichment, used by Discover Weekly sort)
-    - cooldown_until  (from TrackCooldown — stamped here so playlist queries
-      can filter with a simple WHERE cooldown_until IS NULL OR cooldown_until < now)
-    - skip_streak  (from SkipPenalty.consecutive_skips — denormalised for display)
-
-Scoring philosophy (unchanged):
-  - Played tracks: play frequency + recency + skip penalty + artist/genre pull
-  - Unplayed tracks: neutral base + artist/genre affinity (capped below played max)
-  - Skip-heavy artists get suppressed even on unplayed tracks
-  - Favorites get a meaningful but not dominant bonus
-  - Replay boost is additive on top of final score, capped so it can't
-    vault a mediocre track above genuine favourites
+  Phase 3 (TrackScore): factors in replay_boost, global_popularity,
+    cooldown_until, skip_streak (all unchanged from v4).
 """
 from __future__ import annotations
 
@@ -48,8 +69,14 @@ W_ARTIST    = 0.20
 W_GENRE     = 0.10
 
 AFFINITY_SCALE        = 0.70
-SCORE_RESCALE_MAX     = 91.0
-COMPRESSION_EXP       = 0.75
+# v5: raised from 91→100 so raw scores are no longer pre-clamped before compression.
+# The old value of 91 meant any raw_base ≥ 91 all mapped to compressed=100 before
+# bonuses were added, collapsing the top tier into a flat ceiling.
+SCORE_RESCALE_MAX     = 100.0
+# v5: raised from 0.75→0.85 (closer to linear) for more spread in the 70-95 range.
+# 0.75 was too aggressive — it pulled moderate scores up toward the ceiling and
+# compressed the distance between "good" and "great" tracks.
+COMPRESSION_EXP       = 0.85
 
 UNPLAYED_BASE         = 35.0
 UNPLAYED_ARTIST_W     = 0.20
@@ -72,14 +99,13 @@ FAVORITE_ARTIST_BOOST = 15.0
 # 90+ favourites purely from one enthusiastic week of replaying.
 REPLAY_BOOST_CAP      = 12.0
 
-# v3: song-level popularity influence on final_score.
-# For PLAYED tracks: small nudge — your listening behaviour already captured
-# quality, so this just breaks ties toward globally loved tracks. Max +5 pts.
-# For UNPLAYED tracks: stronger weight — it's the only external quality signal
-# for a song you've never heard, so it meaningfully influences surfacing.
-# A song with 80/100 popularity gets the full bonus; 0/100 gets nothing.
-POPULARITY_PLAYED_MAX   = 5.0   # max pts added for a played track
-POPULARITY_UNPLAYED_MAX = 10.0  # max pts added for an unplayed track
+# v5: popularity bonuses are now applied proportionally (scaled by remaining headroom)
+# so that already-high-scoring tracks receive a smaller absolute nudge than
+# lower-scoring tracks. A flat +5 / +10 was enough to vault a 90→99 or 93→99 when
+# stacked with replay and favorite bonuses.
+# These values are the *maximum* bonus at maximum popularity with full headroom.
+POPULARITY_PLAYED_MAX   = 5.0   # max pts for a played track (at pop=100, score=0)
+POPULARITY_UNPLAYED_MAX = 10.0  # max pts for an unplayed track
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -448,11 +474,18 @@ def rebuild_track_scores(
                 final = max(final, FAVORITE_FLOOR)
 
             # v2: add replay boost (additive, capped)
-            final = round(min(99.0, final + replay_boost), 2)
+            # v5: scale by remaining headroom so high-scoring tracks receive a
+            # smaller absolute bump — prevents stacking from vaulting 93→99.
+            if replay_boost > 0:
+                headroom = max(0.0, (99.0 - final) / 99.0)
+                effective_replay = replay_boost * (0.4 + 0.6 * headroom)
+                final = round(min(99.0, final + effective_replay), 2)
 
-            # v3: song popularity nudge — small tie-breaker for played tracks
+            # v3: song popularity nudge — tie-breaker for played tracks
+            # v5: proportional — high-scoring tracks get less benefit
             if global_pop is not None:
-                pop_nudge = round((global_pop / 100.0) * POPULARITY_PLAYED_MAX, 2)
+                headroom = max(0.0, (99.0 - final) / 99.0)
+                pop_nudge = round((global_pop / 100.0) * POPULARITY_PLAYED_MAX * (0.5 + 0.5 * headroom), 2)
                 final = round(min(99.0, final + pop_nudge), 2)
 
             # v2: permanent dislike — score capped at 20 so it essentially
@@ -505,14 +538,19 @@ def rebuild_track_scores(
 
             # v2: replay boost applies to unplayed tracks too — user might have
             # heard a track in a playlist, sought out more by the artist (artist_return
-            # signal fires), and we haven't fully indexed that track as played yet
-            final = round(min(UNPLAYED_CAP, final + replay_boost), 2)
+            # signal fires), and we haven't fully indexed that track as played yet.
+            # v5: proportional — scales by remaining headroom below the unplayed cap.
+            if replay_boost > 0:
+                headroom = max(0.0, (UNPLAYED_CAP - final) / UNPLAYED_CAP)
+                effective_replay = replay_boost * (0.4 + 0.6 * headroom)
+                final = round(min(UNPLAYED_CAP, final + effective_replay), 2)
 
             # v3: song popularity is the primary external quality signal for
-            # unplayed tracks — it's the best available hint that a song is
-            # worth surfacing before the user has formed an opinion on it.
+            # unplayed tracks — best hint that a song is worth surfacing.
+            # v5: proportional within the unplayed cap.
             if global_pop is not None:
-                pop_nudge = round((global_pop / 100.0) * POPULARITY_UNPLAYED_MAX, 2)
+                headroom = max(0.0, (UNPLAYED_CAP - final) / UNPLAYED_CAP)
+                pop_nudge = round((global_pop / 100.0) * POPULARITY_UNPLAYED_MAX * (0.5 + 0.5 * headroom), 2)
                 final = round(min(UNPLAYED_CAP, final + pop_nudge), 2)
 
             if is_permanent_dislike:

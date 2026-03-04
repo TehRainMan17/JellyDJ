@@ -1,3 +1,4 @@
+
 """
 Discovery Queue router — Module 6
 
@@ -336,7 +337,7 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
 
     if lidarr_base_url:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 headers = {"X-Api-Key": lidarr_api_key}
 
                 # Get all artists Lidarr is monitoring
@@ -344,23 +345,31 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
                     f"{lidarr_base_url}/api/v1/artist", headers=headers
                 )
                 if artists_resp.status_code == 200:
-                    for a in artists_resp.json():
+                    artists = artists_resp.json()
+                    for a in artists:
                         lidarr_monitored_artists.add(a.get("artistName", "").lower())
                         artist_id = a.get("id")
                         if not artist_id:
                             continue
-                        # Get albums for each monitored artist
-                        alb_resp = await client.get(
-                            f"{lidarr_base_url}/api/v1/album",
-                            headers=headers,
-                            params={"artistId": artist_id},
-                        )
-                        if alb_resp.status_code == 200:
-                            for alb in alb_resp.json():
-                                aname = a.get("artistName", "").lower()
-                                albname = alb.get("title", "").lower()
-                                if aname and albname:
-                                    lidarr_monitored_albums.add(f"{aname}::{albname}")
+                        # Get albums for each monitored artist.
+                        # Use a short per-request timeout — if Lidarr is slow we'd
+                        # rather skip album-level dedup than hold the request open
+                        # long enough for nginx's proxy_read_timeout to fire.
+                        try:
+                            alb_resp = await client.get(
+                                f"{lidarr_base_url}/api/v1/album",
+                                headers=headers,
+                                params={"artistId": artist_id},
+                            )
+                            if alb_resp.status_code == 200:
+                                for alb in alb_resp.json():
+                                    aname = a.get("artistName", "").lower()
+                                    albname = alb.get("title", "").lower()
+                                    if aname and albname:
+                                        lidarr_monitored_albums.add(f"{aname}::{albname}")
+                        except httpx.TimeoutException:
+                            log.warning(f"  Lidarr album fetch timed out for artist_id={artist_id} — skipping")
+                            continue
 
             log.info(
                 f"  Lidarr: {len(lidarr_monitored_artists)} monitored artists, "
@@ -576,6 +585,7 @@ async def populate_queue(
     Runs synchronously so the client gets the real added count and can
     immediately refresh the list. Limit is always read from AutomationSettings.
     """
+    import traceback as _tb
     from models import AutomationSettings
     users = db.query(ManagedUser).filter_by(is_enabled=True).all()
     if not users:
@@ -586,16 +596,31 @@ async def populate_queue(
     log.info(f"Discovery populate: limit={effective_limit} (from AutomationSettings)")
 
     total_added = 0
+    errors = []
     for user in users:
         try:
             added = await _populate_queue_for_user(user.jellyfin_user_id, db, effective_limit)
             total_added += added
             log.info(f"Discovery queue: +{added} items for {user.username}")
         except Exception as e:
-            log.warning(f"Discovery populate failed for {user.username}: {e}")
+            # Log full traceback so the failure is visible in backend logs.
+            # Previously a bare log.warning(e) here swallowed the stack trace,
+            # making silent failures look identical to a timeout from the outside.
+            log.error(f"Discovery populate failed for {user.username}: {e}")
+            log.error(_tb.format_exc())
+            errors.append(user.username)
 
-    return {"ok": True, "added": total_added,
-            "message": f"Added {total_added} new recommendation(s)"}
+    if errors and not total_added:
+        # All users failed — surface this as a proper error response
+        # so the frontend shows something more useful than "Added 0 recommendations"
+        raise HTTPException(500, f"Discovery populate failed for: {', '.join(errors)}. Check backend logs.")
+
+    return {
+        "ok": True,
+        "added": total_added,
+        "message": f"Added {total_added} new recommendation(s)"
+        + (f" ({len(errors)} user(s) had errors — check logs)" if errors else ""),
+    }
 
 
 async def _populate_all_users(users, limit: int = 0):
@@ -604,6 +629,7 @@ async def _populate_all_users(users, limit: int = 0):
     Always reads the limit from AutomationSettings so the user's control is respected.
     The limit parameter is ignored — it exists only for backwards compatibility.
     """
+    import traceback as _tb
     from database import SessionLocal
     from models import AutomationSettings
     db = SessionLocal()
@@ -619,7 +645,8 @@ async def _populate_all_users(users, limit: int = 0):
                 )
                 log.info(f"Discovery queue: +{added} items for {user.username}")
             except Exception as e:
-                log.warning(f"Discovery populate failed for {user.username}: {e}")
+                log.error(f"Discovery populate failed for {user.username}: {type(e).__name__}: {e}")
+                log.error(_tb.format_exc())
     finally:
         db.close()
 
