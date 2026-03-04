@@ -1,3 +1,4 @@
+
 """
 PopularityAggregator — unified interface over all adapters.
 Results are cached in SQLite for 24 hours to avoid hammering external APIs.
@@ -64,15 +65,51 @@ class PopularityAggregator:
         return json.loads(row.payload)
 
     def _cache_set(self, db: Session, key: str, data: dict):
-        from models import PopularityCache
-        row = db.query(PopularityCache).filter_by(cache_key=key).first()
-        if not row:
-            row = PopularityCache(cache_key=key)
-            db.add(row)
-        row.payload = json.dumps(data)
-        row.expires_at = datetime.utcnow() + timedelta(hours=CACHE_TTL_HOURS)
-        row.updated_at = datetime.utcnow()
-        db.commit()
+        # Use a raw UPSERT rather than check-then-insert to eliminate the race
+        # condition that caused UNIQUE constraint failures in production.
+        #
+        # The popularity cache is written by _run_cache_refresh_sync which runs
+        # 5 concurrent ThreadPoolExecutor workers, all sharing the same thread_db
+        # Session. The old pattern was:
+        #   1. query for existing row  (no row found — worker A and worker B both see this)
+        #   2. create new PopularityCache(cache_key=key)
+        #   3. db.add(row)
+        #   4. db.commit()             (worker A commits id=2872)
+        #   5.                         (worker B also tries to commit id=2872 → UNIQUE fail)
+        #
+        # Worker B's failure then poisons the shared Session ("needs rollback"),
+        # causing every subsequent cache write in that refresh run to also fail
+        # with "This Session's transaction has been rolled back" — which is why
+        # you saw the same row (2872, 'artist:taylor swift feat. brendon urie')
+        # repeated dozens of times in the logs.
+        #
+        # INSERT OR REPLACE is atomic at the SQLite level: if the cache_key
+        # already exists it updates in-place; otherwise it inserts. No SELECT
+        # needed, no window for two workers to both decide "no row exists".
+        from sqlalchemy import text
+        now = datetime.utcnow()
+        expires = now + timedelta(hours=CACHE_TTL_HOURS)
+        try:
+            db.execute(
+                text(
+                    "INSERT INTO popularity_cache (cache_key, payload, expires_at, updated_at) "
+                    "VALUES (:key, :payload, :expires_at, :updated_at) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET "
+                    "payload=excluded.payload, "
+                    "expires_at=excluded.expires_at, "
+                    "updated_at=excluded.updated_at"
+                ),
+                {
+                    "key": key,
+                    "payload": json.dumps(data),
+                    "expires_at": expires,
+                    "updated_at": now,
+                },
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -320,16 +357,22 @@ class PopularityAggregator:
         results = adapter.get_tag_top_artists(tag, limit=limit)
         if db and results:
             # Cache for 48h — tag charts change slowly
-            from models import PopularityCache
-            from datetime import timedelta
-            row = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
-            if not row:
-                row = PopularityCache(cache_key=cache_key)
-                db.add(row)
-            row.payload = __import__("json").dumps({"artists": results})
-            row.expires_at = __import__("datetime").datetime.utcnow() + timedelta(hours=48)
-            row.updated_at = __import__("datetime").datetime.utcnow()
-            db.commit()
+            from sqlalchemy import text as _text
+            now = datetime.utcnow()
+            db.execute(
+                _text(
+                    "INSERT INTO popularity_cache (cache_key, payload, expires_at, updated_at) "
+                    "VALUES (:key, :payload, :expires_at, :updated_at) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET "
+                    "payload=excluded.payload, expires_at=excluded.expires_at, updated_at=excluded.updated_at"
+                ),
+                {"key": cache_key, "payload": __import__("json").dumps({"artists": results}),
+                 "expires_at": now + timedelta(hours=48), "updated_at": now},
+            )
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
         return results
 
     def get_similar_tags(self, tag: str, limit: int = 10, db: Optional[Session] = None) -> list[str]:
@@ -346,16 +389,22 @@ class PopularityAggregator:
 
         results = adapter.get_similar_tags(tag, limit=limit)
         if db and results:
-            from models import PopularityCache
-            from datetime import timedelta
-            row = db.query(PopularityCache).filter_by(cache_key=cache_key).first()
-            if not row:
-                row = PopularityCache(cache_key=cache_key)
-                db.add(row)
-            row.payload = __import__("json").dumps({"tags": results})
-            row.expires_at = __import__("datetime").datetime.utcnow() + timedelta(hours=72)
-            row.updated_at = __import__("datetime").datetime.utcnow()
-            db.commit()
+            from sqlalchemy import text as _text
+            now = datetime.utcnow()
+            db.execute(
+                _text(
+                    "INSERT INTO popularity_cache (cache_key, payload, expires_at, updated_at) "
+                    "VALUES (:key, :payload, :expires_at, :updated_at) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET "
+                    "payload=excluded.payload, expires_at=excluded.expires_at, updated_at=excluded.updated_at"
+                ),
+                {"key": cache_key, "payload": __import__("json").dumps({"tags": results}),
+                 "expires_at": now + timedelta(hours=72), "updated_at": now},
+            )
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
         return results
 
     def get_artist_top_album(self, artist_name: str, db: Optional[Session] = None) -> Optional[dict]:

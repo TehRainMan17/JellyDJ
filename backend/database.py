@@ -1,3 +1,4 @@
+
 """
 JellyDJ — SQLAlchemy database setup.
 
@@ -26,8 +27,33 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////config/jellydj.db")
 # This is safe here because SQLAlchemy manages connection pooling itself.
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    connect_args={
+        "check_same_thread": False,
+        # Without a timeout, concurrent writers (e.g. the 5-worker popularity
+        # cache refresh) immediately get "database is locked" on host-filesystem
+        # bind mounts. Named Docker volumes handle this more gracefully but
+        # bind mounts use strict OS file locking. 30 seconds gives all workers
+        # time to queue up and write sequentially rather than failing instantly.
+        "timeout": 30,
+    } if "sqlite" in DATABASE_URL else {},
 )
+
+# Enable WAL (Write-Ahead Logging) for SQLite.
+# Default journal mode is DELETE which serialises ALL readers and writers —
+# any write blocks every read until the transaction commits. WAL allows
+# concurrent reads while a write is in progress, and serialises multiple
+# writers gracefully via the timeout above instead of immediately erroring.
+# This is safe and recommended for any multi-threaded SQLite usage.
+# It's a no-op on non-SQLite databases.
+if "sqlite" in DATABASE_URL:
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, faster than FULL
+        cursor.close()
 
 # Session factory — use get_db() as a FastAPI dependency to get a session
 # that is automatically closed after the request completes.

@@ -337,7 +337,7 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
 
     if lidarr_base_url:
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 headers = {"X-Api-Key": lidarr_api_key}
 
                 # Get all artists Lidarr is monitoring
@@ -345,31 +345,23 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
                     f"{lidarr_base_url}/api/v1/artist", headers=headers
                 )
                 if artists_resp.status_code == 200:
-                    artists = artists_resp.json()
-                    for a in artists:
+                    for a in artists_resp.json():
                         lidarr_monitored_artists.add(a.get("artistName", "").lower())
                         artist_id = a.get("id")
                         if not artist_id:
                             continue
-                        # Get albums for each monitored artist.
-                        # Use a short per-request timeout — if Lidarr is slow we'd
-                        # rather skip album-level dedup than hold the request open
-                        # long enough for nginx's proxy_read_timeout to fire.
-                        try:
-                            alb_resp = await client.get(
-                                f"{lidarr_base_url}/api/v1/album",
-                                headers=headers,
-                                params={"artistId": artist_id},
-                            )
-                            if alb_resp.status_code == 200:
-                                for alb in alb_resp.json():
-                                    aname = a.get("artistName", "").lower()
-                                    albname = alb.get("title", "").lower()
-                                    if aname and albname:
-                                        lidarr_monitored_albums.add(f"{aname}::{albname}")
-                        except httpx.TimeoutException:
-                            log.warning(f"  Lidarr album fetch timed out for artist_id={artist_id} — skipping")
-                            continue
+                        # Get albums for each monitored artist
+                        alb_resp = await client.get(
+                            f"{lidarr_base_url}/api/v1/album",
+                            headers=headers,
+                            params={"artistId": artist_id},
+                        )
+                        if alb_resp.status_code == 200:
+                            for alb in alb_resp.json():
+                                aname = a.get("artistName", "").lower()
+                                albname = alb.get("title", "").lower()
+                                if aname and albname:
+                                    lidarr_monitored_albums.add(f"{aname}::{albname}")
 
             log.info(
                 f"  Lidarr: {len(lidarr_monitored_artists)} monitored artists, "
@@ -382,12 +374,28 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
     recs = recommend_new_albums(user_id, effective_limit * 4, db)
 
     # ── Step 5: Enforce discovery bias — 75% new artists, 25% known ──────────
-    # Split recs by type, then interleave with the target ratio.
-    new_artist_recs = [r for r in recs if r.rec_type != "missing_album"]
+    # Split recs by type, then build an oversized ordered pool before the
+    # Lidarr validation loop.
+    #
+    # BUG FIX: the old code built ordered with exactly effective_limit items
+    # (n_new = int(limit*0.75), n_known = limit - n_new). Each Lidarr
+    # validation call that rejects a rec has no fallback — the pool is
+    # exhausted and added stays below effective_limit. With a typical 30-40%
+    # Lidarr rejection rate and limit=5, you'd get 3 instead of 5 per user,
+    # producing ~7 total across 3 users instead of 15.
+    #
+    # Fix: build the pool at 3× effective_limit (same 75/25 ratio) so there
+    # are always enough candidates to absorb Lidarr rejections and still reach
+    # the target. The existing 'if added >= effective_limit: break' guard
+    # stops the loop at the right count.
+    _POOL_MULTIPLIER = 3
+    new_artist_recs  = [r for r in recs if r.rec_type != "missing_album"]
     known_artist_recs = [r for r in recs if r.rec_type == "missing_album"]
 
-    n_new   = min(len(new_artist_recs),   int(effective_limit * 0.75))
-    n_known = min(len(known_artist_recs), effective_limit - n_new)
+    pool_size = effective_limit * _POOL_MULTIPLIER
+    n_new   = min(len(new_artist_recs),   int(pool_size * 0.75))
+    n_known = min(len(known_artist_recs), pool_size - n_new)
+
     # Interleave: 3 new for every 1 known
     ordered: list = []
     ni, ki = 0, 0
@@ -402,7 +410,8 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
 
     log.info(
         f"  Rec mix: {n_new} new-artist / {n_known} known-artist "
-        f"(from {len(new_artist_recs)} / {len(known_artist_recs)} available)"
+        f"(pool={len(ordered)}, target={effective_limit}, "
+        f"from {len(new_artist_recs)} / {len(known_artist_recs)} available)"
     )
 
     added = 0
@@ -585,7 +594,6 @@ async def populate_queue(
     Runs synchronously so the client gets the real added count and can
     immediately refresh the list. Limit is always read from AutomationSettings.
     """
-    import traceback as _tb
     from models import AutomationSettings
     users = db.query(ManagedUser).filter_by(is_enabled=True).all()
     if not users:
@@ -596,31 +604,16 @@ async def populate_queue(
     log.info(f"Discovery populate: limit={effective_limit} (from AutomationSettings)")
 
     total_added = 0
-    errors = []
     for user in users:
         try:
             added = await _populate_queue_for_user(user.jellyfin_user_id, db, effective_limit)
             total_added += added
             log.info(f"Discovery queue: +{added} items for {user.username}")
         except Exception as e:
-            # Log full traceback so the failure is visible in backend logs.
-            # Previously a bare log.warning(e) here swallowed the stack trace,
-            # making silent failures look identical to a timeout from the outside.
-            log.error(f"Discovery populate failed for {user.username}: {e}")
-            log.error(_tb.format_exc())
-            errors.append(user.username)
+            log.warning(f"Discovery populate failed for {user.username}: {e}")
 
-    if errors and not total_added:
-        # All users failed — surface this as a proper error response
-        # so the frontend shows something more useful than "Added 0 recommendations"
-        raise HTTPException(500, f"Discovery populate failed for: {', '.join(errors)}. Check backend logs.")
-
-    return {
-        "ok": True,
-        "added": total_added,
-        "message": f"Added {total_added} new recommendation(s)"
-        + (f" ({len(errors)} user(s) had errors — check logs)" if errors else ""),
-    }
+    return {"ok": True, "added": total_added,
+            "message": f"Added {total_added} new recommendation(s)"}
 
 
 async def _populate_all_users(users, limit: int = 0):
@@ -629,7 +622,6 @@ async def _populate_all_users(users, limit: int = 0):
     Always reads the limit from AutomationSettings so the user's control is respected.
     The limit parameter is ignored — it exists only for backwards compatibility.
     """
-    import traceback as _tb
     from database import SessionLocal
     from models import AutomationSettings
     db = SessionLocal()
@@ -645,8 +637,7 @@ async def _populate_all_users(users, limit: int = 0):
                 )
                 log.info(f"Discovery queue: +{added} items for {user.username}")
             except Exception as e:
-                log.error(f"Discovery populate failed for {user.username}: {type(e).__name__}: {e}")
-                log.error(_tb.format_exc())
+                log.warning(f"Discovery populate failed for {user.username}: {e}")
     finally:
         db.close()
 
