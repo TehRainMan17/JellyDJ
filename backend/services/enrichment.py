@@ -1,3 +1,4 @@
+
 """
 JellyDJ Enrichment Service — v2
 
@@ -973,13 +974,17 @@ def detect_replay_signals(db: Session, user_id: str) -> dict:
         for i in range(1, len(play_times)):
             days_diff = (play_times[i] - play_times[i - 1]).total_seconds() / 86400
             if 0 < days_diff <= REPLAY_WINDOW_DAYS:
-                # Check we haven't already recorded this signal
+                # Dedup: check for a signal already written for this exact replay
+                # timestamp (within 60 seconds). Use a tight window so rapid
+                # consecutive plays (e.g. same song on repeat) each get their own
+                # signal rather than being eaten by the previous one.
                 exists = db.query(UserReplaySignal).filter_by(
                     user_id=user_id,
                     jellyfin_item_id=item_id,
                     signal_type="track_replay",
                 ).filter(
-                    UserReplaySignal.replay_at >= play_times[i] - timedelta(minutes=5)
+                    UserReplaySignal.replay_at >= play_times[i] - timedelta(seconds=60),
+                    UserReplaySignal.replay_at <= play_times[i] + timedelta(seconds=60),
                 ).first()
                 if not exists:
                     # Find artist name from the event
@@ -1018,7 +1023,8 @@ def detect_replay_signals(db: Session, user_id: str) -> dict:
                     jellyfin_item_id=t2_id,
                     signal_type="artist_return",
                 ).filter(
-                    UserReplaySignal.replay_at >= t2_time - timedelta(minutes=5)
+                    UserReplaySignal.replay_at >= t2_time - timedelta(seconds=60),
+                    UserReplaySignal.replay_at <= t2_time + timedelta(seconds=60),
                 ).first()
                 if not exists:
                     db.add(UserReplaySignal(
@@ -1048,6 +1054,10 @@ def compute_replay_boosts(db: Session, user_id: str) -> dict[str, float]:
     Returns dict of {jellyfin_item_id: boost_pts} for tracks that have
     active replay signals within the last REPLAY_WINDOW_DAYS.
     Also returns {f"artist:{artist_name_lower}": boost_pts} for artist-level boosts.
+
+    Multiple signals for the same track are summed (not maxed) so that
+    genuinely obsessive repeat-plays accumulate a stronger boost. The
+    scoring engine caps the final contribution at REPLAY_BOOST_CAP.
     """
     from models import UserReplaySignal
 
@@ -1074,10 +1084,12 @@ def compute_replay_boosts(db: Session, user_id: str) -> dict[str, float]:
 
         if sig.signal_type == "track_replay":
             key = sig.jellyfin_item_id
-            boosts[key] = max(boosts.get(key, 0.0), effective_boost)
+            # Sum signals: 3× replays should feel stronger than 1×.
+            # The scoring engine caps the final contribution at REPLAY_BOOST_CAP.
+            boosts[key] = boosts.get(key, 0.0) + effective_boost
         elif sig.signal_type in ("artist_return", "same_session_return"):
             key = f"artist:{sig.artist_name.lower()}"
-            boosts[key] = max(boosts.get(key, 0.0), effective_boost)
+            boosts[key] = boosts.get(key, 0.0) + effective_boost
 
     return boosts
 

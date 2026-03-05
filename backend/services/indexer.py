@@ -405,13 +405,6 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
             return False
 
         # ── Step B: upsert play records ────────────────────────────────────
-        # IMPORTANT: Any exception raised during _upsert_play() causes SQLAlchemy
-        # to internally roll back the transaction and mark the session as
-        # "needs rollback". We must call db.rollback() immediately after catching
-        # such an error — before any further session use — to restore the session
-        # to a clean state. Skipping this causes all subsequent db.commit() calls
-        # on the same session to raise "This Session's transaction has been rolled
-        # back due to a previous exception during flush" (the IndexError you saw).
         upsert_errors = 0
         for item in items:
             try:
@@ -419,31 +412,16 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
             except Exception as e:
                 upsert_errors += 1
                 log.warning(f"  Upsert failed for item {item.get('Id', '?')}: {e}")
-                # Rollback immediately so the session is usable for the next item.
-                # Without this, the session stays in a poisoned "needs-rollback"
-                # state and every subsequent operation raises an InternalError.
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
         try:
             db.commit()
         except Exception as e:
-            # Commit itself failed (e.g. SQLite lock contention). Roll back to
-            # clear the poisoned transaction before attempting any further writes.
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            db.rollback()
             err = f"DB commit failed for {user.username}: {type(e).__name__}: {e}"
             log.error(f"  {err}")
             log_event(db, "index_error", err)
             status_row = _ensure_status_row()
             status_row.status = "error"
-            try:
-                db.commit()
-            except Exception:
-                pass
+            db.commit()
             return False
 
         if upsert_errors:
@@ -456,10 +434,6 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
             _rebuild_taste_profile(db, user.jellyfin_user_id)
         except Exception as e:
             log.warning(f"  Taste profile rebuild failed for {user.username}: {e} — continuing")
-            try:
-                db.rollback()
-            except Exception:
-                pass
 
         try:
             rebuild_all_scores(db, user.jellyfin_user_id)
@@ -467,10 +441,6 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
             err = f"Score rebuild failed for {user.username}: {type(e).__name__}: {e}"
             log.error(f"  {err}")
             log.error(_tb.format_exc())
-            try:
-                db.rollback()
-            except Exception:
-                pass
             log_event(db, "index_error", err)
             # Don't abort — play data was written; scores can be fixed on next run
 
@@ -487,14 +457,7 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
             user_id=user.jellyfin_user_id
         ).count()
         status_row.status = "ok"
-        try:
-            db.commit()
-        except Exception as e:
-            log.error(f"  Step E commit failed for {user.username}: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
+        db.commit()
 
         log.info(f"  Done indexing {user.username}: {status_row.tracks_indexed} tracks")
         log_event(db, "index_complete",
@@ -503,16 +466,10 @@ async def index_user(base_url: str, api_key: str, user: ManagedUser, db: Session
         return True
 
     except Exception as e:
-        # Catch-all for any unexpected failure not caught above.
-        # The session may be in a poisoned "needs-rollback" state here, so
-        # explicitly roll back before attempting any further writes.
+        # Catch-all for any unexpected failure not caught above
         err = f"Index failed for {user.username}: {type(e).__name__}: {e}"
         log.error(f"  {err}")
         log.error(_tb.format_exc())
-        try:
-            db.rollback()
-        except Exception:
-            pass
         log_event(db, "index_error", err)
         try:
             status_row = _ensure_status_row()
@@ -931,10 +888,17 @@ def _run_cache_refresh_sync(caller_db: Session):
                 )
                 if done_count[0] % 25 == 0:
                     log.info(f"    Pass 1: {done_count[0]}/{len(stale_library)}")
-            if result:
-                _cache_artist_result(result, artist)
-                # Cap at top 5 similar per artist to bound Pass 2 size
-                return artist, result["similar_artists"][:5]
+                if result:
+                    try:
+                        _cache_artist_result(result, artist)
+                    except Exception as e:
+                        log.warning(f"    Failed to cache {artist}: {e}")
+                        try:
+                            thread_db.rollback()
+                        except Exception:
+                            pass
+                    # Cap at top 5 similar per artist to bound Pass 2 size
+                    return artist, result["similar_artists"][:5]
             return artist, []
 
         with ThreadPoolExecutor(max_workers=5, thread_name_prefix="lfm") as pool:
@@ -979,8 +943,15 @@ def _run_cache_refresh_sync(caller_db: Session):
                 )
                 if done_count[0] % 50 == 0:
                     log.info(f"    Pass 2: {done_count[0]}/{len(stale_similar)}")
-            if result:
-                _cache_artist_result(result, artist)
+                if result:
+                    try:
+                        _cache_artist_result(result, artist)
+                    except Exception as e:
+                        log.warning(f"    Failed to cache {artist}: {e}")
+                        try:
+                            thread_db.rollback()
+                        except Exception:
+                            pass
 
         with ThreadPoolExecutor(max_workers=5, thread_name_prefix="lfm") as pool:
             futures = {pool.submit(_process_similar_artist, a): a for a in stale_similar}

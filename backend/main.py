@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -106,6 +107,11 @@ def _run_migrations():
         ("artist_enrichments", "expires_at",          "DATETIME", "NULL"),
         ("artist_enrichments", "source",              "TEXT",     "NULL"),
         ("artist_enrichments", "listeners_previous",  "INTEGER",  "NULL"),
+        # bugfix: first_play_at was missing from user_replay_signals, causing every
+        # db.add(UserReplaySignal(..., first_play_at=...)) to throw an
+        # InvalidRequestError that was silently swallowed — no replay signals were
+        # ever written, so replay_boost was always null/0 for every track.
+        ("user_replay_signals", "first_play_at", "DATETIME", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:

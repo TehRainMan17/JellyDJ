@@ -1,3 +1,4 @@
+
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3).
 
@@ -424,7 +425,8 @@ class UserReplaySignal(Base):
     user_id = Column(String, nullable=False, index=True)
     jellyfin_item_id = Column(String, nullable=False, index=True)
     artist_name = Column(String, nullable=False, default="")
-    signal_type = Column(String, nullable=False)  # "track_return"|"artist_return"|"session_return"
+    signal_type = Column(String, nullable=False)  # "track_replay"|"artist_return"|"same_session_return"
+    first_play_at = Column(DateTime, nullable=True)   # timestamp of the triggering prior play
     days_between = Column(Float, nullable=True)
     seed_was_playlist = Column(Boolean, default=False)
     boost_applied = Column(Float, nullable=False, default=0.0)

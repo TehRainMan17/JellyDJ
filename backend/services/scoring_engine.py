@@ -264,14 +264,28 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
 def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
     """
     Build GenreProfile for every genre the user has played.
-    Returns dict of genre → affinity_score. Unchanged from v1.
+    Returns dict of genre → affinity_score.
+
+    Fixed: previously averaged per-track play_score and recency_score across
+    all tracks in the genre. This compressed everything into a ~13-point range
+    (typically 48-61) because:
+      1. play_score was normalised against the single most-played track in the
+         whole library, so per-track averages for any genre were always modest.
+      2. Averaging recency across all genre tracks heavily diluted large genres —
+         200 older rock tracks pulled the average recency way down even if the
+         user played rock yesterday.
+
+    Now uses:
+      - play_score: log(total_genre_plays) / log(max_genre_total_plays) * 100
+        Captures how much you listen to this genre as a whole.
+      - recency_score: score of the most-recently-played track in the genre.
+        If you played any rock song yesterday, rock feels current — averaging
+        in hundreds of old tracks shouldn't penalise it.
     """
     now = datetime.utcnow()
     plays = db.query(Play).filter_by(user_id=user_id).all()
     if not plays:
         return {}
-
-    max_plays = max((p.play_count for p in plays if p.play_count), default=1) or 1
 
     genre_agg: dict[str, dict] = {}
     for p in plays:
@@ -282,18 +296,20 @@ def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
             genre_agg[key] = {
                 "total_plays": 0,
                 "tracks_played": 0,
-                "play_scores": [],
-                "recency_scores": [],
+                "best_last_played": None,
                 "has_favorite": False,
             }
         agg = genre_agg[key]
         agg["total_plays"] += p.play_count
         agg["tracks_played"] += 1
-        if p.play_count > 0:
-            agg["play_scores"].append(_play_score(p.play_count, max_plays))
-            agg["recency_scores"].append(_recency_score(p.last_played))
+        if p.last_played:
+            if agg["best_last_played"] is None or p.last_played > agg["best_last_played"]:
+                agg["best_last_played"] = p.last_played
         if p.is_favorite:
             agg["has_favorite"] = True
+
+    # Normalise against the most-played genre, not the most-played single track
+    max_genre_plays = max((a["total_plays"] for a in genre_agg.values()), default=1) or 1
 
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
     genre_skips: dict[str, dict] = {}
@@ -311,12 +327,10 @@ def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
     affinity_map: dict[str, float] = {}
 
     for genre, agg in genre_agg.items():
-        ps = agg["play_scores"]
-        rs = agg["recency_scores"]
-        avg_play = sum(ps) / len(ps) if ps else 0.0
-        avg_recency = sum(rs) / len(rs) if rs else 0.0
+        genre_play_score = _play_score(agg["total_plays"], max_genre_plays)
+        genre_recency_score = _recency_score(agg["best_last_played"])
         fav_boost = FAVORITE_ARTIST_BOOST if agg["has_favorite"] else 0.0
-        raw_score = W_PLAY * avg_play + W_RECENCY * avg_recency + fav_boost
+        raw_score = W_PLAY * genre_play_score + W_RECENCY * genre_recency_score + fav_boost
         affinity = round(min(100.0, raw_score), 2)
 
         sk_data = genre_skips.get(genre, {})

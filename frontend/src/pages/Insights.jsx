@@ -1,3 +1,4 @@
+
 import { useState, useEffect } from 'react'
 import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
@@ -116,23 +117,24 @@ function SortHeader({ label, field, currentSort, currentOrder, onSort, hint }) {
 // ── Column definitions ────────────────────────────────────────────────────────
 
 const ALL_COLUMNS = [
-  { key: 'track_name',      label: 'Track',        always: true,  hint: 'Track title' },
-  { key: 'artist_name',     label: 'Artist',       always: true,  hint: 'Primary artist' },
-  { key: 'final_score',     label: 'Score',        always: true,  hint: 'Composite recommendation score (0–100). Higher = more likely to appear in playlists.' },
-  { key: 'play_count',      label: 'Plays',        default: true, hint: 'Total play count in Jellyfin' },
-  { key: 'last_played',     label: 'Last played',  default: true, hint: 'Most recent play date' },
-  { key: 'play_score',      label: 'Play score',   default: false, hint: 'Score component from play frequency (log-normalised against your most-played track).' },
-  { key: 'recency_score',   label: 'Recency',      default: false, hint: 'Score component for how recently you played this. Full marks within 30 days, decays to 0 after 1 year.' },
-  { key: 'artist_affinity', label: 'Artist aff.',  default: true,  hint: 'How much the engine thinks you like this artist (0–100), based on your overall play history for them.' },
-  { key: 'genre_affinity',  label: 'Genre aff.',   default: false, hint: 'How much you like this track\'s genre overall.' },
+  { key: 'track_name',        label: 'Track',           always: true,  hint: 'Track title' },
+  { key: 'artist_name',       label: 'Artist',          always: true,  hint: 'Primary artist' },
+  { key: 'genre',             label: 'Genre',           default: true,  hint: 'Genre tag stored for this track in Jellyfin.' },
+  { key: 'final_score',       label: 'Score',           always: true,  hint: 'Composite recommendation score (0–100). Higher = more likely to appear in playlists.' },
+  { key: 'play_count',        label: 'Plays',           default: true,  hint: 'Total play count in Jellyfin' },
+  { key: 'last_played',       label: 'Last played',     default: true,  hint: 'Most recent play date' },
+  { key: 'play_score',        label: 'Play score',      default: false, hint: 'Score component from play frequency (log-normalised against your most-played track).' },
+  { key: 'recency_score',     label: 'Recency',         default: false, hint: 'Score component for how recently you played this. Full marks within 30 days, decays to 0 after 1 year.' },
+  { key: 'artist_affinity',   label: 'Artist aff.',     default: true,  hint: 'How much the engine thinks you like this artist (0–100), based on your overall play history for them.' },
+  { key: 'genre_affinity',    label: 'Genre affinity',  default: true,  hint: 'How much you like this track\'s genre overall (0–100). Drives 10% of the final score.' },
   { key: 'global_popularity', label: 'Song Popularity', default: true,  hint: 'Per-song Last.fm popularity (0–100). Based on how many people globally have listened to this specific track. Requires enrichment to populate — blank until enrichment has run.' },
-  { key: 'replay_boost',    label: 'Replay ↑',     default: true,  hint: 'Bonus score from voluntary replays within 7 days of a previous play — a strong signal that you really like this track.' },
-  { key: 'novelty_bonus',   label: 'Novelty',      default: false, hint: 'Small bonus for unplayed tracks to give them a chance. 0 on played tracks.' },
-  { key: 'skip_penalty',    label: 'Skip pen.',    default: true,  hint: 'Skip penalty multiplier applied to the final score. High values suppress the track in playlists.' },
-  { key: 'skip_count',      label: 'Skips',        default: true,  hint: 'Raw skip count vs total events tracked by webhook.' },
-  { key: 'skip_streak',     label: 'Skip streak',  default: true,  hint: 'Consecutive skips without a full listen. ≥3 triggers a cooldown.' },
-  { key: 'on_cooldown',     label: 'Cooldown',     default: true,  hint: 'Whether this track is in a skip-streak cooldown and excluded from playlists until the timer expires.' },
-  { key: 'holiday',         label: 'Holiday',      default: false, hint: 'Auto-detected holiday tag and whether it\'s currently in-season.' },
+  { key: 'replay_boost',      label: 'Replay ↑',        default: true,  hint: 'Bonus score from voluntary replays within 7 days of a previous play — a strong signal that you really like this track.' },
+  { key: 'novelty_bonus',     label: 'Novelty',         default: false, hint: 'Small bonus for unplayed tracks to give them a chance. 0 on played tracks.' },
+  { key: 'skip_penalty',      label: 'Skip pen.',       default: true,  hint: 'Skip penalty multiplier applied to the final score. High values suppress the track in playlists.' },
+  { key: 'skip_count',        label: 'Skips',           default: true,  hint: 'Raw skip count vs total events tracked by webhook.' },
+  { key: 'skip_streak',       label: 'Skip streak',     default: true,  hint: 'Consecutive skips without a full listen. ≥3 triggers a cooldown.' },
+  { key: 'on_cooldown',       label: 'Cooldown',        default: true,  hint: 'Whether this track is in a skip-streak cooldown and excluded from playlists until the timer expires.' },
+  { key: 'holiday',           label: 'Holiday',         default: false, hint: 'Auto-detected holiday tag and whether it\'s currently in-season.' },
 ]
 
 const DEFAULT_VISIBLE = new Set(
@@ -504,6 +506,11 @@ function TrackTable({ userId }) {
                     <SortHeader label="Artist" field="artist_name" currentSort={sort} currentOrder={order} onSort={handleSort} />
                   </th>
                 )}
+                {col('genre') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]">Genre</span>
+                  </th>
+                )}
                 {col('final_score') && (
                   <th className="px-2 py-2.5">
                     <SortHeader label="Score" field="final_score" currentSort={sort} currentOrder={order} onSort={handleSort}
@@ -530,6 +537,30 @@ function TrackTable({ userId }) {
                   <th className="px-2 py-2.5 hidden lg:table-cell">
                     <SortHeader label="Artist aff." field="artist_affinity" currentSort={sort} currentOrder={order} onSort={handleSort}
                       hint="Your affinity for this artist (0–100)" />
+                  </th>
+                )}
+                {col('genre_affinity') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Genre aff." field="genre_affinity" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Your affinity for this track's genre (0–100). Drives 10% of the final score." />
+                  </th>
+                )}
+                {col('play_score') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <SortHeader label="Play score" field="play_score" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Score from play frequency, log-normalised (45% weight)" />
+                  </th>
+                )}
+                {col('recency_score') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <SortHeader label="Recency" field="recency_score" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="How recently you played this. Decays from 100 → 0 over 1 year (25% weight)" />
+                  </th>
+                )}
+                {col('novelty_bonus') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <SortHeader label="Novelty" field="novelty_bonus" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Small bonus for unplayed tracks to surface them. 0 on played tracks." />
                   </th>
                 )}
                 {col('replay_boost') && (
@@ -606,6 +637,13 @@ function TrackTable({ userId }) {
                       </td>
                     )}
 
+                    {/* Genre */}
+                    {col('genre') && (
+                      <td className="px-2 py-2.5 hidden md:table-cell max-w-[120px]">
+                        <span className="text-xs text-[var(--text-secondary)] truncate block">{t.genre || '—'}</span>
+                      </td>
+                    )}
+
                     {/* Score */}
                     {col('final_score') && (
                       <td className="px-2 py-2.5">
@@ -643,6 +681,48 @@ function TrackTable({ userId }) {
                     {col('artist_affinity') && (
                       <td className="px-2 py-2.5 hidden lg:table-cell text-xs text-[var(--text-secondary)] tabular-nums">
                         {t.artist_affinity.toFixed(1)}
+                      </td>
+                    )}
+
+                    {/* Genre affinity */}
+                    {col('genre_affinity') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell min-w-[80px]">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs tabular-nums"
+                            style={{ color: t.genre_affinity >= 60 ? 'var(--accent)' : t.genre_affinity >= 30 ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
+                            {t.genre_affinity.toFixed(1)}
+                          </span>
+                          <ScoreBar value={t.genre_affinity}
+                            color={t.genre_affinity >= 60 ? '#ffa657' : 'var(--text-secondary)'} />
+                        </div>
+                      </td>
+                    )}
+
+                    {/* Play score */}
+                    {col('play_score') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell min-w-[80px]">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs tabular-nums text-[var(--text-secondary)]">{t.play_score.toFixed(1)}</span>
+                          <ScoreBar value={t.play_score} color="var(--accent)" />
+                        </div>
+                      </td>
+                    )}
+
+                    {/* Recency score */}
+                    {col('recency_score') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell min-w-[80px]">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs tabular-nums text-[var(--text-secondary)]">{t.recency_score.toFixed(1)}</span>
+                          <ScoreBar value={t.recency_score} color="#7ee787" />
+                        </div>
+                      </td>
+                    )}
+
+                    {/* Novelty bonus */}
+                    {col('novelty_bonus') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs tabular-nums"
+                          style={{ color: (t.novelty_bonus || 0) > 0 ? 'var(--accent)' : 'var(--text-secondary)' }}>
+                        {(t.novelty_bonus || 0) > 0 ? `+${parseFloat(t.novelty_bonus).toFixed(1)}` : '—'}
                       </td>
                     )}
 
@@ -870,6 +950,98 @@ function TrackTable({ userId }) {
   )
 }
 
+// ── Artist Column definitions ─────────────────────────────────────────────────
+
+const ARTIST_COLUMNS = [
+  { key: 'artist_name',      label: 'Artist',       always: true,  hint: 'Artist name' },
+  { key: 'affinity_score',   label: 'Affinity',     always: true,  hint: 'Overall affinity score (0–100) built from play frequency, recency, and favorites.' },
+  { key: 'total_plays',      label: 'Total plays',  default: true,  hint: 'Total plays across all tracks for this artist' },
+  { key: 'skip_rate',        label: 'Skip rate',    default: true,  hint: 'Skip rate from webhook events' },
+  { key: 'total_skips',      label: 'Skips',        default: true,  hint: 'Raw skip count vs total events' },
+  { key: 'replay_boost',     label: 'Replay ↑',     default: true,  hint: 'Artist-level replay boost from voluntary returns within 7 days.' },
+  { key: 'popularity_score', label: 'Popularity',   default: true,  hint: 'Global Last.fm artist popularity.' },
+  { key: 'primary_genre',    label: 'Genre',        default: true,  hint: 'Primary genre tag for this artist.' },
+  { key: 'trend_direction',  label: 'Trend',        default: true,  hint: 'Whether your listening of this artist is rising, stable, or falling.' },
+  { key: 'has_favorite',     label: 'Fav',          default: true,  hint: 'Whether you have a favorited track by this artist.' },
+]
+
+const ARTIST_DEFAULT_VISIBLE = new Set(
+  ARTIST_COLUMNS.filter(c => c.always || c.default).map(c => c.key)
+)
+
+const ARTIST_COLS_STORAGE_KEY = 'jellydj_insights_artist_cols_v1'
+
+function loadSavedArtistCols() {
+  try {
+    const raw = localStorage.getItem(ARTIST_COLS_STORAGE_KEY)
+    if (!raw) return ARTIST_DEFAULT_VISIBLE
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length === 0) return ARTIST_DEFAULT_VISIBLE
+    const valid = new Set(ARTIST_COLUMNS.map(c => c.key))
+    const filtered = parsed.filter(k => valid.has(k))
+    ARTIST_COLUMNS.filter(c => c.always).forEach(c => filtered.push(c.key))
+    return new Set(filtered)
+  } catch {
+    return ARTIST_DEFAULT_VISIBLE
+  }
+}
+
+function saveArtistCols(colSet) {
+  try {
+    localStorage.setItem(ARTIST_COLS_STORAGE_KEY, JSON.stringify([...colSet]))
+  } catch {}
+}
+
+function ArtistColumnPicker({ visible, onChange }) {
+  const [open, setOpen] = useState(false)
+  const toggleable = ARTIST_COLUMNS.filter(c => !c.always)
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 px-3 py-1.5 bg-[var(--bg-overlay)] border border-[var(--border)]
+                   rounded-lg text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+      >
+        <Activity size={12} />
+        Columns
+        <ChevronDown size={10} className={open ? 'rotate-180' : ''} style={{ transition: 'transform 0.15s' }} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-50 bg-[var(--bg-surface)] border border-[var(--border)]
+                        rounded-xl shadow-xl p-3 min-w-[220px] space-y-1">
+          <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-2 px-1">Toggle columns</div>
+          {toggleable.map(col => (
+            <label key={col.key}
+              className="flex items-start gap-2 px-1 py-1 rounded hover:bg-[var(--bg-overlay)] cursor-pointer"
+              title={col.hint}>
+              <input
+                type="checkbox"
+                checked={visible.has(col.key)}
+                onChange={() => {
+                  const next = new Set(visible)
+                  next.has(col.key) ? next.delete(col.key) : next.add(col.key)
+                  onChange(next)
+                }}
+                className="mt-0.5 accent-[var(--accent)]"
+              />
+              <div>
+                <div className="text-xs text-[var(--text-primary)]">{col.label}</div>
+                {col.hint && <div className="text-[10px] text-[var(--text-secondary)] leading-tight mt-0.5">{col.hint}</div>}
+              </div>
+            </label>
+          ))}
+          <button
+            onClick={() => onChange(ARTIST_DEFAULT_VISIBLE)}
+            className="mt-2 w-full text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] py-1 border-t border-[var(--bg-overlay)] transition-colors"
+          >
+            Reset to default
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Artist Table ──────────────────────────────────────────────────────────────
 
 function ArtistTable({ userId }) {
@@ -879,6 +1051,9 @@ function ArtistTable({ userId }) {
   const [order, setOrder] = useState('desc')
   const [page, setPage] = useState(1)
   const [expandedRow, setExpandedRow] = useState(null)
+  const [visibleCols, setVisibleCols] = useState(() => loadSavedArtistCols())
+
+  const acol = (key) => visibleCols.has(key)
 
   const doFetch = (uid, sb, ord, pg) => {
     if (!uid) return
@@ -902,8 +1077,11 @@ function ArtistTable({ userId }) {
 
   return (
     <div>
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-between items-center mb-4">
         {data && <span className="text-xs text-[var(--text-secondary)]">{data.total} artists tracked</span>}
+        <div className="ml-auto">
+          <ArtistColumnPicker visible={visibleCols} onChange={cols => { setVisibleCols(cols); saveArtistCols(cols) }} />
+        </div>
       </div>
       <div className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
@@ -918,26 +1096,42 @@ function ArtistTable({ userId }) {
                   <SortHeader label="Affinity" field="affinity_score" currentSort={sort} currentOrder={order} onSort={handleSort}
                     hint="Overall affinity score (0–100) built from play frequency, recency, and favorites." />
                 </th>
-                <th className="px-2 py-2.5 hidden sm:table-cell">
-                  <SortHeader label="Total plays" field="total_plays" currentSort={sort} currentOrder={order} onSort={handleSort} />
-                </th>
-                <th className="px-2 py-2.5 hidden md:table-cell">
-                  <SortHeader label="Skip rate" field="skip_rate" currentSort={sort} currentOrder={order} onSort={handleSort} />
-                </th>
-                <th className="px-2 py-2.5 hidden md:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">
-                  Skips
-                </th>
-                <th className="px-2 py-2.5 hidden lg:table-cell">
-                  <SortHeader label="Replay ↑" field="replay_boost" currentSort={sort} currentOrder={order} onSort={handleSort}
-                    hint="Artist-level replay boost from voluntary returns within 7 days." />
-                </th>
-                <th className="px-2 py-2.5 hidden lg:table-cell">
-                  <SortHeader label="Popularity" field="popularity_score" currentSort={sort} currentOrder={order} onSort={handleSort}
-                    hint="Global Last.fm artist popularity." />
-                </th>
-                <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Genre</th>
-                <th className="px-2 py-2.5 hidden xl:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Trend</th>
-                <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Fav</th>
+                {acol('total_plays') && (
+                  <th className="px-2 py-2.5 hidden sm:table-cell">
+                    <SortHeader label="Total plays" field="total_plays" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                  </th>
+                )}
+                {acol('skip_rate') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell">
+                    <SortHeader label="Skip rate" field="skip_rate" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                  </th>
+                )}
+                {acol('total_skips') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">
+                    Skips
+                  </th>
+                )}
+                {acol('replay_boost') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Replay ↑" field="replay_boost" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Artist-level replay boost from voluntary returns within 7 days." />
+                  </th>
+                )}
+                {acol('popularity_score') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Popularity" field="popularity_score" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Global Last.fm artist popularity." />
+                  </th>
+                )}
+                {acol('primary_genre') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Genre</th>
+                )}
+                {acol('trend_direction') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Trend</th>
+                )}
+                {acol('has_favorite') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Fav</th>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -970,46 +1164,62 @@ function ArtistTable({ userId }) {
                         <ScoreBar value={a.affinity_score} color={a.affinity_score >= 60 ? 'var(--accent)' : 'var(--text-secondary)'} />
                       </div>
                     </td>
-                    <td className="px-2 py-2.5 hidden sm:table-cell text-xs text-[var(--text-secondary)] tabular-nums">{a.total_plays}</td>
-                    <td className="px-2 py-2.5 hidden md:table-cell text-xs tabular-nums"
-                        style={{ color: a.skip_rate > 0.3 ? 'var(--danger)' : 'var(--text-secondary)' }}>
-                      {a.skip_rate > 0 ? `${(a.skip_rate * 100).toFixed(0)}%` : '—'}
-                    </td>
-                    <td className="px-2 py-2.5 hidden md:table-cell text-xs tabular-nums"
-                        style={{ color: a.total_skips > 0 ? 'var(--danger)' : 'var(--text-secondary)' }}>
-                      {a.total_skips > 0
-                        ? <span title={`${a.total_skips} skips / ${a.total_events} events`}>
-                            {a.total_skips}<span className="text-[var(--text-secondary)] text-[10px]">/{a.total_events}</span>
-                          </span>
-                        : '—'}
-                    </td>
-                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs tabular-nums"
-                        style={{ color: (a.replay_boost || 0) > 0 ? '#e3b341' : 'var(--text-secondary)' }}>
-                      {(a.replay_boost || 0) > 0 ? `+${a.replay_boost.toFixed(1)}` : '—'}
-                    </td>
-                    <td className="px-2 py-2.5 hidden lg:table-cell min-w-[70px]">
-                      {a.popularity_score != null
-                        ? <PopularityBar value={a.popularity_score} />
-                        : <span className="text-[var(--text-secondary)] text-xs">—</span>}
-                    </td>
-                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs text-[var(--text-secondary)] truncate max-w-[120px]">
-                      {a.primary_genre || '—'}
-                    </td>
-                    <td className="px-2 py-2.5 hidden xl:table-cell text-xs">
-                      {a.trend_direction === 'rising'  && <span className="text-green-400 flex items-center gap-1"><TrendingUp size={11} /> Rising</span>}
-                      {a.trend_direction === 'falling' && <span className="text-[var(--danger)] flex items-center gap-1"><TrendingDown size={11} /> Falling</span>}
-                      {a.trend_direction === 'stable'  && <span className="text-[var(--text-secondary)]">Stable</span>}
-                      {!a.trend_direction && <span className="text-[var(--border)]">—</span>}
-                    </td>
-                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs">
-                      {a.has_favorite ? <Heart size={11} className="text-[var(--danger)]" /> : <span className="text-[var(--border)]">—</span>}
-                    </td>
+                    {acol('total_plays') && (
+                      <td className="px-2 py-2.5 hidden sm:table-cell text-xs text-[var(--text-secondary)] tabular-nums">{a.total_plays}</td>
+                    )}
+                    {acol('skip_rate') && (
+                      <td className="px-2 py-2.5 hidden md:table-cell text-xs tabular-nums"
+                          style={{ color: a.skip_rate > 0.3 ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                        {a.skip_rate > 0 ? `${(a.skip_rate * 100).toFixed(0)}%` : '—'}
+                      </td>
+                    )}
+                    {acol('total_skips') && (
+                      <td className="px-2 py-2.5 hidden md:table-cell text-xs tabular-nums"
+                          style={{ color: a.total_skips > 0 ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                        {a.total_skips > 0
+                          ? <span title={`${a.total_skips} skips / ${a.total_events} events`}>
+                              {a.total_skips}<span className="text-[var(--text-secondary)] text-[10px]">/{a.total_events}</span>
+                            </span>
+                          : '—'}
+                      </td>
+                    )}
+                    {acol('replay_boost') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell text-xs tabular-nums"
+                          style={{ color: (a.replay_boost || 0) > 0 ? '#e3b341' : 'var(--text-secondary)' }}>
+                        {(a.replay_boost || 0) > 0 ? `+${a.replay_boost.toFixed(1)}` : '—'}
+                      </td>
+                    )}
+                    {acol('popularity_score') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell min-w-[70px]">
+                        {a.popularity_score != null
+                          ? <PopularityBar value={a.popularity_score} />
+                          : <span className="text-[var(--text-secondary)] text-xs">—</span>}
+                      </td>
+                    )}
+                    {acol('primary_genre') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell text-xs text-[var(--text-secondary)] truncate max-w-[120px]">
+                        {a.primary_genre || '—'}
+                      </td>
+                    )}
+                    {acol('trend_direction') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs">
+                        {a.trend_direction === 'rising'  && <span className="text-green-400 flex items-center gap-1"><TrendingUp size={11} /> Rising</span>}
+                        {a.trend_direction === 'falling' && <span className="text-[var(--danger)] flex items-center gap-1"><TrendingDown size={11} /> Falling</span>}
+                        {a.trend_direction === 'stable'  && <span className="text-[var(--text-secondary)]">Stable</span>}
+                        {!a.trend_direction && <span className="text-[var(--border)]">—</span>}
+                      </td>
+                    )}
+                    {acol('has_favorite') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell text-xs">
+                        {a.has_favorite ? <Heart size={11} className="text-[var(--danger)]" /> : <span className="text-[var(--border)]">—</span>}
+                      </td>
+                    )}
                   </tr>
 
                   {/* Artist expanded row */}
                   {expandedRow === a.artist_name && (
                     <tr key={`${a.artist_name}-exp`} className="bg-[var(--bg-surface)] border-b border-[var(--bg-overlay)]">
-                      <td colSpan={11} className="px-4 py-4">
+                      <td colSpan={20} className="px-4 py-4">
                         <div className="space-y-3">
                           <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider font-semibold">
                             Artist profile — {a.artist_name}
@@ -1319,3 +1529,4 @@ export default function Insights() {
     </div>
   )
 }
+
