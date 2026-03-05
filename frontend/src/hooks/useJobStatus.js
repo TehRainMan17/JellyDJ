@@ -1,28 +1,39 @@
 /**
- * useJobStatus — polls both the indexer job and the popularity cache refresh.
+ * useJobStatus — polls all background jobs and exposes their live state.
  *
- * Two separate background processes run on the server:
- *   1. Indexer  → /api/indexer/job-status
- *      Fields: { running, phase, detail, percent, error, started_at, finished_at }
- *
- *   2. Cache refresh → /api/automation/trigger/popularity-cache/status
- *      Fields: { running, phase, done, total, progress_pct, error, started_at, finished_at }
+ * Six background processes on the server, each with its own status endpoint:
+ *   1. Indexer         → /api/indexer/job-status
+ *   2. Popularity cache → /api/automation/trigger/popularity-cache/status
+ *   3. Enrichment       → /api/automation/trigger/enrichment/status
+ *   4. Discovery        → /api/automation/trigger/discovery/status
+ *   5. Playlists        → /api/automation/trigger/playlists/status
+ *   6. Auto-download    → /api/automation/trigger/auto-download/status
  *
  * Key behaviours:
- *   - Polling starts immediately on mount so a job already running when you
- *     navigate to the dashboard is visible right away — no button click needed.
- *   - startPolling() resets and restarts (called after manually triggering).
- *   - onComplete fires once when the INDEX job transitions running→false.
+ *   - Polling starts immediately on mount — any already-running job appears
+ *     without a button click.
+ *   - startPolling() resets and restarts polling (call after triggering a job).
+ *   - onComplete fires once when the INDEX job transitions running → false.
  */
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-const INDEX_URL  = '/api/indexer/job-status'
-const CACHE_URL  = '/api/automation/trigger/popularity-cache/status'
+const URLS = {
+  index:    '/api/indexer/job-status',
+  cache:    '/api/automation/trigger/popularity-cache/status',
+  enrich:   '/api/automation/trigger/enrichment/status',
+  discover: '/api/automation/trigger/discovery/status',
+  playlist: '/api/automation/trigger/playlists/status',
+  download: '/api/automation/trigger/auto-download/status',
+}
 const INTERVAL_MS = 2000
 
 export function useJobStatus(onComplete) {
-  const [indexStatus, setIndexStatus] = useState(null)
-  const [cacheStatus, setCacheStatus] = useState(null)
+  const [indexStatus,    setIndexStatus]    = useState(null)
+  const [cacheStatus,    setCacheStatus]    = useState(null)
+  const [enrichStatus,   setEnrichStatus]   = useState(null)
+  const [discoverStatus, setDiscoverStatus] = useState(null)
+  const [playlistStatus, setPlaylistStatus] = useState(null)
+  const [downloadStatus, setDownloadStatus] = useState(null)
 
   const timerRef        = useRef(null)
   const indexWasRunning = useRef(false)
@@ -35,28 +46,31 @@ export function useJobStatus(onComplete) {
 
   const poll = useCallback(async () => {
     try {
-      const [ir, cr] = await Promise.allSettled([
-        fetch(INDEX_URL).then(r => r.ok ? r.json() : null),
-        fetch(CACHE_URL).then(r => r.ok ? r.json() : null),
-      ])
+      const results = await Promise.allSettled(
+        Object.values(URLS).map(url => fetch(url).then(r => r.ok ? r.json() : null))
+      )
+      const [ir, cr, er, dr, pr, dlr] = results.map(r =>
+        r.status === 'fulfilled' ? r.value : null
+      )
 
-      const idx   = ir.status === 'fulfilled' ? ir.value : null
-      const cache = cr.status === 'fulfilled' ? cr.value : null
-
-      if (idx)   setIndexStatus(idx)
-      if (cache) setCacheStatus(cache)
+      if (ir)  setIndexStatus(ir)
+      if (cr)  setCacheStatus(cr)
+      if (er)  setEnrichStatus(er)
+      if (dr)  setDiscoverStatus(dr)
+      if (pr)  setPlaylistStatus(pr)
+      if (dlr) setDownloadStatus(dlr)
 
       // Fire onComplete when index transitions running → idle
-      if (idx?.running) {
+      if (ir?.running) {
         indexWasRunning.current = true
-      } else if (indexWasRunning.current && idx && !idx.running) {
+      } else if (indexWasRunning.current && ir && !ir.running) {
         indexWasRunning.current = false
-        onCompleteRef.current?.(idx)
+        onCompleteRef.current?.(ir)
       }
     } catch { /* network blip */ }
   }, [])
 
-  // Start polling immediately on mount — catches jobs already running
+  // Start polling immediately on mount
   useEffect(() => {
     poll()
     timerRef.current = setInterval(poll, INTERVAL_MS)
@@ -70,5 +84,14 @@ export function useJobStatus(onComplete) {
     timerRef.current = setInterval(poll, INTERVAL_MS)
   }, [poll, stopPolling])
 
-  return { indexStatus, cacheStatus, startPolling, stopPolling }
+  return {
+    indexStatus,
+    cacheStatus,
+    enrichStatus,
+    discoverStatus,
+    playlistStatus,
+    downloadStatus,
+    startPolling,
+    stopPolling,
+  }
 }

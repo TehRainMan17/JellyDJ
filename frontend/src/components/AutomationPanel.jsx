@@ -1,3 +1,4 @@
+
 import { useState, useEffect } from 'react'
 import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database } from 'lucide-react'
 
@@ -93,7 +94,11 @@ function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, ena
   )
 }
 
-export default function AutomationPanel() {
+export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
+  // jobStatuses: { indexStatus, cacheStatus, enrichStatus, discoverStatus, playlistStatus, downloadStatus }
+  // onTrigger: () => void — call this after any trigger POST so the parent re-starts polling
+  const enrichStatus = jobStatuses.enrichStatus
+
   const [settings, setSettings]         = useState(null)
   const [jobStatus, setJobStatus]       = useState({})
   const [saving, setSaving]             = useState(false)
@@ -113,14 +118,13 @@ export default function AutomationPanel() {
   const [autoMax,       setAutoMax]       = useState(1)
   const [autoCooldown,  setAutoCooldown]  = useState(7)
 
-  // Trigger states
+  // Trigger loading states (button spinner while POST is in-flight)
   const [trigIndex,     setTrigIndex]     = useState(false)
   const [trigDisc,      setTrigDisc]      = useState(false)
   const [trigPl,        setTrigPl]        = useState(false)
   const [trigAuto,      setTrigAuto]      = useState(false)
   const [trigEnrich,    setTrigEnrich]    = useState(false)
   const [trigPopCache,  setTrigPopCache]  = useState(false)
-  const [enrichStatus,  setEnrichStatus]  = useState(null)
 
   useEffect(() => {
     fetch('/api/automation/settings').then(r=>r.json()).then(d => {
@@ -136,14 +140,6 @@ export default function AutomationPanel() {
       setAutoCooldown(d.auto_download_cooldown_days ?? 7)
     }).catch(() => {})
     fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
-    // Poll enrichment status if running
-    const pollEnrich = setInterval(() => {
-      fetch('/api/automation/trigger/enrichment/status').then(r=>r.json()).then(d => {
-        setEnrichStatus(d)
-        if (!d.running) clearInterval(pollEnrich)
-      }).catch(() => {})
-    }, 3000)
-    return () => clearInterval(pollEnrich)
   }, [])
 
   const save = async () => {
@@ -175,22 +171,23 @@ export default function AutomationPanel() {
 
   const trigger = async (path, setLoading) => {
     setLoading(true)
-    try { await fetch(path, { method:'POST' }) }
-    finally { setLoading(false); setTimeout(() => fetch('/api/automation/settings').then(r=>r.json()).then(setSettings).catch(()=>{}), 2000) }
+    try {
+      await fetch(path, { method: 'POST' })
+      onTrigger?.()
+    } finally {
+      setLoading(false)
+      setTimeout(() => fetch('/api/automation/settings').then(r=>r.json()).then(setSettings).catch(()=>{}), 2000)
+    }
   }
 
   const triggerEnrichment = async () => {
     setTrigEnrich(true)
     try {
       await fetch('/api/automation/trigger/enrichment', { method: 'POST' })
-      // Start polling status
-      const poll = setInterval(() => {
-        fetch('/api/automation/trigger/enrichment/status').then(r=>r.json()).then(d => {
-          setEnrichStatus(d)
-          if (!d.running) { clearInterval(poll); setTrigEnrich(false) }
-        }).catch(() => {})
-      }, 2000)
-    } catch { setTrigEnrich(false) }
+      onTrigger?.()
+    } finally {
+      setTrigEnrich(false)
+    }
   }
 
   const s = settings
@@ -214,7 +211,7 @@ export default function AutomationPanel() {
                 lastRun={s?.last_discovery_refresh} nextRun={jobStatus.discovery_refresh}
                 enabled={discEnabled} onToggle={setDiscEnabled}
                 triggerLabel="Refresh Now" triggering={trigDisc}
-                onTrigger={() => trigger('/api/discovery/populate', setTrigDisc)}>
+                onTrigger={() => trigger('/api/automation/trigger/discovery', setTrigDisc)}>
         <div className="space-y-3">
           <Slider label="Run every" value={discInterval} onChange={setDiscInterval}
                   min={1} max={168} unit="h" markers={['1h','24h','1w']} />
@@ -302,7 +299,7 @@ export default function AutomationPanel() {
                 description="Fetches per-song and per-artist Last.fm data — populates Song Popularity and Artist Popularity in Insights"
                 lastRun={s?.last_enrichment}
                 triggerLabel={enrichStatus?.running ? "Running…" : "Run Now"}
-                triggering={enrichStatus?.running}
+                triggering={trigEnrich || !!enrichStatus?.running}
                 onTrigger={triggerEnrichment}>
         <div className="space-y-3">
 
@@ -411,7 +408,8 @@ export default function AutomationPanel() {
       {/* Popularity Cache */}
       <TaskCard icon={Database} color="#38bdf8" title="Popularity Cache Refresh"
                 description="Fetches artist-level listener counts, tags, similar artists and top albums from Last.fm"
-                triggerLabel="Refresh Now" triggering={trigPopCache}
+                triggerLabel={jobStatuses.cacheStatus?.running ? 'Running…' : 'Refresh Now'}
+                triggering={trigPopCache || !!jobStatuses.cacheStatus?.running}
                 onTrigger={() => trigger('/api/automation/trigger/popularity-cache', setTrigPopCache)}>
         <div className="text-[11px] px-3 py-2.5 rounded-xl"
              style={{ background:'rgba(56,189,248,0.06)', border:'1px solid rgba(56,189,248,0.18)', color:'var(--text-secondary)' }}>

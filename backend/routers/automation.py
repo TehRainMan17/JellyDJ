@@ -1,3 +1,4 @@
+
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
 plus the activity feed endpoint.
@@ -48,6 +49,70 @@ def _set_enrichment_state(**kwargs):
     if kwargs.get("running") is False:
         _enrichment_state["finished_at"] = _dt.utcnow().isoformat()
         _enrichment_state["started_at"] = None
+
+
+# ── In-memory state for discovery, playlists, auto-download ──────────────────
+
+_discovery_state: dict = {
+    "running": False,
+    "phase": "",
+    "detail": "",
+    "users_done": 0,
+    "users_total": 0,
+    "items_added": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+_playlist_state: dict = {
+    "running": False,
+    "phase": "",
+    "detail": "",
+    "playlists_done": 0,
+    "playlists_total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+_download_state: dict = {
+    "running": False,
+    "phase": "",
+    "detail": "",
+    "sent": 0,
+    "total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+def _set_discovery_state(**kwargs):
+    from datetime import datetime as _dt
+    _discovery_state.update(kwargs)
+    if kwargs.get("running") and not _discovery_state.get("started_at"):
+        _discovery_state["started_at"] = _dt.utcnow().isoformat()
+        _discovery_state["finished_at"] = None
+    if kwargs.get("running") is False:
+        _discovery_state["finished_at"] = _dt.utcnow().isoformat()
+
+def _set_playlist_state(**kwargs):
+    from datetime import datetime as _dt
+    _playlist_state.update(kwargs)
+    if kwargs.get("running") and not _playlist_state.get("started_at"):
+        _playlist_state["started_at"] = _dt.utcnow().isoformat()
+        _playlist_state["finished_at"] = None
+    if kwargs.get("running") is False:
+        _playlist_state["finished_at"] = _dt.utcnow().isoformat()
+
+def _set_download_state(**kwargs):
+    from datetime import datetime as _dt
+    _download_state.update(kwargs)
+    if kwargs.get("running") and not _download_state.get("started_at"):
+        _download_state["started_at"] = _dt.utcnow().isoformat()
+        _download_state["finished_at"] = None
+    if kwargs.get("running") is False:
+        _download_state["finished_at"] = _dt.utcnow().isoformat()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -295,6 +360,36 @@ def cache_refresh_status():
     return {**state, "progress_pct": pct}
 
 
+@router.get("/trigger/discovery/status")
+def discovery_trigger_status():
+    """Poll this to get live progress of the discovery refresh."""
+    state = dict(_discovery_state)
+    done = state.get("users_done", 0)
+    total = state.get("users_total", 0)
+    pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
+    return {**state, "progress_pct": pct}
+
+
+@router.get("/trigger/playlists/status")
+def playlists_trigger_status():
+    """Poll this to get live progress of playlist regeneration."""
+    state = dict(_playlist_state)
+    done = state.get("playlists_done", 0)
+    total = state.get("playlists_total", 0)
+    pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
+    return {**state, "progress_pct": pct}
+
+
+@router.get("/trigger/auto-download/status")
+def download_trigger_status():
+    """Poll this to get live progress of the auto-download run."""
+    state = dict(_download_state)
+    sent = state.get("sent", 0)
+    total = state.get("total", 0)
+    pct = round(100 * sent / total) if total > 0 else (50 if state.get("running") else 0)
+    return {**state, "progress_pct": pct}
+
+
 @router.post("/trigger/discovery")
 async def trigger_discovery(db: Session = Depends(get_db)):
     """Manually trigger a discovery queue refresh for all enabled users."""
@@ -417,11 +512,23 @@ async def _run_discovery_refresh():
         s = _get_or_create_settings(db)
         users = db.query(ManagedUser).filter_by(is_enabled=True).all()
         if not users:
+            _set_discovery_state(running=False, phase="No enabled users", detail="", users_done=0, users_total=0, items_added=0, error=None)
             return
+
+        _set_discovery_state(
+            running=True, phase="Starting discovery refresh",
+            detail=f"Found {len(users)} user(s)", users_done=0,
+            users_total=len(users), items_added=0, error=None,
+        )
 
         from routers.discovery import _populate_queue_for_user
         total_added = 0
-        for user in users:
+        for idx, user in enumerate(users):
+            _set_discovery_state(
+                phase=f"Refreshing queue for {user.username}",
+                detail=f"User {idx + 1} of {len(users)}",
+                users_done=idx,
+            )
             try:
                 added = await _populate_queue_for_user(
                     user.jellyfin_user_id, db,
@@ -435,8 +542,14 @@ async def _run_discovery_refresh():
         s.last_discovery_refresh = datetime.utcnow()
         db.commit()
         log.info(f"Discovery refresh complete: +{total_added} items total")
+        _set_discovery_state(
+            running=False, phase="Complete",
+            detail=f"+{total_added} new items across {len(users)} user(s)",
+            users_done=len(users), items_added=total_added, error=None,
+        )
     except Exception as e:
         log.error(f"Discovery refresh run failed: {e}")
+        _set_discovery_state(running=False, phase="Error", error=str(e))
     finally:
         db.close()
 
@@ -447,10 +560,23 @@ async def _run_playlist_regen():
     try:
         from services.playlist_writer import run_playlist_generation
         log.info("Scheduled playlist regeneration starting...")
+        _set_playlist_state(
+            running=True, phase="Starting playlist generation",
+            detail="Scoring and writing playlists for all users",
+            playlists_done=0, playlists_total=0, error=None,
+        )
         result = await run_playlist_generation(db)
-        log.info(f"Playlist regen complete: {result.get('playlists_written', 0)} written")
+        written = result.get("playlists_written", 0)
+        total   = result.get("playlists_total", written)
+        log.info(f"Playlist regen complete: {written} written")
+        _set_playlist_state(
+            running=False, phase="Complete",
+            detail=f"{written} playlist(s) written",
+            playlists_done=written, playlists_total=total, error=None,
+        )
     except Exception as e:
         log.error(f"Playlist regen failed: {e}")
+        _set_playlist_state(running=False, phase="Error", error=str(e))
     finally:
         db.close()
 
@@ -471,6 +597,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
     - If any item has auto_queued=True (user said "getting this next"), send that first
     - Otherwise pick the highest-scored pending item not marked auto_skip
     """
+    _set_download_state(running=True, phase="Starting", detail="Checking gates…", sent=0, total=0, error=None)
     db = SessionLocal()
     try:
         s = _get_or_create_settings(db)
@@ -478,6 +605,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
         # Gate 1: master switch
         if not s.auto_download_enabled:
             log.info("Auto-download: skipping — disabled")
+            _set_download_state(running=False, phase="Skipped — auto-download is disabled", error=None)
             return
 
         # Gate 2: cooldown check
@@ -487,6 +615,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
             if elapsed < cooldown:
                 remaining = (cooldown - elapsed).total_seconds() / 3600
                 log.info(f"Auto-download: cooldown active — {remaining:.1f}h remaining")
+                _set_download_state(running=False, phase=f"Cooldown active — {remaining:.1f}h remaining", error=None)
                 return
 
         from models import DiscoveryQueueItem
@@ -496,6 +625,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
             base_url, api_key = _get_lidarr_creds(db)
         except Exception as e:
             log.error(f"Auto-download: Lidarr not configured — {e}")
+            _set_download_state(running=False, phase="Lidarr not configured", error=str(e))
             return
 
         # Gate 2b: refresh discovery queue before picking candidates.
@@ -513,6 +643,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
 
         if needs_refresh:
             log.info("Auto-download: running discovery refresh before picking candidates...")
+            _set_download_state(phase="Refreshing discovery queue…", detail="Pre-run queue update")
             try:
                 users_for_refresh = db.query(ManagedUser).filter_by(is_enabled=True).all()
                 from routers.discovery import _populate_queue_for_user
@@ -538,6 +669,12 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
         max_total  = s.auto_download_max_per_run
         users_sent_this_run: set = set()
 
+        _set_download_state(
+            phase="Selecting candidates",
+            detail=f"Up to {max_total} album(s) across {len(users)} user(s)",
+            total=max_total,
+        )
+
         async def _send_candidate(candidate, user, is_pinned: bool):
             nonlocal total_sent
             log.info(
@@ -556,6 +693,11 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
                     candidate.auto_queued = False
                     total_sent += 1
                     users_sent_this_run.add(user.jellyfin_user_id)
+                    _set_download_state(
+                        phase=f"Sending to Lidarr",
+                        detail=f"{candidate.artist_name} — {candidate.album_name or 'album'}",
+                        sent=total_sent,
+                    )
                     log.info(f"  ✓ {result['message']}")
                     from services.events import log_event
                     # Use the album name Lidarr actually searched for (from result["message"]),
@@ -625,14 +767,17 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
             db.commit()
         if total_sent > 0:
             log.info(f"Auto-download complete: {total_sent} album(s) sent to Lidarr")
+            _set_download_state(running=False, phase="Complete", detail=f"{total_sent} album(s) sent to Lidarr", sent=total_sent, error=None)
         else:
             log.info("Auto-download: ran, no albums sent this run (queue empty or all filtered)")
+            _set_download_state(running=False, phase="Complete — nothing to send", detail="Queue empty or all candidates filtered", sent=0, error=None)
 
 
     except Exception as e:
         log.error(f"Auto-download run failed: {e}")
         import traceback
         log.error(traceback.format_exc())
+        _set_download_state(running=False, phase="Error", error=str(e))
     finally:
         db.close()
 
