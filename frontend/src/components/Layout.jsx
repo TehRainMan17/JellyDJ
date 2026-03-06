@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, ListMusic, Telescope, Settings,
-  Plug, Radio, BarChart2, Menu, X, ChevronRight, Ban,
+  Plug, BarChart2, Menu, X, ChevronRight, Ban,
 } from 'lucide-react'
+import logoUrl from '/logo-64.png'
 
 const NAV = [
   { to: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard'       },
@@ -25,14 +26,18 @@ function SidebarContent({ onClose }) {
   return (
     <div className="flex flex-col h-full">
       {/* Logo */}
-      <div className="h-14 flex items-center px-4 gap-3 flex-shrink-0"
+      <div className="h-16 flex items-center px-4 gap-3 flex-shrink-0"
            style={{ borderBottom: '1px solid var(--border)' }}>
-        <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 anim-glow"
-             style={{ background: 'linear-gradient(135deg, var(--accent) 0%, var(--accent-dim) 100%)' }}>
-          <Radio size={15} color="#0a0e17" strokeWidth={2.5} />
-        </div>
-        <span style={{ fontFamily:'Syne', fontWeight:800, fontSize:18, letterSpacing:'-0.02em', color:'var(--text-primary)' }}>
-          JellyDJ
+        <img
+          src={logoUrl}
+          alt="JellyDJ"
+          width={52}
+          height={52}
+          className="flex-shrink-0 anim-glow"
+          style={{ borderRadius: '50%' }}
+        />
+        <span style={{ fontFamily:'Syne', fontWeight:800, fontSize:18, letterSpacing:'-0.02em' }}>
+          <span style={{ background: 'linear-gradient(90deg, #5be6f5 0%, #9b5de5 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>Jelly</span><span style={{ background: 'linear-gradient(90deg, #9b5de5 0%, #b44fff 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>DJ</span>
         </span>
         {onClose && (
           <button onClick={onClose}
@@ -58,7 +63,7 @@ function SidebarContent({ onClose }) {
       {/* Footer */}
       <div className="px-4 py-3 flex-shrink-0" style={{ borderTop: '1px solid var(--border)' }}>
         <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-[var(--accent)] anim-glow" />
+          <div className="w-2 h-2 rounded-full anim-glow" style={{ background: 'var(--accent)' }} />
           <span style={{ fontSize:11, color:'var(--text-muted)', fontFamily:'JetBrains Mono,monospace' }}>v0.1.0</span>
         </div>
       </div>
@@ -135,10 +140,10 @@ export default function Layout() {
 
           <Breadcrumb />
 
-          {/* Right slot — could add notifications, user avatar, etc later */}
+          {/* Right slot */}
           <div className="ml-auto flex items-center gap-2">
             <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
-                 style={{ background:'rgba(0,212,170,0.06)', border:'1px solid rgba(0,212,170,0.12)' }}>
+                 style={{ background:'var(--accent-soft)', border:'1px solid rgba(83,236,252,0.15)' }}>
               <div className="w-1.5 h-1.5 rounded-full anim-glow" style={{ background:'var(--accent)' }} />
               <span style={{ fontSize:11, color:'var(--accent)', fontWeight:600 }}>Live</span>
             </div>

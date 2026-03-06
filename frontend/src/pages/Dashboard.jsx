@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback } from 'react'
 import {
   Activity, Music2, Telescope, CheckCircle2, XCircle, Loader2,
@@ -70,11 +69,12 @@ function BillboardDownloadModal({ entry, onClose, onSuccess }) {
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)' }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
+      onPointerDown={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
       <div
         className="w-full max-w-sm rounded-2xl overflow-hidden anim-fade-up"
         style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', boxShadow: '0 32px 80px rgba(0,0,0,0.6)' }}
+        onPointerDown={(e) => e.stopPropagation()}
       >
         {/* Album art header */}
         <div className="relative h-40 overflow-hidden">
@@ -204,7 +204,7 @@ function BillboardDownloadModal({ entry, onClose, onSuccess }) {
             <button
               onClick={onClose}
               className="flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
-              style={{ background: 'var(--bg-overlay)', color: 'var(--text-secondary)', border: '1px solid var(--border)' }}
+              style={{ background: 'var(--bg-overlay)', color: 'var(--text-secondary)', border: '1px solid var(--border)', touchAction: 'manipulation', WebkitTapHighlightColor: 'transparent' }}
             >
               {status === 'ok' ? 'Close' : 'Cancel'}
             </button>
@@ -213,7 +213,7 @@ function BillboardDownloadModal({ entry, onClose, onSuccess }) {
                 onClick={handleDownload}
                 disabled={status === 'loading'}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all btn-primary"
-                style={{ opacity: status === 'loading' ? 0.7 : 1 }}
+                style={{ opacity: status === 'loading' ? 0.7 : 1, touchAction: 'manipulation', WebkitTapHighlightColor: 'transparent' }}
               >
                 {status === 'loading'
                   ? <><Loader2 size={13} className="animate-spin" />Sending…</>
@@ -240,14 +240,16 @@ function BillboardCard({ entry, rank, onClick }) {
       style={{
         animationDelay: `${rank * 60}ms`,
         background: 'var(--bg-card)',
-        border: `1px solid ${inLibrary ? 'rgba(0,212,170,0.2)' : 'var(--border)'}`,
+        border: `1px solid ${inLibrary ? 'rgba(83,236,252,0.2)' : 'var(--border)'}`,
         cursor: inLibrary ? 'default' : 'pointer',
+        touchAction: 'manipulation',
+        WebkitTapHighlightColor: 'transparent',
       }}
       onMouseEnter={e => {
         if (inLibrary) return
         e.currentTarget.style.transform = 'translateY(-2px)'
         e.currentTarget.style.borderColor = 'var(--accent)'
-        e.currentTarget.style.boxShadow = '0 8px 32px rgba(0,212,170,0.12)'
+        e.currentTarget.style.boxShadow = '0 8px 32px rgba(83,236,252,0.12)'
       }}
       onMouseLeave={e => {
         if (inLibrary) return
@@ -263,7 +265,7 @@ function BillboardCard({ entry, rank, onClick }) {
           <img
             src={entry.image_url}
             alt=""
-            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+            className="w-full h-full object-cover transition-transform duration-300"
             onError={() => setImgError(true)}
           />
         ) : (
@@ -290,8 +292,8 @@ function BillboardCard({ entry, rank, onClick }) {
         )}
 
         {/* Hover overlay — only show download CTA if not already in library */}
-        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200"
-             style={{ background: 'rgba(0,0,0,0.45)' }}>
+        <div className="absolute inset-0 flex items-center justify-center billboard-card-overlay transition-opacity duration-200"
+             style={{ background: 'rgba(0,0,0,0.45)', pointerEvents: 'none' }}>
           {entry.in_library ? (
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold"
                  style={{ background: 'rgba(0,212,170,0.85)', color: '#fff' }}>

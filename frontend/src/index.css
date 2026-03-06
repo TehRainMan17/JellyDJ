@@ -2,25 +2,48 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── JellyDJ Design Tokens ──────────────────────────────────────────────────
+   Palette derived directly from the JellyDJ logo:
+     Cyan glow   (#53ecfc) — jellyfish bell highlight  → primary accent
+     Lavender    (#a28ffb) — outer ring / tentacles    → secondary / purple
+     Deep navy   (#090b22) — logo background           → app background
+     Inner navy  (#13194b) — inner circle              → surface
+   ────────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg:           #0a0e17;
-  --bg-surface:   #111827;
-  --bg-elevated:  #1a2235;
-  --bg-overlay:   #1f2d42;
-  --border:       rgba(99, 130, 180, 0.12);
-  --border-mid:   rgba(99, 130, 180, 0.22);
-  --accent:       #00d4aa;
-  --accent-dim:   #00a882;
-  --accent-glow:  rgba(0, 212, 170, 0.18);
-  --accent-soft:  rgba(0, 212, 170, 0.07);
+  /* Backgrounds */
+  --bg:           #090b22;
+  --bg-surface:   #0f1333;
+  --bg-elevated:  #161a42;
+  --bg-overlay:   #1c2254;
+
+  /* Borders — tinted with the lavender accent */
+  --border:       rgba(162, 143, 251, 0.10);
+  --border-mid:   rgba(162, 143, 251, 0.22);
+
+  /* Primary accent — cyan jellyfish glow */
+  --accent:       #53ecfc;
+  --accent-dim:   #2dc8d8;
+  --accent-glow:  rgba(83, 236, 252, 0.18);
+  --accent-soft:  rgba(83, 236, 252, 0.07);
+
+  /* Secondary accent — lavender ring */
+  --purple:       #a28ffb;
+  --purple-dim:   #7d6bd6;
+  --purple-glow:  rgba(162, 143, 251, 0.18);
+  --purple-soft:  rgba(162, 143, 251, 0.07);
+
+  /* Text */
   --text-primary:   #e8edf5;
-  --text-secondary: #8899b5;
-  --text-muted:     #4a5568;
+  --text-secondary: #8d9fc4;
+  --text-muted:     #465070;
+
+  /* Semantic */
   --danger:  #f87171;
   --warning: #fbbf24;
-  --purple:  #a78bfa;
+
+  /* Layout */
   --sidebar-w: 220px;
-  --header-h:  56px;
+  --header-h:  64px;
 }
 
 @layer base {
@@ -34,8 +57,8 @@
   }
   ::-webkit-scrollbar { width: 5px; height: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(99,130,180,0.2); border-radius: 99px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(99,130,180,0.35); }
+  ::-webkit-scrollbar-thumb { background: rgba(162,143,251,0.2); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(162,143,251,0.35); }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
   ::selection { background: var(--accent-glow); color: var(--text-primary); }
 }
@@ -65,7 +88,7 @@
   .badge {
     @apply inline-flex items-center justify-center min-w-[18px] h-[18px]
            px-1.5 rounded-full text-[10px] font-bold font-mono;
-    background: var(--accent); color: #0a0e17;
+    background: var(--accent); color: var(--bg);
   }
 
   .btn {
@@ -75,7 +98,7 @@
   }
   .btn-primary {
     @apply btn;
-    background: var(--accent); color: #0a0e17;
+    background: var(--accent); color: var(--bg);
   }
   .btn-primary:hover:not(:disabled) {
     background: var(--accent-dim);
@@ -105,8 +128,8 @@
   .input::placeholder { color: var(--text-muted); }
   .input:focus {
     outline: none;
-    border-color: rgba(0,212,170,0.5);
-    box-shadow: 0 0 0 3px rgba(0,212,170,0.08);
+    border-color: rgba(83, 236, 252, 0.5);
+    box-shadow: 0 0 0 3px rgba(83, 236, 252, 0.08);
     background: rgba(255,255,255,0.06);
   }
 
@@ -126,8 +149,12 @@
   @keyframes scale-in  { from { opacity:0; transform:scale(0.95); } to { opacity:1; transform:none; } }
   @keyframes shimmer   { from { background-position:-200% 0; } to { background-position:200% 0; } }
   @keyframes glow-pulse {
-    0%,100% { box-shadow: 0 0 6px rgba(0,212,170,0.3); }
-    50%      { box-shadow: 0 0 18px rgba(0,212,170,0.6); }
+    0%,100% { box-shadow: 0 0 6px rgba(83, 236, 252, 0.3); }
+    50%      { box-shadow: 0 0 18px rgba(83, 236, 252, 0.65); }
+  }
+  @keyframes purple-pulse {
+    0%,100% { box-shadow: 0 0 6px rgba(162, 143, 251, 0.3); }
+    50%      { box-shadow: 0 0 18px rgba(162, 143, 251, 0.65); }
   }
 
   .anim-fade-up  { animation: fade-up  0.35s ease both; }
@@ -135,6 +162,7 @@
   .anim-slide-r  { animation: slide-r  0.3s cubic-bezier(0.4,0,0.2,1) both; }
   .anim-scale-in { animation: scale-in 0.25s ease both; }
   .anim-glow     { animation: glow-pulse 2s ease-in-out infinite; }
+  .anim-glow-purple { animation: purple-pulse 2s ease-in-out infinite; }
 
   .stagger > *:nth-child(1) { animation-delay:0ms; }
   .stagger > *:nth-child(2) { animation-delay:50ms; }
@@ -155,15 +183,17 @@
   .page-enter { animation: fade-up 0.3s ease both; }
   .text-accent { color: var(--accent); }
   .text-accent-glow { color: var(--accent); text-shadow: 0 0 20px var(--accent-glow); }
+  .text-purple { color: var(--purple); }
+  .text-purple-glow { color: var(--purple); text-shadow: 0 0 20px var(--purple-glow); }
 }
 
 /* Range inputs */
 input[type=range] { -webkit-appearance:none; appearance:none; height:4px; border-radius:99px; background:var(--bg-overlay); cursor:pointer; width:100%; }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--accent); border:2px solid var(--bg); box-shadow:0 0 8px var(--accent-glow); transition:transform 150ms,box-shadow 150ms; }
-input[type=range]::-webkit-slider-thumb:hover { transform:scale(1.2); box-shadow:0 0 14px rgba(0,212,170,0.55); }
+input[type=range]::-webkit-slider-thumb:hover { transform:scale(1.2); box-shadow:0 0 14px rgba(83,236,252,0.55); }
 input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:var(--accent); border:2px solid var(--bg); }
 
-/* Indeterminate progress bar (used while waiting for sync endpoints) */
+/* Indeterminate progress bar */
 @keyframes indeterminate {
   0%   { transform: translateX(-100%) scaleX(0.5); }
   50%  { transform: translateX(0%)    scaleX(0.6); }
@@ -175,6 +205,16 @@ input[type=range]::-moz-range-thumb { width:16px; height:16px; border-radius:50%
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.3; }
+}
+
+/* Billboard card overlay — hover on desktop, always-on on touch */
+.billboard-card-overlay { opacity: 0; }
+@media (hover: hover) {
+  .group:hover .billboard-card-overlay { opacity: 1; }
+}
+@media (hover: none) {
+  /* Touch device — always show the overlay so the CTA is always tappable */
+  .billboard-card-overlay { opacity: 1; }
 }
 
 /* Mobile */

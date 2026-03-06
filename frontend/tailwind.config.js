@@ -9,6 +9,7 @@ export default {
         elevated: 'var(--bg-elevated)',
         border:   'var(--border)',
         accent:   'var(--accent)',
+        purple:   'var(--purple)',
         danger:   'var(--danger)',
         warning:  'var(--warning)',
         muted:    'var(--text-muted)',
