@@ -1,4 +1,3 @@
-
 """
 JellyDJ Playlist Writer — Module 7
 
@@ -7,7 +6,7 @@ Each managed user gets their own named playlist visible to all Jellyfin users.
 
 Playlist types:
   for_you         — "For You - Alice"          affinity-weighted
-  discover        — "Discover Weekly - Alice"  novelty-heavy, NEW-artist-first
+  discover        — "New For You - Alice"  novelty-heavy, NEW-artist-first
   most_played     — "Most Played - Alice"      sorted by play count
   recently_played — "Recently Played - Alice"  sorted by last_played desc
 
@@ -154,7 +153,7 @@ log = logging.getLogger(__name__)
 
 # Track counts per playlist type.
 # Kept intentionally different so each playlist feels sized appropriately —
-# "Most Played" at 50 gives a decent listening session; "Discover Weekly"
+# "Most Played" at 50 gives a decent listening session; "New For You"
 # at 40 keeps the unfamiliar content digestible.
 # Playlist names in Jellyfin follow the pattern "<Label> - <Username>",
 # e.g. "For You - Alice". Jellyfin shows these to all users on the server
@@ -168,7 +167,7 @@ PLAYLIST_SIZES = {
 
 PLAYLIST_LABELS = {
     "for_you":          "For You",
-    "discover":         "Discover Weekly",
+    "discover":         "New For You",
     "most_played":      "Most Played",
     "recently_played":  "Recently Played",
 }
@@ -235,7 +234,7 @@ def _build_artist_play_totals(user_id: str, db: Session) -> dict[str, int]:
     """
     Return a dict of {artist_name_lower: total_play_count} for the user.
 
-    This is the key signal for Discover Weekly: we need to know which artists
+    This is the key signal for New For You: we need to know which artists
     the user has NEVER played (strangers), barely played (acquaintances), and
     plays heavily (familiar). We derive this from the ArtistProfile table which
     the scoring engine builds on every index run.
@@ -288,12 +287,12 @@ def _get_tracks_for_playlist(
 
     Variety mechanisms:
     - for_you:   20% reserved discovery slots (unplayed from loved artists) +
-                 10% deep cuts (high-affinity tracks not heard in 6+ months) +
+                 10% deep cuts (high-affinity tracks not heard in 1+ month) +
                  mid-tier score jitter on the remaining 70%
     - discover:  NEW-ARTIST-FIRST algorithm (see below)
     - most_played / recently_played: stable (intentionally deterministic)
 
-    Discover Weekly algorithm (completely reworked):
+    New For You algorithm (completely reworked):
     ─────────────────────────────────────────────────
     Goal: Surface the absolute best songs from artists the user has never
     or barely played, filtered by genre/taste compatibility, sorted by
@@ -311,7 +310,7 @@ def _get_tracks_for_playlist(
       Familiar: genre_affinity DESC (still unplayed, just from known artists)
 
     Per-artist cap:
-      Discover Weekly uses max_per_artist=1 (one song per artist, period).
+      New For You uses max_per_artist=1 (one song per artist, period).
       This forces maximum breadth. If the pool runs dry we relax to 2.
 
     Popularity bonus:
@@ -444,8 +443,8 @@ def _get_tracks_for_playlist(
         discovery_ids = _diversify(discovery_pool, n_discovery)
         combined_set = core_set | set(discovery_ids)
 
-        # Deep cuts: high affinity, played, not heard in 6+ months
-        cutoff = datetime.utcnow() - timedelta(days=180)
+        # Deep cuts: high affinity, played, not heard in 1+ month
+        cutoff = datetime.utcnow() - timedelta(days=30)
         deep_pool = (
             db.query(TrackScore)
             .filter_by(user_id=user_id)
@@ -588,7 +587,7 @@ def _get_tracks_for_playlist(
         familiar.sort(key=lambda r: r._discover_score, reverse=True)
 
         log.info(
-            f"  Discover Weekly [{username}]: "
+            f"  New For You [{username}]: "
             f"{len(strangers)} stranger tracks, "
             f"{len(acquaintances)} acquaintance tracks, "
             f"{len(familiar)} familiar-unplayed tracks"
@@ -621,7 +620,7 @@ def _get_tracks_for_playlist(
         # If a bucket ran dry, backfill from the others (still strict cap)
         shortage = limit - len(stranger_ids) - len(acquaintance_ids) - len(familiar_ids)
         if shortage > 0:
-            log.info(f"  Discover Weekly [{username}]: backfilling {shortage} slots from remaining pools")
+            log.info(f"  New For You [{username}]: backfilling {shortage} slots from remaining pools")
             remaining = [
                 r for r in (strangers + acquaintances + familiar)
                 if r.jellyfin_item_id not in used_ids
@@ -632,7 +631,7 @@ def _get_tracks_for_playlist(
 
         result = stranger_ids + acquaintance_ids + familiar_ids
         log.info(
-            f"  Discover Weekly [{username}]: "
+            f"  New For You [{username}]: "
             f"{len(stranger_ids)} strangers + {len(acquaintance_ids)} acquaintances + "
             f"{len(familiar_ids)} familiar = {len(result)} total"
         )

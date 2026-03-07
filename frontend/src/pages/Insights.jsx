@@ -1,4 +1,3 @@
-
 import { useState, useEffect } from 'react'
 import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
@@ -910,7 +909,7 @@ function TrackTable({ userId }) {
                               <>
                                 This track is <strong className="text-[#388bfd]">unplayed</strong>. It starts with a base score of 35 plus artist/genre affinity signals ({t.artist_affinity.toFixed(0)} + {t.genre_affinity.toFixed(0)}), capped at 65 to keep it below genuinely loved tracks.
                                 {(t.novelty_bonus || 0) > 0 && <> A small novelty bonus of +{parseFloat(t.novelty_bonus).toFixed(1)} helps surface it.</>}
-                                {t.track_popularity != null ? <> This song has <strong className="text-green-400">{(t.track_listeners || 0).toLocaleString()}</strong> Last.fm listeners (song popularity <strong className="text-green-400">{t.track_popularity.toFixed(0)}</strong>/100), which nudges its score and informs Discover Weekly ranking.</> : t.artist_popularity != null ? <> No per-song data yet — using artist popularity (<strong className="text-[var(--accent)]">{t.artist_popularity.toFixed(0)}</strong>/100) as a fallback. Run enrichment to get track-specific listener counts.</> : null}
+                                {t.track_popularity != null ? <> This song has <strong className="text-green-400">{(t.track_listeners || 0).toLocaleString()}</strong> Last.fm listeners (song popularity <strong className="text-green-400">{t.track_popularity.toFixed(0)}</strong>/100), which nudges its score and informs New For You ranking.</> : t.artist_popularity != null ? <> No per-song data yet — using artist popularity (<strong className="text-[var(--accent)]">{t.artist_popularity.toFixed(0)}</strong>/100) as a fallback. Run enrichment to get track-specific listener counts.</> : null}
                               </>
                             )}
                           </div>
@@ -1260,7 +1259,7 @@ function ArtistTable({ userId }) {
                           {a.related_artists && a.related_artists.length > 0 && (
                             <div>
                               <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-1.5">
-                                Similar artists (Last.fm) — used for Discover Weekly
+                                Similar artists (Last.fm) — used for New For You
                               </div>
                               <div className="flex flex-wrap gap-1.5">
                                 {a.related_artists.slice(0, 10).map(rel => (
@@ -1529,4 +1528,3 @@ export default function Insights() {
     </div>
   )
 }
-

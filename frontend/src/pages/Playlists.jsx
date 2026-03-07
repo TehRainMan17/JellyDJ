@@ -5,7 +5,7 @@ import JobProgress from '../components/JobProgress.jsx'
 
 const TYPE_CFG = {
   for_you:         { label:'For You',         icon:Sparkles,   color:'var(--accent)', desc:'Affinity-weighted picks from your history' },
-  discover:        { label:'Discover Weekly', icon:Radio,      color:'#fbbf24',        desc:"Novelty-heavy — tracks you haven't heard yet" },
+  discover:        { label:'New For You',     icon:Radio,      color:'#fbbf24',        desc:"Novel picks — artists and tracks you haven't heard yet, ranked by how well they fit your taste" },
   most_played:     { label:'Most Played',     icon:TrendingUp, color:'#f78166',        desc:'Your all-time top tracks' },
   recently_played: { label:'Recently Played', icon:History,    color:'#8899b5',        desc:"What you've been listening to lately" },
 }

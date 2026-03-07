@@ -1,4 +1,3 @@
-
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3).
 
@@ -340,6 +339,9 @@ class AutomationSettings(Base):
     billboard_refresh_enabled = Column(Boolean, default=True)
     billboard_refresh_interval_hours = Column(Integer, nullable=False, default=168)
     last_billboard_refresh = Column(DateTime, nullable=True)
+    # v7: popularity cache refresh schedule
+    popularity_cache_refresh_interval_hours = Column(Integer, nullable=False, default=24)
+    last_popularity_cache_refresh = Column(DateTime, nullable=True)
 
 
 # ── v2: new tables (created by create_all, never existed before) ──────────────

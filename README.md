@@ -8,6 +8,7 @@
   <a href="https://github.com/TehRainMan17/JellyDJ/issues"><img src="https://img.shields.io/github/issues/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=f87171&labelColor=090b22&logoColor=f87171" alt="Issues" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-a28ffb?style=for-the-badge&labelColor=090b22" alt="License" /></a>
   <a href="https://hub.docker.com/r/562ray/jellydj-backend"><img src="https://img.shields.io/docker/pulls/562ray/jellydj-backend?style=for-the-badge&logo=docker&color=5be6f5&labelColor=090b22&logoColor=5be6f5" alt="Docker Pulls" /></a>
+  <a href="https://discord.gg/HdKaQSAaGa"><img src="https://img.shields.io/badge/discord-join-5865f2?style=for-the-badge&logo=discord&labelColor=090b22&logoColor=5865f2" alt="Discord" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +41,7 @@ It watches what everyone in the house listens to, builds taste profiles per pers
 | | Feature | Description |
 |---|---|---|
 | 🧠 | **Per-User Taste Profiles** | Affinity scores built from play counts, recency, skips, favorites, and replay signals — per person |
-| 📋 | **Smart Playlists** | *For You*, *Discover Weekly*, *Most Played*, *Recently Played* — auto-generated directly in Jellyfin |
+| 📋 | **Smart Playlists** | *For You*, *New For You*, *Most Played*, *Recently Played* — auto-generated directly in Jellyfin |
 | 🔭 | **Discovery Queue** | New artist and album recommendations ranked by affinity + novelty, ready to approve or reject |
 | 📥 | **Auto-Download** | Approved discoveries go straight to Lidarr — your library grows while you sleep |
 | 🔥 | **Billboard Hot 100** | Weekly chart data cross-referenced with your library so you never miss a trending track |

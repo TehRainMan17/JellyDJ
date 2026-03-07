@@ -8,7 +8,7 @@
  *   indexStatus    enrichStatus   discoverStatus
  *   cacheStatus    playlistStatus downloadStatus
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Database, Sparkles, Star, Telescope, Music2, Download } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -216,6 +216,8 @@ const JOB_ROWS = [
   },
 ]
 
+const HIDE_AFTER_MS = 20_000  // hide completed rows after 20 s
+
 export default function JobProgress({
   indexStatus,
   cacheStatus,
@@ -235,7 +237,48 @@ export default function JobProgress({
     download: downloadStatus,
   }
 
+  // completedAt[key] = timestamp (ms) when a job first entered "done" state
+  const completedAt = useRef({})
+  // hidden[key] = true once the 20-s timer has fired
+  const [hidden, setHidden] = useState({})
+
+  useEffect(() => {
+    const timers = []
+
+    JOB_ROWS.forEach(({ key }) => {
+      const s = statuses[key]
+      const isDone = s && !s.running && !s.error && !!s.finished_at
+
+      if (isDone) {
+        // Record the first time we see this job as done
+        if (!completedAt.current[key]) {
+          completedAt.current[key] = Date.now()
+        }
+        // If not already hidden, schedule (or fire immediately if overdue)
+        if (!hidden[key]) {
+          const elapsed = Date.now() - completedAt.current[key]
+          const delay = Math.max(0, HIDE_AFTER_MS - elapsed)
+          const id = setTimeout(() => {
+            setHidden(prev => ({ ...prev, [key]: true }))
+          }, delay)
+          timers.push(id)
+        }
+      } else {
+        // Job is running or errored — reset so it shows again on next completion
+        if (completedAt.current[key]) {
+          delete completedAt.current[key]
+        }
+        if (hidden[key]) {
+          setHidden(prev => { const n = { ...prev }; delete n[key]; return n })
+        }
+      }
+    })
+
+    return () => timers.forEach(clearTimeout)
+  })  // run every render so timers stay accurate as statuses update
+
   const visible = JOB_ROWS.filter(({ key }) => {
+    if (hidden[key]) return false
     const s = statuses[key]
     return s && (s.running || s.finished_at || s.error)
   })

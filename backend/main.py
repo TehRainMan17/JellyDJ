@@ -1,4 +1,3 @@
-
 """
 JellyDJ — FastAPI application entry point.
 
@@ -112,6 +111,9 @@ def _run_migrations():
         # InvalidRequestError that was silently swallowed — no replay signals were
         # ever written, so replay_boost was always null/0 for every track.
         ("user_replay_signals", "first_play_at", "DATETIME", "NULL"),
+        # v7: popularity cache refresh schedule on AutomationSettings
+        ("automation_settings", "popularity_cache_refresh_interval_hours", "INTEGER",  "24"),
+        ("automation_settings", "last_popularity_cache_refresh",           "DATETIME", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:

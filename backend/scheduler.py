@@ -6,18 +6,22 @@ coroutines and share the same event loop as FastAPI.
 
 Registered jobs
 ───────────────
-  play_history_index   Run library scan + per-user play history sync + score rebuild.
-                       Default: every 6 hours. Configurable in Automation settings.
+  play_history_index      Run library scan + per-user play history sync + score rebuild.
+                          Default: every 6 hours. Configurable in Automation settings.
 
-  discovery_refresh    Populate the discovery queue with new album recommendations
-                       for all enabled users. Default: every 24 hours.
+  discovery_refresh       Populate the discovery queue with new album recommendations
+                          for all enabled users. Default: every 24 hours.
 
-  playlist_regen       Regenerate all Jellyfin playlists from current scores.
-                       Default: every 24 hours.
+  playlist_regen          Regenerate all Jellyfin playlists from current scores.
+                          Default: every 24 hours.
 
-  auto_download        Send top-scored pending discovery items to Lidarr.
-                       Starts paused; only runs when auto_download_enabled=True.
-                       Interval matches the cooldown_days setting.
+  auto_download           Send top-scored pending discovery items to Lidarr.
+                          Starts paused; only runs when auto_download_enabled=True.
+                          Interval matches the cooldown_days setting.
+
+  popularity_cache_refresh  Refresh the artist-level popularity cache (listener counts,
+                          tags, similar artists) from Last.fm and other adapters.
+                          Default: every 24 hours. Configurable in Automation settings.
 
 All intervals are re-read from the AutomationSettings database row on startup
 via reschedule_automation_jobs(), so changes made in the UI take effect after
@@ -43,6 +47,7 @@ PLAYLIST_JOB_ID       = "playlist_regen"
 AUTO_DOWNLOAD_JOB_ID  = "auto_download"
 BILLBOARD_JOB_ID      = "billboard_refresh"
 ENRICHMENT_JOB_ID     = "enrichment"
+POPULARITY_CACHE_JOB_ID = "popularity_cache_refresh"
 
 
 def _get_settings(db):
@@ -138,6 +143,12 @@ def _job_enrichment():
         log.error(f"Enrichment job failed: {e}")
     finally:
         db.close()
+
+
+def _job_popularity_cache_refresh():
+    """Periodic job: refresh artist-level popularity cache from Last.fm and other adapters."""
+    from routers.automation import _run_popularity_cache_refresh
+    _sync_wrap(_run_popularity_cache_refresh)
 
 
 def _job_holiday_flags():
@@ -243,6 +254,14 @@ def start_scheduler(db_session_factory):
     )
 
     scheduler.add_job(
+        _job_popularity_cache_refresh,
+        trigger=IntervalTrigger(hours=24),  # default; reschedule() below corrects from DB
+        id=POPULARITY_CACHE_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
         _job_holiday_flags,
         trigger=IntervalTrigger(hours=24, start_date=datetime.now(timezone.utc)),
         id="holiday_flags",
@@ -255,7 +274,7 @@ def start_scheduler(db_session_factory):
     # Auto-download starts paused — reschedule_automation_jobs will enable it
     # only if auto_download_enabled=True is saved in the database
     scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (5 jobs registered).")
+    log.info("Scheduler started (7 jobs registered).")
 
     # Run billboard sync immediately on first start if table is empty
     _run_billboard_if_empty()
@@ -454,6 +473,29 @@ def reschedule_automation_jobs(db):
     except Exception:
         pass
 
+    # Popularity cache refresh — always enabled, last-run-based scheduling
+    pop_cache_interval = getattr(s, "popularity_cache_refresh_interval_hours", 24) or 24
+    _pc_last = getattr(s, "last_popularity_cache_refresh", None)
+    _now = datetime.now(timezone.utc)
+    from datetime import timedelta as _td
+    if _pc_last is None:
+        # Never run — fire shortly after startup so new installs populate quickly
+        _pc_next = _now + _td(minutes=10)
+    else:
+        if _pc_last.tzinfo is None:
+            _pc_last = _pc_last.replace(tzinfo=timezone.utc)
+        _pc_next = _pc_last + _td(hours=pop_cache_interval)
+        if _pc_next < _now:
+            _pc_next = _now + _td(minutes=10)
+    try:
+        scheduler.reschedule_job(
+            POPULARITY_CACHE_JOB_ID,
+            trigger=IntervalTrigger(hours=pop_cache_interval, start_date=_pc_next),
+        )
+        scheduler.resume_job(POPULARITY_CACHE_JOB_ID)
+    except Exception:
+        pass
+
     log.info(
         f"Automation rescheduled: index={s.index_interval_hours}h | "
         f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
@@ -464,7 +506,8 @@ def reschedule_automation_jobs(db):
         f"(every {cooldown_days}d) | "
         f"billboard={'on' if billboard_enabled else 'off'} "
         f"(every {billboard_interval}h) | "
-        f"enrichment=on (every {enrich_interval}h)"
+        f"enrichment=on (every {enrich_interval}h) | "
+        f"popularity_cache=on (every {pop_cache_interval}h)"
     )
 
 

@@ -1,9 +1,8 @@
-
 import { useState, useEffect, useCallback } from 'react'
 import WebhookSetupPanel from '../components/WebhookSetupPanel.jsx'
 import {
   Plug, CheckCircle2, XCircle, Loader2, Eye, EyeOff,
-  RefreshCw, Users, ChevronDown, ChevronUp, Save, Trash2, Database,
+  RefreshCw, Users, ChevronDown, ChevronUp, Save,
 } from 'lucide-react'
 
 // ── Shared sub-components ─────────────────────────────────────────────────────
@@ -833,67 +832,6 @@ function NoKeyServiceCard({ title, color, icon, testUrl, description, docsUrl, d
   )
 }
 
-// ── Cache panel ───────────────────────────────────────────────────────────────
-
-function CachePanel() {
-  const [stats, setStats] = useState(null)
-  const [clearing, setClearing] = useState(false)
-
-  const fetchStats = () => {
-    fetch('/api/external-apis/cache/stats')
-      .then(r => r.json())
-      .then(setStats)
-      .catch(() => {})
-  }
-
-  useEffect(() => { fetchStats() }, [])
-
-  const handleClear = async () => {
-    setClearing(true)
-    await fetch('/api/external-apis/cache', { method: 'DELETE' })
-    setClearing(false)
-    fetchStats()
-  }
-
-  return (
-    <div className="card">
-      <div className="flex items-center gap-2 mb-3">
-        <Database size={14} className="text-[var(--text-secondary)]" />
-        <span className="text-sm font-semibold text-[var(--text-primary)]">Popularity Cache</span>
-      </div>
-      <p className="text-xs text-[var(--text-secondary)] mb-4">
-        External API responses are cached for 24 hours to avoid rate limiting.
-      </p>
-      {stats && (
-        <div className="flex gap-6 mb-4">
-          <div>
-            <div className="text-xs text-[var(--text-secondary)] uppercase tracking-wider">Live entries</div>
-            <div className="text-2xl font-bold text-[var(--text-primary)] mt-0.5" style={{ fontFamily: 'Syne' }}>
-              {stats.live_entries}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-[var(--text-secondary)] uppercase tracking-wider">Expired</div>
-            <div className="text-2xl font-bold text-[var(--text-secondary)] mt-0.5" style={{ fontFamily: 'Syne' }}>
-              {stats.expired_entries}
-            </div>
-          </div>
-        </div>
-      )}
-      <button
-        onClick={handleClear}
-        disabled={clearing}
-        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold
-                   bg-[#f85149]/10 hover:bg-[#f85149]/20 border border-[#f85149]/30 text-[var(--danger)]
-                   disabled:opacity-40 transition-all"
-      >
-        {clearing ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
-        Clear Cache
-      </button>
-    </div>
-  )
-}
-
 // ── Page root ─────────────────────────────────────────────────────────────────
 
 export default function Connections() {
@@ -946,8 +884,6 @@ export default function Connections() {
       />
 
       <WebhookSetupPanel />
-
-      <CachePanel />
     </div>
   )
 }

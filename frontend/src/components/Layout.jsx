@@ -118,7 +118,7 @@ export default function Layout() {
           <div className="absolute inset-0" style={{ background:'rgba(0,0,0,0.6)', backdropFilter:'blur(4px)' }}
                onClick={() => setMobileOpen(false)} />
           {/* Drawer */}
-          <aside className="relative z-10 flex flex-col anim-slide-r"
+          <aside className="relative z-10 flex flex-col anim-slide-l"
                  style={{ width:280, background:'var(--bg-surface)', borderRight:'1px solid var(--border)' }}>
             <SidebarContent onClose={() => setMobileOpen(false)} />
           </aside>

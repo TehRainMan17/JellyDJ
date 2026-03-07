@@ -1,4 +1,3 @@
-
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
 plus the activity feed endpoint.
@@ -127,6 +126,9 @@ class AutomationSettingsUpdate(BaseModel):
     auto_download_enabled: Optional[bool] = None
     auto_download_max_per_run: Optional[int] = None
     auto_download_cooldown_days: Optional[int] = None
+    popularity_cache_refresh_interval_hours: Optional[int] = None
+    billboard_refresh_enabled: Optional[bool] = None
+    billboard_refresh_interval_hours: Optional[int] = None
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -156,10 +158,15 @@ def get_settings(db: Session = Depends(get_db)):
         "auto_download_enabled": bool(s.auto_download_enabled),
         "auto_download_max_per_run": s.auto_download_max_per_run,
         "auto_download_cooldown_days": s.auto_download_cooldown_days,
+        "popularity_cache_refresh_interval_hours": s.popularity_cache_refresh_interval_hours,
+        "billboard_refresh_enabled": bool(s.billboard_refresh_enabled),
+        "billboard_refresh_interval_hours": s.billboard_refresh_interval_hours,
         "last_auto_download": s.last_auto_download,
         "last_index": s.last_index,
         "last_discovery_refresh": s.last_discovery_refresh,
         "last_playlist_regen": s.last_playlist_regen,
+        "last_popularity_cache_refresh": s.last_popularity_cache_refresh,
+        "last_billboard_refresh": s.last_billboard_refresh,
     }
 
 
@@ -213,6 +220,19 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
         if not (1 <= payload.auto_download_cooldown_days <= 30):
             raise HTTPException(400, "Cooldown must be 1–30 days")
         s.auto_download_cooldown_days = payload.auto_download_cooldown_days
+
+    if payload.popularity_cache_refresh_interval_hours is not None:
+        if not (1 <= payload.popularity_cache_refresh_interval_hours <= 168):
+            raise HTTPException(400, "Popularity cache interval must be 1–168 hours")
+        s.popularity_cache_refresh_interval_hours = payload.popularity_cache_refresh_interval_hours
+
+    if payload.billboard_refresh_enabled is not None:
+        s.billboard_refresh_enabled = payload.billboard_refresh_enabled
+
+    if payload.billboard_refresh_interval_hours is not None:
+        if not (24 <= payload.billboard_refresh_interval_hours <= 168):
+            raise HTTPException(400, "Billboard interval must be 24–168 hours")
+        s.billboard_refresh_interval_hours = payload.billboard_refresh_interval_hours
 
     db.commit()
 
@@ -338,14 +358,27 @@ def enrichment_trigger_status():
 async def trigger_popularity_cache(db: Session = Depends(get_db)):
     """
     Trigger a full library popularity cache refresh.
-    Runs in a background thread — returns immediately, dashboard stays responsive.
+    Runs in a background task — returns immediately, dashboard stays responsive.
     Poll GET /trigger/popularity-cache/status for progress.
     """
     from services.indexer import get_cache_refresh_state, refresh_library_popularity_cache
     state = get_cache_refresh_state()
     if state.get("running"):
         return {"ok": False, "message": "Cache refresh already running", "state": state}
-    asyncio.create_task(refresh_library_popularity_cache(db))
+
+    async def _run_and_stamp():
+        await refresh_library_popularity_cache(db)
+        try:
+            db2 = SessionLocal()
+            s = db2.query(AutomationSettings).first()
+            if s:
+                s.last_popularity_cache_refresh = datetime.utcnow()
+                db2.commit()
+            db2.close()
+        except Exception as exc:
+            log.warning(f"Could not stamp last_popularity_cache_refresh: {exc}")
+
+    asyncio.create_task(_run_and_stamp())
     return {"ok": True, "message": "Cache refresh started in background — poll /status for progress"}
 
 
@@ -778,6 +811,35 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
         import traceback
         log.error(traceback.format_exc())
         _set_download_state(running=False, phase="Error", error=str(e))
+    finally:
+        db.close()
+
+
+async def _run_popularity_cache_refresh():
+    """
+    Scheduled job: refresh the artist-level popularity cache.
+
+    Fetches listener counts, tags, similar artists, and top albums from
+    Last.fm (and other configured adapters) for every artist in the library,
+    writing results to the PopularityCache table keyed as 'artist:{name_lower}'.
+
+    Stamping last_popularity_cache_refresh on completion lets the scheduler
+    use last-run-based scheduling (same pattern as discovery/playlists) so
+    container restarts do not reset the clock.
+    """
+    from services.indexer import refresh_library_popularity_cache
+    db = SessionLocal()
+    try:
+        log.info("Scheduled popularity cache refresh starting…")
+        await refresh_library_popularity_cache(db)
+        # Stamp last run time
+        s = db.query(AutomationSettings).first()
+        if s:
+            s.last_popularity_cache_refresh = datetime.utcnow()
+            db.commit()
+        log.info("Scheduled popularity cache refresh complete.")
+    except Exception as e:
+        log.error(f"Popularity cache refresh job failed: {e}")
     finally:
         db.close()
 

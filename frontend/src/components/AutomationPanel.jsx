@@ -1,6 +1,5 @@
-
 import { useState, useEffect } from 'react'
-import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database } from 'lucide-react'
+import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp, Trash2 } from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
 // Python's datetime.utcnow().isoformat() produces "2026-02-24T14:30:00" with no
@@ -117,6 +116,13 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [autoEnabled,   setAutoEnabled]   = useState(false)
   const [autoMax,       setAutoMax]       = useState(1)
   const [autoCooldown,  setAutoCooldown]  = useState(7)
+  // Popularity cache
+  const [popCacheInterval, setPopCacheInterval] = useState(24)
+  const [cacheStats,    setCacheStats]    = useState(null)
+  const [clearingCache, setClearingCache] = useState(false)
+  // Billboard
+  const [bbEnabled,   setBbEnabled]   = useState(true)
+  const [bbInterval,  setBbInterval]  = useState(168)
 
   // Trigger loading states (button spinner while POST is in-flight)
   const [trigIndex,     setTrigIndex]     = useState(false)
@@ -125,6 +131,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [trigAuto,      setTrigAuto]      = useState(false)
   const [trigEnrich,    setTrigEnrich]    = useState(false)
   const [trigPopCache,  setTrigPopCache]  = useState(false)
+  const [trigBillboard, setTrigBillboard] = useState(false)
 
   useEffect(() => {
     fetch('/api/automation/settings').then(r=>r.json()).then(d => {
@@ -138,9 +145,26 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       setAutoEnabled(!!d.auto_download_enabled)
       setAutoMax(d.auto_download_max_per_run ?? 1)
       setAutoCooldown(d.auto_download_cooldown_days ?? 7)
+      setPopCacheInterval(d.popularity_cache_refresh_interval_hours ?? 24)
+      setBbEnabled(d.billboard_refresh_enabled !== false)
+      setBbInterval(d.billboard_refresh_interval_hours ?? 168)
     }).catch(() => {})
     fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
+    fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
   }, [])
+
+  const fetchCacheStats = () =>
+    fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
+
+  const handleClearCache = async () => {
+    setClearingCache(true)
+    try {
+      await fetch('/api/external-apis/cache', { method: 'DELETE' })
+      await fetchCacheStats()
+    } finally {
+      setClearingCache(false)
+    }
+  }
 
   const save = async () => {
     setSaving(true); setSaveMsg('')
@@ -157,6 +181,9 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
           auto_download_enabled: autoEnabled,
           auto_download_max_per_run: autoMax,
           auto_download_cooldown_days: autoCooldown,
+          popularity_cache_refresh_interval_hours: popCacheInterval,
+          billboard_refresh_enabled: bbEnabled,
+          billboard_refresh_interval_hours: bbInterval,
         }),
       })
       setSaveMsg(r.ok ? '✓ Saved' : '✗ Save failed')
@@ -408,13 +435,66 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       {/* Popularity Cache */}
       <TaskCard icon={Database} color="#38bdf8" title="Popularity Cache Refresh"
                 description="Fetches artist-level listener counts, tags, similar artists and top albums from Last.fm"
+                lastRun={s?.last_popularity_cache_refresh}
+                nextRun={jobStatus.popularity_cache_refresh}
                 triggerLabel={jobStatuses.cacheStatus?.running ? 'Running…' : 'Refresh Now'}
                 triggering={trigPopCache || !!jobStatuses.cacheStatus?.running}
-                onTrigger={() => trigger('/api/automation/trigger/popularity-cache', setTrigPopCache)}>
-        <div className="text-[11px] px-3 py-2.5 rounded-xl"
-             style={{ background:'rgba(56,189,248,0.06)', border:'1px solid rgba(56,189,248,0.18)', color:'var(--text-secondary)' }}>
-          Feeds Discovery Refresh and the Artist Popularity column. Run this first if you just set up Last.fm credentials.
-          Enrichment (above) populates song-level data; this populates artist-level data.
+                onTrigger={() => { trigger('/api/automation/trigger/popularity-cache', setTrigPopCache); setTimeout(fetchCacheStats, 3000) }}>
+        <div className="space-y-3">
+          <Slider label="Run every" value={popCacheInterval} onChange={setPopCacheInterval}
+                  min={1} max={168} unit="h" markers={['1h','24h','1w']} />
+
+          {/* Live / Expired stats + Clear button */}
+          <div className="flex items-center justify-between px-3 py-2.5 rounded-xl"
+               style={{ background:'rgba(56,189,248,0.06)', border:'1px solid rgba(56,189,248,0.18)' }}>
+            <div className="flex gap-5">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Live entries</div>
+                <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-primary)' }}>
+                  {cacheStats ? cacheStats.live_entries : '—'}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Expired</div>
+                <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-secondary)' }}>
+                  {cacheStats ? cacheStats.expired_entries : '—'}
+                </div>
+              </div>
+            </div>
+            <button onClick={handleClearCache} disabled={clearingCache}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold
+                               bg-[#f85149]/10 hover:bg-[#f85149]/20 border border-[#f85149]/30 text-[var(--danger)]
+                               disabled:opacity-40 transition-all">
+              {clearingCache ? <Loader2 size={11} className="animate-spin" /> : <Trash2 size={11} />}
+              Clear
+            </button>
+          </div>
+
+          <div className="text-[11px] px-3 py-2" style={{ color:'var(--text-secondary)' }}>
+            Feeds Discovery Refresh and the Artist Popularity column in Insights. Run this first if you
+            just set up Last.fm credentials. Enrichment (above) populates song-level data; this populates artist-level data.
+          </div>
+        </div>
+      </TaskCard>
+
+      {/* Billboard Hot 100 */}
+      <TaskCard icon={TrendingUp} color="#f59e0b" title="Billboard Hot 100"
+                description="Fetches the current Hot 100 chart and matches entries against your library"
+                enabled={bbEnabled} onToggle={setBbEnabled}
+                lastRun={s?.last_billboard_refresh}
+                nextRun={bbEnabled ? jobStatus.billboard_refresh : null}
+                triggerLabel="Refresh Now"
+                triggering={trigBillboard}
+                onTrigger={() => trigger('/api/indexer/billboard/refresh', setTrigBillboard)}>
+        <div className="space-y-3">
+          <Slider label="Check every" value={bbInterval} onChange={setBbInterval}
+                  min={24} max={168} unit="h" markers={['24h','72h','1w']} />
+          <div className="text-[11px] px-3 py-2.5 rounded-xl"
+               style={{ background:'rgba(245,158,11,0.06)', border:'1px solid rgba(245,158,11,0.18)', color:'var(--text-secondary)' }}>
+            The chart itself updates weekly — checking more often than that won't pull new data,
+            but will keep your library match list current as you add new music.
+            Chart scores boost currently-charting tracks you already own in playlist scoring.
+          </div>
         </div>
       </TaskCard>
 
