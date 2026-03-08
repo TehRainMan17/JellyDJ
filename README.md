@@ -20,13 +20,86 @@
 
 ---
 
+## 🚀 Quick Start
+
+**Prerequisites:** Docker + Docker Compose, a running [Jellyfin](https://jellyfin.org) instance, and *(optionally)* [Lidarr](https://lidarr.audio) for auto-download.
+
+### 1. Create your compose file
+
+Create a `docker-compose.yml` anywhere on your server:
+
+```yaml
+version: "3.9"
+
+services:
+  backend:
+    image: 562ray/jellydj-backend:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DATABASE_URL=sqlite:////config/jellydj.db
+      - TZ=${TZ:-UTC}
+    volumes:
+      - jellydj-config:/config
+    networks:
+      - jellydj
+
+  frontend:
+    image: 562ray/jellydj-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "${JELLYDJ_PORT:-7879}:3000"
+    depends_on:
+      - backend
+    networks:
+      - jellydj
+
+volumes:
+  jellydj-config:
+
+networks:
+  jellydj:
+```
+
+### 2. Create your `.env` file
+
+```env
+JELLYDJ_PORT=7879
+TZ=America/New_York
+SECRET_KEY=your_generated_key_here
+```
+
+Generate a secret key:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+> ⚠️ Set `SECRET_KEY` once and don't change it — it encrypts your stored API keys. Changing it later will require re-entering all credentials.
+
+### 3. Launch
+
+```bash
+docker compose up -d
+```
+
+### 4. Open
+
+```
+http://localhost:7879
+```
+
+Complete setup on the **Connections** page, then hit **Index Now** to run your first library scan. Everything else — Jellyfin URL, API keys, Lidarr — is configured from the web UI.
+
+---
+
 ## 🪼 Why I Built This
 
 My family moved off Spotify to take back control of our music. No subscriptions, no algorithms selling our data, no content disappearing overnight — just our library, our way.
 
 But my girls missed something real: **the magic of discovery**. That moment when a service just *knows* you well enough to surface an artist you've never heard but somehow immediately love. Spotify and YouTube Music are genuinely great at this, and plain Jellyfin has no answer for it.
 
-So I built JellyDJ to fill that void.
+So I built JellyDJ to fill that void — with a lot of help from AI along the way.
 
 It watches what everyone in the house listens to, builds taste profiles per person, and quietly surfaces new artists and albums they're likely to love — sending approved ones straight to Lidarr for download. My kids wake up and there's new music in their library that they didn't have to search for. My wife's playlists update themselves. Nobody has to touch a thing.
 
@@ -96,96 +169,6 @@ Approved discoveries are automatically sent to Lidarr for download.
 
 ---
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Docker + Docker Compose
-- A running [Jellyfin](https://jellyfin.org) instance
-- *(Optional)* [Lidarr](https://lidarr.audio) for auto-download
-
-### 1. Clone
-
-```bash
-git clone https://github.com/TehRainMan17/JellyDJ.git
-cd JellyDJ
-```
-
-### 2. Configure
-
-```bash
-cp .env.example .env
-```
-
-Generate a secret key and add it to `.env`:
-
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
-
-```env
-SECRET_KEY=your_generated_key_here
-JELLYDJ_PORT=7879   # change if needed
-TZ=America/New_York
-```
-
-Everything else — Jellyfin URL, API keys, Lidarr — can be configured from the web UI after launch.
-
-### 3. Launch
-
-```bash
-docker compose up -d
-```
-
-> First startup takes 30–90 seconds. Docker pulls the images automatically — no building required.
-
-### 4. Open
-
-```
-http://localhost:7879
-```
-
-Complete setup on the **Connections** page, then hit **Index Now** to run your first library scan.
-
----
-
-## 🐳 Docker Compose Reference
-
-```yaml
-version: "3.9"
-
-services:
-  backend:
-    image: 562ray/jellydj-backend:latest
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      - DATABASE_URL=sqlite:////config/jellydj.db
-      - TZ=${TZ:-UTC}
-    volumes:
-      - jellydj-config:/config
-    networks:
-      - jellydj
-
-  frontend:
-    image: 562ray/jellydj-frontend:latest
-    restart: unless-stopped
-    ports:
-      - "${JELLYDJ_PORT:-7879}:3000"
-    depends_on:
-      - backend
-    networks:
-      - jellydj
-
-volumes:
-  jellydj-config:
-
-networks:
-  jellydj:
-```
-
----
-
 ## ⚙️ Configuration
 
 All settings are managed from the web UI. The `.env` file only needs the secret key and port.
@@ -196,8 +179,6 @@ All settings are managed from the web UI. The `.env` file only needs the secret 
 | `SECRET_KEY` | *(required)* | Encrypts stored credentials — generate once, don't change |
 | `TZ` | `UTC` | Timezone for scheduled jobs and display |
 | `DATABASE_URL` | `sqlite:////config/jellydj.db` | SQLite (default) or PostgreSQL for larger libraries |
-
-> ⚠️ Changing `SECRET_KEY` after setup will invalidate all stored API keys. You'll need to re-enter them in the UI.
 
 ### External API Keys *(all optional)*
 
@@ -245,6 +226,22 @@ Run a full index first (Dashboard → Index Now), then trigger a Discovery Refre
 
 ---
 
+## 🔨 Building from Source
+
+Most users should use the prebuilt images above. If you want to build locally (for development or customization):
+
+```bash
+git clone https://github.com/TehRainMan17/JellyDJ.git
+cd JellyDJ
+cp .env.example .env
+# edit .env with your SECRET_KEY
+docker compose up --build -d
+```
+
+Images are automatically rebuilt and published to Docker Hub on every commit to `main`.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
@@ -254,18 +251,3 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 - 🔧 **Pull requests** → fork, branch off `main`, and submit
 
 ---
-
-## 📄 License
-
-GNU Affero General Public License v3.0 — see [LICENSE](LICENSE) for details.
-
-AGPL means: if you run a modified version of JellyDJ as a network service, you must make your modifications available under the same license.
-
----
-
-<p align="center">
-  Built with 🪼 by <a href="https://github.com/TehRainMan17">TehRainMan17</a>
-  &nbsp;—&nbsp; because my girls deserve great music discovery without giving up their privacy.
-  <br/><br/>
-  <a href="https://github.com/TehRainMan17/JellyDJ/stargazers">⭐ If JellyDJ fills the same void for your family, a star means a lot.</a>
-</p>
