@@ -116,6 +116,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [autoEnabled,   setAutoEnabled]   = useState(false)
   const [autoMax,       setAutoMax]       = useState(1)
   const [autoCooldown,  setAutoCooldown]  = useState(7)
+  const [lastDownload,  setLastDownload]  = useState(null)
   // Popularity cache
   const [popCacheInterval, setPopCacheInterval] = useState(24)
   const [cacheStats,    setCacheStats]    = useState(null)
@@ -151,7 +152,11 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
     }).catch(() => {})
     fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
     fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
+    fetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
   }, [])
+
+  const fetchLastDownload = () =>
+    fetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
 
   const fetchCacheStats = () =>
     fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
@@ -265,7 +270,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                 nextRun={autoEnabled ? jobStatus.auto_download : null}
                 enabled={autoEnabled} onToggle={setAutoEnabled}
                 triggerLabel="Run Now" triggering={trigAuto}
-                onTrigger={() => trigger('/api/automation/trigger/auto-download', setTrigAuto)}>
+                onTrigger={() => { trigger('/api/automation/trigger/auto-download', setTrigAuto); setTimeout(fetchLastDownload, 5000) }}>
         <div className="space-y-3">
           {!autoEnabled && (
             <div className="text-xs px-3 py-2 rounded-xl" style={{ background:'rgba(255,255,255,0.04)', color:'var(--text-muted)', border:'1px solid var(--border)' }}>
@@ -316,6 +321,23 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                   Use <strong>Not that one</strong> to exclude items. Turning this off stops all automatic downloads.
                 </div>
               </div>
+              {lastDownload && (() => {
+                const msg    = lastDownload.message || ''
+                const artist = msg.replace(/^Auto-downloaded:\s*/, '').split(' — ')[0] || '—'
+                const album  = msg.includes(' — ') ? msg.split(' — ').slice(1).join(' — ') : '—'
+                const ts     = lastDownload.created_at
+                  ? new Date(lastDownload.created_at.replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z').toLocaleString()
+                  : ''
+                return (
+                  <div className="px-3 py-2.5 rounded-xl"
+                       style={{ background:'rgba(212,153,34,0.06)', border:'1px solid rgba(212,153,34,0.15)' }}>
+                    <div className="text-[10px] uppercase tracking-wider mb-1" style={{ color:'var(--text-muted)' }}>Last requested</div>
+                    <div className="text-sm font-medium truncate" style={{ color:'var(--text-primary)' }}>{artist}</div>
+                    <div className="text-xs truncate" style={{ color:'var(--text-secondary)' }}>{album}</div>
+                    <div className="text-[10px] mt-1" style={{ color:'var(--text-muted)' }}>{ts}</div>
+                  </div>
+                )
+              })()}
             </>
           )}
         </div>

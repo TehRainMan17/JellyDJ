@@ -9,10 +9,10 @@ import {
 const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
 
 const STATUS_TABS = [
-  { key:'pending',  label:'Pending',  color:'#fbbf24' },
-  { key:'approved', label:'Approved', color:'var(--accent)' },
-  { key:'rejected', label:'Rejected', color:'var(--danger)' },
-  { key:'snoozed',  label:'Snoozed',  color:'var(--text-secondary)' },
+  { key:'pending',       label:'Pending',        color:'#fbbf24' },
+  { key:'approved',      label:'Approved',       color:'var(--accent)' },
+  { key:'rejected',      label:'Rejected',       color:'var(--danger)' },
+  { key:'snoozed',       label:'Snoozed',        color:'var(--text-secondary)' },
   { key:'auto_downloaded', label:'Auto-Downloaded', color:'#d29922' },
 ]
 
@@ -273,54 +273,6 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
   )
 }
 
-// ── Auto-Downloaded history tab ───────────────────────────────────────────────
-function AutoDownloadedTab({ entries, loading }) {
-  if (loading) {
-    return (
-      <div className="space-y-3">
-        {[1,2,3].map(i => <div key={i} className="skeleton h-16 rounded-xl" />)}
-      </div>
-    )
-  }
-  if (!entries.length) {
-    return (
-      <div className="card flex flex-col items-center justify-center py-20 gap-3 text-center anim-scale-in">
-        <History size={32} strokeWidth={1.25} style={{ color:'var(--text-muted)' }} />
-        <div className="text-sm font-medium" style={{ color:'var(--text-secondary)' }}>No auto-downloads yet</div>
-        <div className="text-xs max-w-xs" style={{ color:'var(--text-muted)' }}>
-          Albums sent to Lidarr by the auto-downloader will appear here permanently.
-        </div>
-      </div>
-    )
-  }
-  return (
-    <div className="space-y-2 stagger">
-      {entries.map(entry => {
-        const raw = entry.message.replace(/^Auto-downloaded:\s*/i, '')
-        const [artist, ...albumParts] = raw.split(' — ')
-        const album = albumParts.join(' — ')
-        return (
-          <div key={entry.id} className="card flex items-center gap-3 py-3 anim-fade-up">
-            <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
-                 style={{ background:'rgba(210,153,34,0.1)', border:'1px solid rgba(210,153,34,0.25)' }}>
-              <Download size={14} style={{ color:'#d29922' }} />
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold truncate" style={{ color:'var(--text-primary)' }}>{artist}</div>
-              {album && (
-                <div className="text-xs truncate" style={{ color:'var(--text-secondary)' }}>{album}</div>
-              )}
-            </div>
-            <div className="text-[10px] flex-shrink-0 text-right" style={{ color:'var(--text-muted)' }}>
-              {new Date(utc(entry.created_at)).toLocaleString()}
-            </div>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function DiscoveryQueue() {
   const [activeTab, setActiveTab]     = useState('pending')
@@ -329,13 +281,18 @@ export default function DiscoveryQueue() {
   const [loading, setLoading]         = useState(true)
   const [populating, setPopulating]   = useState(false)
   const [popMsg, setPopMsg]           = useState('')
-
-  // Auto-downloaded history
   const [dlHistory, setDlHistory]     = useState([])
   const [dlLoading, setDlLoading]     = useState(false)
 
+  const fetchDlHistory = useCallback(() => {
+    setDlLoading(true)
+    fetch('/api/automation/auto-download/history?limit=200')
+      .then(r => r.json()).then(setDlHistory).catch(() => setDlHistory([]))
+      .finally(() => setDlLoading(false))
+  }, [])
+
   const fetchItems = useCallback((tab) => {
-    if (tab === 'auto_downloaded') return  // handled separately
+    if (tab === 'auto_downloaded') return
     setLoading(true)
     fetch(`/api/discovery?status=${tab}`)
       .then(r => r.json()).then(setItems).catch(() => setItems([]))
@@ -346,16 +303,9 @@ export default function DiscoveryQueue() {
     fetch('/api/discovery/counts').then(r => r.json()).then(setCounts).catch(() => {})
   }, [])
 
-  const fetchDlHistory = useCallback(() => {
-    setDlLoading(true)
-    fetch('/api/automation/auto-download/history?limit=200')
-      .then(r => r.json()).then(setDlHistory).catch(() => setDlHistory([]))
-      .finally(() => setDlLoading(false))
-  }, [])
-
   useEffect(() => {
-    if (activeTab === 'auto_downloaded') { fetchDlHistory() }
-    else { fetchItems(activeTab) }
+    if (activeTab === 'auto_downloaded') fetchDlHistory()
+    else fetchItems(activeTab)
   }, [activeTab, fetchItems, fetchDlHistory])
   useEffect(() => { fetchCounts() }, [fetchCounts])
 
@@ -457,7 +407,42 @@ export default function DiscoveryQueue() {
 
       {/* List */}
       {activeTab === 'auto_downloaded' ? (
-        <AutoDownloadedTab entries={dlHistory} loading={dlLoading} />
+        dlLoading ? (
+          <div className="space-y-3">
+            {[1,2,3].map(i => <div key={i} className="skeleton h-14 rounded-xl" />)}
+          </div>
+        ) : dlHistory.length === 0 ? (
+          <div className="card flex flex-col items-center justify-center py-20 gap-3 text-center anim-scale-in">
+            <History size={32} strokeWidth={1.25} style={{ color:'var(--text-muted)' }} />
+            <div className="text-sm font-medium" style={{ color:'var(--text-secondary)' }}>No auto-download history yet</div>
+            <div className="text-xs max-w-xs" style={{ color:'var(--text-muted)' }}>
+              Albums sent to Lidarr by the auto-downloader will appear here
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-2 stagger">
+            {dlHistory.map(entry => {
+              const msg = entry.message || ''
+              const artist = msg.replace(/^Auto-downloaded:\s*/, '').split(' — ')[0] || '—'
+              const album  = msg.includes(' — ') ? msg.split(' — ').slice(1).join(' — ') : '—'
+              const ts     = entry.created_at
+                ? new Date(entry.created_at.replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z').toLocaleString()
+                : ''
+              return (
+                <div key={entry.id} className="card flex items-center gap-3 py-3 px-4">
+                  <Download size={14} style={{ color:'#d29922', flexShrink:0 }} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium truncate" style={{ color:'var(--text-primary)' }}>
+                      {artist}
+                    </div>
+                    <div className="text-xs truncate" style={{ color:'var(--text-secondary)' }}>{album}</div>
+                  </div>
+                  <div className="text-[11px] flex-shrink-0" style={{ color:'var(--text-muted)' }}>{ts}</div>
+                </div>
+              )
+            })}
+          </div>
+        )
       ) : loading ? (
         <div className="space-y-3">
           {[1,2,3].map(i => <div key={i} className="skeleton h-28 rounded-xl" />)}

@@ -127,8 +127,6 @@ class AutomationSettingsUpdate(BaseModel):
     auto_download_max_per_run: Optional[int] = None
     auto_download_cooldown_days: Optional[int] = None
     popularity_cache_refresh_interval_hours: Optional[int] = None
-    billboard_refresh_enabled: Optional[bool] = None
-    billboard_refresh_interval_hours: Optional[int] = None
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -159,14 +157,11 @@ def get_settings(db: Session = Depends(get_db)):
         "auto_download_max_per_run": s.auto_download_max_per_run,
         "auto_download_cooldown_days": s.auto_download_cooldown_days,
         "popularity_cache_refresh_interval_hours": s.popularity_cache_refresh_interval_hours,
-        "billboard_refresh_enabled": bool(s.billboard_refresh_enabled),
-        "billboard_refresh_interval_hours": s.billboard_refresh_interval_hours,
         "last_auto_download": s.last_auto_download,
         "last_index": s.last_index,
         "last_discovery_refresh": s.last_discovery_refresh,
         "last_playlist_regen": s.last_playlist_regen,
         "last_popularity_cache_refresh": s.last_popularity_cache_refresh,
-        "last_billboard_refresh": s.last_billboard_refresh,
     }
 
 
@@ -225,14 +220,6 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
         if not (1 <= payload.popularity_cache_refresh_interval_hours <= 168):
             raise HTTPException(400, "Popularity cache interval must be 1–168 hours")
         s.popularity_cache_refresh_interval_hours = payload.popularity_cache_refresh_interval_hours
-
-    if payload.billboard_refresh_enabled is not None:
-        s.billboard_refresh_enabled = payload.billboard_refresh_enabled
-
-    if payload.billboard_refresh_interval_hours is not None:
-        if not (24 <= payload.billboard_refresh_interval_hours <= 168):
-            raise HTTPException(400, "Billboard interval must be 24–168 hours")
-        s.billboard_refresh_interval_hours = payload.billboard_refresh_interval_hours
 
     db.commit()
 
@@ -744,6 +731,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
                             display_album = m.group(1)
                     log_event(db, "auto_download",
                               f"Auto-downloaded: {candidate.artist_name} — {display_album or 'unknown album'}")
+                    db.flush()  # ensure SystemEvent row lands in the same commit as the queue item update
                 else:
                     log.warning(f"  ✗ Failed: {result['message']}")
                 db.commit()
@@ -842,6 +830,32 @@ async def _run_popularity_cache_refresh():
         log.error(f"Popularity cache refresh job failed: {e}")
     finally:
         db.close()
+
+
+# ── Auto-download history ──────────────────────────────────────────────────────
+
+@router.get("/auto-download/history")
+def get_auto_download_history(limit: int = 200, db: Session = Depends(get_db)):
+    """
+    Return the most recent auto-download events from the SystemEvent log,
+    newest first. Used by Settings > Auto-Download (last requested display)
+    and the Discovery Queue > Auto-Downloaded history tab.
+    """
+    rows = (
+        db.query(SystemEvent)
+        .filter(SystemEvent.event_type == "auto_download")
+        .order_by(SystemEvent.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id":         r.id,
+            "message":    r.message,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
 
 
 # ── Activity feed ─────────────────────────────────────────────────────────────
