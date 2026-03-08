@@ -1,5 +1,6 @@
+
 """
-JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3).
+JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3 + Auth Phase 1).
 
 All tables and columns from every version are defined here.
 New tables are created by create_all() on startup.
@@ -39,6 +40,9 @@ class ManagedUser(Base):
     username = Column(String, nullable=False)
     is_enabled = Column(Boolean, default=False)
     added_at = Column(DateTime, default=datetime.utcnow)
+    # Auth Phase 1: Jellyfin login integration
+    is_admin = Column(Boolean, default=False, nullable=False)
+    last_login_at = Column(DateTime, nullable=True)
 
 
 class ExternalApiSettings(Base):
@@ -484,6 +488,28 @@ class BillboardChartEntry(Base):
     )
 
 
+# ── Auth Phase 1: refresh token store ────────────────────────────────────────
+
+class RefreshToken(Base):
+    """
+    Server-side refresh token store.
+
+    Only the SHA-256 hash of the token is persisted — the plaintext is
+    returned to the client exactly once (at issuance) and never stored.
+
+    The Jellyfin access token is encrypted at rest with crypto.encrypt()
+    so that a DB breach does not expose live Jellyfin sessions.
+    """
+    __tablename__ = "refresh_tokens"
+    id             = Column(Integer, primary_key=True, index=True)
+    token_hash     = Column(String, unique=True, nullable=False, index=True)
+    user_id        = Column(String, nullable=False, index=True)
+    jellyfin_token = Column(Text, nullable=False)   # encrypted via crypto.encrypt()
+    expires_at     = Column(DateTime, nullable=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    last_used_at   = Column(DateTime, nullable=True)
+
+
 # ── v4: manual album exclusions ───────────────────────────────────────────────
 
 class ExcludedAlbum(Base):
@@ -500,3 +526,4 @@ class ExcludedAlbum(Base):
     cover_image_url   = Column(String, nullable=True)
     excluded_at       = Column(DateTime, default=datetime.utcnow)
     track_count       = Column(Integer, nullable=False, default=0)
+

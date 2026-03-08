@@ -1,3 +1,4 @@
+
 fastapi>=0.111.0,<0.112.0
 uvicorn[standard]>=0.30.0
 sqlalchemy>=2.0.0
@@ -18,3 +19,5 @@ git+https://github.com/guoguo12/billboard-charts.git
 numpy>=1.26.0
 # Testing
 pytest>=8.0.0
+# Auth Phase 1 — JWT issuance and verification
+python-jose[cryptography]>=3.3.0

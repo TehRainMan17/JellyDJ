@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import WebhookSetupPanel from '../components/WebhookSetupPanel.jsx'
+import { api } from '../lib/api.js'
 import {
   Plug, CheckCircle2, XCircle, Loader2, Eye, EyeOff,
   RefreshCw, Users, ChevronDown, ChevronUp, Save,
@@ -93,9 +94,8 @@ function ManagedUsersPanel() {
     setLoading(true)
     setError('')
     try {
-      const r = await fetch('/api/connections/jellyfin/users')
-      if (!r.ok) throw new Error('Failed')
-      setUsers(await r.json())
+      const data = await api.get('/api/connections/jellyfin/users')
+      setUsers(data)
     } catch {
       setError('Could not load users. Is Jellyfin connected?')
     } finally {
@@ -108,15 +108,11 @@ function ManagedUsersPanel() {
   const toggle = async (user) => {
     setToggling(p => ({ ...p, [user.jellyfin_user_id]: true }))
     try {
-      await fetch('/api/connections/jellyfin/users/toggle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      await api.post('/api/connections/jellyfin/users/toggle', {
           jellyfin_user_id: user.jellyfin_user_id,
           username: user.username,
           is_enabled: !user.is_enabled,
-        }),
-      })
+        })
       setUsers(prev => prev.map(u =>
         u.jellyfin_user_id === user.jellyfin_user_id
           ? { ...u, is_enabled: !u.is_enabled }
@@ -195,8 +191,8 @@ function JellyfinCard() {
   const [showUsers, setShowUsers] = useState(false)
 
   useEffect(() => {
-    fetch('/api/connections/jellyfin')
-      .then(r => r.json())
+    api.get('/api/connections/jellyfin')
+      
       .then(data => {
         setUrl(data.base_url || '')
         setHasStoredKey(data.has_api_key)
@@ -216,18 +212,10 @@ function JellyfinCard() {
     if (!apiKey) { showMsg('Enter an API key.', true); return }
     setSaving(true)
     try {
-      const r = await fetch('/api/connections/jellyfin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base_url: url, api_key: apiKey }),
-      })
-      if (r.ok) {
-        showMsg('Credentials saved.')
-        setHasStoredKey(true)
-        setStatus('idle')
-      } else {
-        showMsg('Save failed.', true)
-      }
+      await api.post('/api/connections/jellyfin', { base_url: url, api_key: apiKey })
+      showMsg('Credentials saved.')
+      setHasStoredKey(true)
+      setStatus('idle')
     } finally {
       setSaving(false)
     }
@@ -237,19 +225,15 @@ function JellyfinCard() {
     setStatus('testing')
     setMsg({ text: '', isError: false })
     try {
-      const r = await fetch('/api/connections/jellyfin/test', { method: 'POST' })
-      const data = await r.json()
-      if (r.ok) {
+      const data = await api.post('/api/connections/jellyfin/test')
+      if (data) {
         setStatus('connected')
         showMsg(data.message || 'Connected successfully.')
         setLastTested(new Date())
-      } else {
-        setStatus('error')
-        showMsg(data.detail || 'Connection failed.', true)
       }
-    } catch {
+    } catch (err) {
       setStatus('error')
-      showMsg('Network error — is the backend running?', true)
+      showMsg(err.message || 'Connection failed.', true)
     }
   }
 
@@ -358,8 +342,8 @@ function LidarrCard() {
   const [msg, setMsg] = useState({ text: '', isError: false })
 
   useEffect(() => {
-    fetch('/api/connections/lidarr')
-      .then(r => r.json())
+    api.get('/api/connections/lidarr')
+      
       .then(data => {
         setUrl(data.base_url || '')
         setHasStoredKey(data.has_api_key)
@@ -379,18 +363,10 @@ function LidarrCard() {
     if (!apiKey) { showMsg('Enter an API key.', true); return }
     setSaving(true)
     try {
-      const r = await fetch('/api/connections/lidarr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base_url: url, api_key: apiKey }),
-      })
-      if (r.ok) {
-        showMsg('Credentials saved.')
-        setHasStoredKey(true)
-        setStatus('idle')
-      } else {
-        showMsg('Save failed.', true)
-      }
+      await api.post('/api/connections/lidarr', { base_url: url, api_key: apiKey })
+      showMsg('Credentials saved.')
+      setHasStoredKey(true)
+      setStatus('idle')
     } finally {
       setSaving(false)
     }
@@ -400,9 +376,8 @@ function LidarrCard() {
     setStatus('testing')
     setMsg({ text: '', isError: false })
     try {
-      const r = await fetch('/api/connections/lidarr/test', { method: 'POST' })
-      const data = await r.json()
-      if (r.ok) {
+      const data = await api.post('/api/connections/lidarr/test')
+      if (data) {
         setStatus('connected')
         showMsg(data.message || 'Connected successfully.')
         setLastTested(new Date())
@@ -586,12 +561,8 @@ function SpotifyCard({ status, onStatusChange }) {
     if (!clientId || !clientSecret) return
     setSaving(true)
     try {
-      const r = await fetch('/api/external-apis/spotify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
-      })
-      if (r.ok) {
+      await api.post('/api/external-apis/spotify', { client_id: clientId, client_secret: clientSecret })
+      if (true) {
         setResult({ ok: true, message: 'Credentials saved.' })
         onStatusChange()
       } else {
@@ -607,9 +578,8 @@ function SpotifyCard({ status, onStatusChange }) {
     setTesting(true)
     setResult(null)
     try {
-      const r = await fetch('/api/external-apis/spotify/test', { method: 'POST' })
-      const data = await r.json()
-      setResult({ ok: r.ok, message: r.ok ? data.message : (data.detail || 'Test failed.') })
+      const data = await api.post('/api/external-apis/spotify/test')
+      setResult({ ok: true, message: data.message || 'Test passed.' })
     } catch {
       setResult({ ok: false, message: 'Network error.' })
     } finally {
@@ -692,12 +662,8 @@ function LastFmCard({ status, onStatusChange }) {
     if (!apiKey) return
     setSaving(true)
     try {
-      const r = await fetch('/api/external-apis/lastfm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret }),
-      })
-      if (r.ok) {
+      await api.post('/api/external-apis/lastfm', { api_key: apiKey, api_secret: apiSecret })
+      if (true) {
         setResult({ ok: true, message: 'Credentials saved.' })
         onStatusChange()
       } else {
@@ -713,9 +679,8 @@ function LastFmCard({ status, onStatusChange }) {
     setTesting(true)
     setResult(null)
     try {
-      const r = await fetch('/api/external-apis/lastfm/test', { method: 'POST' })
-      const data = await r.json()
-      setResult({ ok: r.ok, message: r.ok ? data.message : (data.detail || 'Test failed.') })
+      const data = await api.post('/api/external-apis/lastfm/test')
+      setResult({ ok: true, message: data.message || 'Test passed.' })
     } catch {
       setResult({ ok: false, message: 'Network error.' })
     } finally {
@@ -794,9 +759,8 @@ function NoKeyServiceCard({ title, color, icon, testUrl, description, docsUrl, d
     setTesting(true)
     setResult(null)
     try {
-      const r = await fetch(testUrl, { method: 'POST' })
-      const data = await r.json()
-      setResult({ ok: r.ok, message: r.ok ? data.message : (data.detail || 'Test failed.') })
+      const data = await api.post(testUrl)
+      setResult({ ok: true, message: data.message || 'Test passed.' })
     } catch {
       setResult({ ok: false, message: 'Network error.' })
     } finally {
@@ -838,8 +802,8 @@ export default function Connections() {
   const [extStatus, setExtStatus] = useState(null)
 
   const fetchExtStatus = () => {
-    fetch('/api/external-apis/status')
-      .then(r => r.json())
+    api.get('/api/external-apis/status')
+      
       .then(setExtStatus)
       .catch(() => {})
   }

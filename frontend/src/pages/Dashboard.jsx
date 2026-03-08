@@ -8,6 +8,7 @@ import {
 import { Link } from 'react-router-dom'
 import { useJobStatus } from '../hooks/useJobStatus.js'
 import JobProgress from '../components/JobProgress.jsx'
+import { api } from '../lib/api.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
@@ -40,17 +41,12 @@ function BillboardDownloadModal({ entry, onClose, onSuccess }) {
   const handleDownload = async () => {
     setStatus('loading')
     try {
-      const r = await fetch('/api/indexer/billboard/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const d = await api.post('/api/indexer/billboard/download', {
           artist: entry.artist,
           title: entry.title,
           album_name: '',
-        }),
-      })
-      const d = await r.json()
-      if (r.ok && d.ok) {
+        })
+      if (d.ok) {
         setStatus('ok')
         setMessage(d.message || 'Sent to Lidarr!')
         onSuccess?.()
@@ -368,8 +364,7 @@ function BillboardStrip() {
 
   const loadEntries = useCallback(async (triggerRefreshIfEmpty = false) => {
     try {
-      const r = await fetch(`/api/indexer/billboard?limit=${LIMIT}`)
-      const d = await r.json()
+      const d = await api.get(`/api/indexer/billboard?limit=${LIMIT}`)
       const list = Array.isArray(d) ? d : []
 
       if (list.length > 0) {
@@ -378,13 +373,13 @@ function BillboardStrip() {
       } else if (triggerRefreshIfEmpty) {
         // Table is empty — trigger a background fetch and poll for results
         setState('fetching')
-        await fetch('/api/indexer/billboard/refresh', { method: 'POST' })
+        await api.post('/api/indexer/billboard/refresh')
         // Poll every 3s for up to 60s waiting for billboard.py to return data
         let attempts = 0
         const poll = setInterval(async () => {
           attempts++
           try {
-            const r2 = await fetch(`/api/indexer/billboard?limit=${LIMIT}`)
+            const r2 = await api.get(`/api/indexer/billboard?limit=${LIMIT}`)
             const d2 = await r2.json()
             const list2 = Array.isArray(d2) ? d2 : []
             if (list2.length > 0) {
@@ -507,8 +502,8 @@ function ConnectionStatus({ service, label }) {
     const url = service === 'lastfm'
       ? '/api/external-apis/status'
       : `/api/connections/${service}`
-    fetch(url)
-      .then(r => r.json())
+    api.get(url)
+      
       .then(d => {
         if (service === 'lastfm') {
           setData({ is_connected: d?.lastfm?.configured === true })
@@ -645,10 +640,10 @@ export default function Dashboard() {
   })
 
   const fetchAll = useCallback(() => {
-    fetch('/api/indexer/status').then(r => r.json()).then(setUsers).catch(() => {})
-    fetch('/api/indexer/library-stats').then(r => r.json()).then(setLib).catch(() => {})
-    fetch('/api/indexer/scheduler').then(r => r.json()).then(setSched).catch(() => {})
-    fetch('/api/automation/activity?limit=20').then(r => r.json()).then(setActivity).catch(() => {})
+    api.get('/api/indexer/status').then(setUsers).catch(() => {})
+    api.get('/api/indexer/library-stats').then(setLib).catch(() => {})
+    api.get('/api/indexer/scheduler').then(setSched).catch(() => {})
+    api.get('/api/automation/activity?limit=20').then(setActivity).catch(() => {})
   }, [])
 
   useEffect(() => { fetchAll() }, [fetchAll])
@@ -656,7 +651,7 @@ export default function Dashboard() {
   const handleIndex = async () => {
     setIndexing(true)
     try {
-      await fetch('/api/indexer/full-scan', { method: 'POST' })
+      await api.post('/api/indexer/full-scan')
       startPolling()
     } catch {
       setIndexing(false)

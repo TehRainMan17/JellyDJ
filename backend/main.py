@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -22,6 +23,7 @@ from routers import (
     connections, external_apis, indexer, recommender,
     webhooks, discovery, playlists, insights, automation, exclusions,
 )
+from routers.auth import router as auth_router
 
 
 def _run_migrations():
@@ -114,6 +116,9 @@ def _run_migrations():
         # v7: popularity cache refresh schedule on AutomationSettings
         ("automation_settings", "popularity_cache_refresh_interval_hours", "INTEGER",  "24"),
         ("automation_settings", "last_popularity_cache_refresh",           "DATETIME", "NULL"),
+        # Auth Phase 1: Jellyfin login integration on managed_users
+        ("managed_users", "is_admin",      "BOOLEAN",  "0"),
+        ("managed_users", "last_login_at", "DATETIME", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -183,6 +188,35 @@ def _fix_various_artists_enrichment():
         db.close()
 
 
+def _cleanup_expired_refresh_tokens():
+    """
+    Delete RefreshToken rows whose expires_at is in the past.
+
+    Run at startup and daily via the scheduler so the table stays small.
+    Safe to run concurrently — each DELETE is atomic.
+    """
+    import logging
+    from datetime import datetime, timezone
+    from models import RefreshToken
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        deleted = (
+            db.query(RefreshToken)
+            .filter(RefreshToken.expires_at < now)
+            .delete(synchronize_session=False)
+        )
+        if deleted:
+            db.commit()
+            logging.getLogger(__name__).info(
+                "Deleted %d expired refresh token(s) on startup", deleted
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Refresh token cleanup failed: %s", exc)
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -205,9 +239,23 @@ async def lifespan(app: FastAPI):
     # get re-fetched with the real track artist on the next enrichment run.
     _fix_various_artists_enrichment()
 
+    # Purge any expired refresh tokens left over from previous sessions
+    _cleanup_expired_refresh_tokens()
+
     # Start the APScheduler background job scheduler
     from scheduler import start_scheduler
     start_scheduler(SessionLocal)
+
+    # Register daily refresh token cleanup in the scheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    from scheduler import scheduler
+    scheduler.add_job(
+        _cleanup_expired_refresh_tokens,
+        trigger=IntervalTrigger(hours=24),
+        id="refresh_token_cleanup",
+        replace_existing=True,
+        name="Refresh token expiry cleanup",
+    )
 
     yield  # application handles requests here
 
@@ -246,6 +294,7 @@ app.include_router(playlists.router)      # /api/playlists      — playlist gen
 app.include_router(insights.router)       # /api/insights       — listening stats + charts
 app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
 app.include_router(exclusions.router)     # /api/exclusions     — manual album exclusions
+app.include_router(auth_router)           # /api/auth           — Jellyfin login + JWT tokens
 
 
 @app.get("/api/health")

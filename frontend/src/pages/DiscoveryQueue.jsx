@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { api } from '../lib/api.js'
 import {
   Telescope, RefreshCw, Check, X, Clock, Send, Loader2, Music2,
   ChevronDown, ChevronUp, Trash2, Download, Pin, PinOff, ShieldAlert,
@@ -53,31 +54,28 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
   const handlePin = async () => {
     setPinning('pin')
     try {
-      await fetch(`/api/discovery/${item.id}/pin`, { method:'POST' })
+      await api.post(`/api/discovery/${item.id}/pin`)
       onPin(item.id, true)
     } finally { setPinning(null) }
   }
   const handleSkipAuto = async () => {
     setPinning('skip')
     try {
-      await fetch(`/api/discovery/${item.id}/skip-auto`, { method:'POST' })
+      await api.post(`/api/discovery/${item.id}/skip-auto`)
       onPin(item.id, false)
     } finally { setPinning(null) }
   }
   const handleAction = async (status) => {
     setActioning(status)
     try {
-      await fetch(`/api/discovery/${item.id}/action`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ status }),
-      })
+      await api.post(`/api/discovery/${item.id}/action`, { status })
       onAction(item.id, status)
     } finally { setActioning(null) }
   }
   const handleSend = async () => {
     setSending(true); setMsg('')
     try {
-      const r = await fetch(`/api/discovery/${item.id}/send-to-lidarr`, { method:'POST' })
+      const r = await api.post(`/api/discovery/${item.id}/send-to-lidarr`)
       const d = await r.json()
       setMsg(d.ok ? '✓ Sent' : `✗ ${d.message || 'Failed'}`)
       if (d.ok) onSendToLidarr(item.id)
@@ -85,7 +83,7 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
     finally { setSending(false); setTimeout(() => setMsg(''), 5000) }
   }
   const handleDelete = async () => {
-    await fetch(`/api/discovery/${item.id}`, { method:'DELETE' })
+    await api.delete(`/api/discovery/${item.id}`)
     onDelete(item.id)
   }
 
@@ -286,21 +284,21 @@ export default function DiscoveryQueue() {
 
   const fetchDlHistory = useCallback(() => {
     setDlLoading(true)
-    fetch('/api/automation/auto-download/history?limit=200')
-      .then(r => r.json()).then(setDlHistory).catch(() => setDlHistory([]))
+    api.get('/api/automation/auto-download/history?limit=200')
+      .then(setDlHistory).catch(() => setDlHistory([]))
       .finally(() => setDlLoading(false))
   }, [])
 
   const fetchItems = useCallback((tab) => {
     if (tab === 'auto_downloaded') return
     setLoading(true)
-    fetch(`/api/discovery?status=${tab}`)
-      .then(r => r.json()).then(setItems).catch(() => setItems([]))
+    api.get(`/api/discovery?status=${tab}`)
+      .then(setItems).catch(() => setItems([]))
       .finally(() => setLoading(false))
   }, [])
 
   const fetchCounts = useCallback(() => {
-    fetch('/api/discovery/counts').then(r => r.json()).then(setCounts).catch(() => {})
+    api.get('/api/discovery/counts').then(setCounts).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -323,7 +321,7 @@ export default function DiscoveryQueue() {
   const handlePopulate = async () => {
     setPopulating(true); setPopMsg('Generating recommendations…'); setPopResult(null)
     try {
-      const r = await fetch('/api/discovery/populate', { method:'POST' })
+      const r = await api.post('/api/discovery/populate')
       const d = await r.json()
       setPopMsg('')
       setPopResult(d.ok

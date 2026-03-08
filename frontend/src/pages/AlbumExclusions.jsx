@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Ban, Search, X, Plus, Trash2, Loader2, AlertCircle, CheckCircle2, Music2 } from 'lucide-react'
+import { api } from '../lib/api.js'
 
 // ── Debounce hook ─────────────────────────────────────────────────────────────
 function useDebounce(value, ms) {
@@ -214,8 +215,8 @@ export default function AlbumExclusions() {
   // ── Load list ────────────────────────────────────────────────────────────
   const loadList = useCallback(() => {
     setLoadingList(true)
-    fetch('/api/exclusions/albums')
-      .then(r => r.json())
+    api.get('/api/exclusions/albums')
+      
       .then(d => { setExclusions(d); setLoadingList(false) })
       .catch(e => { setListErr(e.message); setLoadingList(false) })
   }, [])
@@ -227,7 +228,7 @@ export default function AlbumExclusions() {
     if (!debouncedQ.trim()) { setResults(null); setSearchErr(null); return }
     setSearching(true)
     setSearchErr(null)
-    fetch(`/api/exclusions/search?q=${encodeURIComponent(debouncedQ.trim())}`)
+    api.get(`/api/exclusions/search?q=${encodeURIComponent(debouncedQ.trim())}`)
       .then(r => { if (!r.ok) throw new Error('Search failed'); return r.json() })
       .then(d => { setResults(d.results || []); setSearching(false) })
       .catch(e => { setSearchErr(e.message); setSearching(false) })
@@ -237,19 +238,14 @@ export default function AlbumExclusions() {
   async function handleAdd(item, reason) {
     setAdding(item.jellyfin_album_id)
     try {
-      const r = await fetch('/api/exclusions/albums', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const data = await api.post('/api/exclusions/albums', {
           jellyfin_album_id: item.jellyfin_album_id,
           album_name:        item.album_name,
           artist_name:       item.artist_name,
           reason:            reason || '',
           cover_image_url:   item.cover_image_url || null,
-        }),
-      })
-      const data = await r.json()
-      if (!r.ok) throw new Error(data.detail || 'Failed')
+        })
+      if (!data) throw new Error('Failed')
       const n = data.track_count ?? item.track_count ?? 0
       showToast(`"${item.album_name}" excluded — ${n} track${n === 1 ? '' : 's'} will be skipped in playlists`)
       loadList()
@@ -268,7 +264,7 @@ export default function AlbumExclusions() {
     setRemoving(id)
     const album = exclusions.find(e => e.id === id)
     try {
-      const r = await fetch(`/api/exclusions/albums/${id}`, { method: 'DELETE' })
+      const r = await api.delete(`/api/exclusions/albums/${id}`)
       if (!r.ok) throw new Error('Failed to remove')
       showToast(`"${album?.album_name ?? 'Album'}" removed — will appear in playlists again`)
       loadList()

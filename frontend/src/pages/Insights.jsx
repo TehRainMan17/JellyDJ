@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { api } from '../lib/api.js'
 import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
   ChevronUp, ChevronDown, ChevronsUpDown, Star, Loader2,
@@ -363,8 +364,8 @@ function TrackTable({ userId }) {
       ...(af ? { search_filter: af } : {}),
       ...(hf && hf !== 'all' ? { holiday_filter: hf } : {}),
     })
-    fetch(`/api/insights/tracks?${params}`)
-      .then(r => r.json()).then(d => { setData(d); setLoading(false) })
+    api.get(`/api/insights/tracks?${params}`)
+      .then(d => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
   }
 
@@ -1058,8 +1059,8 @@ function ArtistTable({ userId }) {
     if (!uid) return
     setLoading(true)
     const params = new URLSearchParams({ user_id: uid, sort_by: sb, order: ord, page: pg, page_size: 50 })
-    fetch(`/api/insights/artists?${params}`)
-      .then(r => r.json()).then(d => { setData(d); setLoading(false) })
+    api.get(`/api/insights/artists?${params}`)
+      .then(d => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
   }
 
@@ -1322,8 +1323,8 @@ function HolidayTable() {
   const [expanded, setExpanded] = useState(null)
 
   useEffect(() => {
-    fetch('/api/insights/holiday')
-      .then(r => r.json())
+    api.get('/api/insights/holiday')
+      
       .then(d => { setData(d); setLoading(false) })
       .catch(e => { setError(e.message); setLoading(false) })
   }, [])
@@ -1453,8 +1454,8 @@ export default function Insights() {
   const [tab, setTab] = useState('tracks')
 
   useEffect(() => {
-    fetch('/api/insights/users')
-      .then(r => r.json())
+    api.get('/api/insights/users')
+      
       .then(data => {
         setUsers(data)
         if (data.length > 0) setSelectedUser(data[0].jellyfin_user_id)
@@ -1465,8 +1466,8 @@ export default function Insights() {
   useEffect(() => {
     if (!selectedUser) return
     setSummary(null)
-    fetch(`/api/insights/summary?user_id=${selectedUser}`)
-      .then(r => r.json()).then(setSummary).catch(() => {})
+    api.get(`/api/insights/summary?user_id=${selectedUser}`)
+      .then(setSummary).catch(() => {})
   }, [selectedUser])
 
   return (

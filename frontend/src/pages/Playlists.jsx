@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { ListMusic, RefreshCw, CheckCircle2, XCircle, Loader2, Clock, ChevronDown, ChevronUp, Sparkles, TrendingUp, History, Radio } from 'lucide-react'
 import { useJobStatus } from '../hooks/useJobStatus.js'
 import JobProgress from '../components/JobProgress.jsx'
+import { api } from '../lib/api.js'
 
 const TYPE_CFG = {
   for_you:         { label:'For You',         icon:Sparkles,   color:'var(--accent)', desc:'Affinity-weighted picks from your history' },
@@ -101,9 +102,9 @@ export default function Playlists() {
   const [tab, setTab]               = useState('playlists')
 
   const fetchAll = useCallback(() => {
-    fetch('/api/playlists/current').then(r=>r.json()).then(setCurrent).catch(()=>{})
-    fetch('/api/playlists/runs').then(r=>r.json()).then(setRuns).catch(()=>{})
-    fetch('/api/playlists/users').then(r=>r.json()).then(setUsers).catch(()=>{})
+    api.get('/api/playlists/current').then(setCurrent).catch(()=>{})
+    api.get('/api/playlists/runs').then(setRuns).catch(()=>{})
+    api.get('/api/playlists/users').then(setUsers).catch(()=>{})
   }, [])
   useEffect(() => { fetchAll() }, [fetchAll])
 
@@ -112,13 +113,9 @@ export default function Playlists() {
   const handleGenerate = async () => {
     setGenerating(true); setGenMsg(null); setGenPhase('Writing playlists to Jellyfin\u2026')
     try {
-      const r = await fetch('/api/playlists/generate', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ playlist_types: selected }),
-      })
-      const d = await r.json()
+      const d = await api.post('/api/playlists/generate', { playlist_types: selected })
       setGenPhase('')
-      if (r.ok && d.ok) {
+      if (d.ok) {
         setGenMsg({ text:`${d.playlists_written} playlist${d.playlists_written!==1?'s':''} written to Jellyfin`, ok:true })
         fetchAll(); setTab('playlists')
       } else setGenMsg({ text: d.error || d.detail || 'Generation failed', ok:false })
@@ -130,8 +127,7 @@ export default function Playlists() {
     if (expandedRun === runId) { setExpandedRun(null); return }
     setExpandedRun(runId)
     if (!runDetails[runId]) {
-      const r = await fetch(`/api/playlists/runs/${runId}`)
-      const d = await r.json()
+      const d = await api.get(`/api/playlists/runs/${runId}`)
       setRunDetails(prev => ({ ...prev, [runId]: d }))
     }
   }
