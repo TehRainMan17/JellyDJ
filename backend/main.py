@@ -1,4 +1,3 @@
-
 """
 JellyDJ — FastAPI application entry point.
 
@@ -24,6 +23,8 @@ from routers import (
     webhooks, discovery, playlists, insights, automation, exclusions,
 )
 from routers.auth import router as auth_router
+from routers.playlist_templates import router as playlist_templates_router
+from routers.user_playlists import router as user_playlists_router
 
 
 def _run_migrations():
@@ -119,6 +120,8 @@ def _run_migrations():
         # Auth Phase 1: Jellyfin login integration on managed_users
         ("managed_users", "is_admin",      "BOOLEAN",  "0"),
         ("managed_users", "last_login_at", "DATETIME", "NULL"),
+        # Phase 3: playlist template system — new column on playlist_run_items
+        ("playlist_run_items", "user_playlist_id", "INTEGER", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -156,7 +159,7 @@ def _fix_various_artists_enrichment():
                 _sa.func.lower(TrackEnrichment.artist_name).in_(va_names)
             )
             .update(
-                {"expires_at": None, "popularity_score": None, "source": None},
+                {"expires_at": None, "popularity_score": None, "source": "expired"},
                 synchronize_session=False,
             )
         )
@@ -242,6 +245,17 @@ async def lifespan(app: FastAPI):
     # Purge any expired refresh tokens left over from previous sessions
     _cleanup_expired_refresh_tokens()
 
+    # Seed system prefab playlist templates on a fresh DB (no-op if rows exist),
+    # then migrate any existing system templates to the new filter_tree block
+    # format. Both operations are idempotent and touch only is_system=True rows.
+    from services.prefab_seeder import seed_prefabs, migrate_system_templates
+    _db = SessionLocal()
+    try:
+        seed_prefabs(_db)
+        migrate_system_templates(_db)
+    finally:
+        _db.close()
+
     # Start the APScheduler background job scheduler
     from scheduler import start_scheduler
     start_scheduler(SessionLocal)
@@ -295,6 +309,8 @@ app.include_router(insights.router)       # /api/insights       — listening st
 app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
 app.include_router(exclusions.router)     # /api/exclusions     — manual album exclusions
 app.include_router(auth_router)           # /api/auth           — Jellyfin login + JWT tokens
+app.include_router(playlist_templates_router)  # /api/playlist-templates — template + block CRUD
+app.include_router(user_playlists_router)      # /api/user-playlists     — user playlist CRUD + push
 
 
 @app.get("/api/health")

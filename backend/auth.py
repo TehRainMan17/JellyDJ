@@ -5,6 +5,7 @@ Provides:
   - JWT access token creation/decoding (python-jose)
   - Refresh token generation and hashing
   - FastAPI dependencies: get_current_user, require_admin
+  - Permission helpers: assert_owns_template, assert_owns_playlist
 
 JWT signing key is the existing SECRET_KEY env var — the same key used by
 crypto.py for Fernet credential encryption. No new env vars are introduced.
@@ -117,3 +118,27 @@ def require_admin(user: UserContext = Depends(get_current_user)) -> UserContext:
             detail="Administrator access required",
         )
     return user
+
+
+# ── Permission helpers ────────────────────────────────────────────────────────
+
+def assert_owns_template(template, user: UserContext) -> None:
+    """Raises 403 if user is not admin and does not own the template."""
+    if user.is_admin:
+        return
+    if template.owner_user_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to modify this template.",
+        )
+
+
+def assert_owns_playlist(playlist, user: UserContext) -> None:
+    """Raises 403 if user is not admin and does not own the playlist."""
+    if user.is_admin:
+        return
+    if playlist.owner_user_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this playlist.",
+        )

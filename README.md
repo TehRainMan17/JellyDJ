@@ -99,11 +99,19 @@ My family moved off Spotify to take back control of our music. No subscriptions,
 
 But my girls missed something real: **the magic of discovery**. That moment when a service just *knows* you well enough to surface an artist you've never heard but somehow immediately love. Spotify and YouTube Music are genuinely great at this, and plain Jellyfin has no answer for it.
 
-So I built JellyDJ to fill that void — with a lot of help from AI along the way.
+So I built JellyDJ to fill that void — with some help from AI along the way.
 
 It watches what everyone in the house listens to, builds taste profiles per person, and quietly surfaces new artists and albums they're likely to love — sending approved ones straight to Lidarr for download. My kids wake up and there's new music in their library that they didn't have to search for. My wife's playlists update themselves. Nobody has to touch a thing.
 
 **JellyDJ is what Jellyfin's music experience should have been all along.**
+
+<br/>
+
+---
+
+## ❗ Disclaimer
+I am not a professional programmer and this is not a professionally created piece of enterprise software.  I'm just a single dude making a thing he wanted.  I don't claim to make a production quality piece of software.  I'm using this project as much as a learning tool for software development and AI assisted code generation as I am genuinely creating a piece of desirable software.  There will be updates that break depoloyments or features.  I will debug in production.
+This is early days on this project and, as such, large portions are unfinished, buggy, or plain missing.  
 
 <br/>
 

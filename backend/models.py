@@ -1,6 +1,5 @@
-
 """
-JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3 + Auth Phase 1).
+JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3 + Auth Phase 1 + Phase 3).
 
 All tables and columns from every version are defined here.
 New tables are created by create_all() on startup.
@@ -212,6 +211,8 @@ class PlaylistRunItem(Base):
     action = Column(String, nullable=False, default="")
     status = Column(String, nullable=False, default="ok")
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Phase 3: playlist template system
+    user_playlist_id = Column(Integer, nullable=True)
 
 
 class LibraryTrack(Base):
@@ -527,3 +528,61 @@ class ExcludedAlbum(Base):
     excluded_at       = Column(DateTime, default=datetime.utcnow)
     track_count       = Column(Integer, nullable=False, default=0)
 
+
+# ── Phase 3: playlist template system ────────────────────────────────────────
+
+class PlaylistTemplate(Base):
+    """
+    A reusable playlist recipe — either a system prefab (is_system=True,
+    owner_user_id=None) or a user-created template.  Templates are composed
+    of one or more PlaylistBlock rows that describe how tracks are sourced
+    and weighted.
+    """
+    __tablename__ = "playlist_templates"
+    id             = Column(Integer, primary_key=True, index=True)
+    name           = Column(Text, nullable=False)
+    description    = Column(Text, nullable=True)
+    owner_user_id  = Column(Text, nullable=True)   # NULL = system/prefab template
+    is_public      = Column(Boolean, default=True)
+    is_system      = Column(Boolean, default=False)
+    forked_from_id = Column(Integer, nullable=True)  # references PlaylistTemplate.id
+    total_tracks   = Column(Integer, default=50)
+    blend_mode     = Column(Text, default="weighted_shuffle")
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PlaylistBlock(Base):
+    """
+    One scoring/selection block within a PlaylistTemplate.  Multiple blocks
+    are blended together according to their weights and the template's
+    blend_mode.  params is a JSON blob serialised/deserialised at the
+    service layer — never interpreted by the model itself.
+    """
+    __tablename__ = "playlist_blocks"
+    id          = Column(Integer, primary_key=True, index=True)
+    template_id = Column(Integer, nullable=False)   # references PlaylistTemplate.id
+    block_type  = Column(Text, nullable=False)
+    weight      = Column(Integer, nullable=False)
+    position    = Column(Integer, nullable=False)
+    params      = Column(Text, nullable=False)       # JSON blob — use json.dumps/loads
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserPlaylist(Base):
+    """
+    A user-owned playlist instance, optionally backed by a PlaylistTemplate.
+    Tracks schedule settings and generation history.
+    """
+    __tablename__ = "user_playlists"
+    id                   = Column(Integer, primary_key=True, index=True)
+    owner_user_id        = Column(Text, nullable=False)
+    template_id          = Column(Integer, nullable=True)  # references PlaylistTemplate.id
+    base_name            = Column(Text, nullable=False)
+    schedule_enabled     = Column(Boolean, default=False)
+    schedule_interval_h  = Column(Integer, default=24)
+    last_generated_at    = Column(DateTime, nullable=True)
+    last_track_count     = Column(Integer, nullable=True)
+    created_at           = Column(DateTime, default=datetime.utcnow)
+    updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
