@@ -3,10 +3,12 @@ JellyDJ — Authentication router.
 
 Endpoints
 ─────────
-  POST /api/auth/login    Authenticate via Jellyfin, issue JWT + refresh token
-  POST /api/auth/refresh  Rotate refresh token, re-validate Jellyfin session
-  POST /api/auth/logout   Revoke refresh token server-side
-  GET  /api/auth/me       Return current user from JWT (no DB/Jellyfin call)
+  POST /api/auth/login          Authenticate via Jellyfin, issue JWT + refresh token
+  POST /api/auth/setup-login    First-time setup login (env-var credentials, no Jellyfin needed)
+  GET  /api/auth/setup-status   Returns whether setup mode is active
+  POST /api/auth/refresh        Rotate refresh token, re-validate Jellyfin session
+  POST /api/auth/logout         Revoke refresh token server-side
+  GET  /api/auth/me             Return current user from JWT (no DB/Jellyfin call)
 
 Design notes
 ────────────
@@ -16,11 +18,26 @@ Design notes
   once (at issuance) and never stored.
 - All Jellyfin HTTP calls use the same X-Emby-Authorization header format and
   ConnectionSettings lookup pattern as the rest of the codebase.
+
+Setup Mode
+──────────
+- Enabled when SETUP_USERNAME and SETUP_PASSWORD are both set in the environment.
+- Setup login is ONLY accepted when Jellyfin is not yet configured, preventing
+  the setup account from being used as a backdoor once production is running.
+  (Operators who intentionally want persistent setup access can set
+  SETUP_ALLOW_AFTER_CONFIGURE=true, but this is not recommended.)
+- The setup session is issued as a short-lived JWT (same 15-min expiry) with
+  is_admin=True and a synthetic user_id of "jellydj-setup".
+- Refresh tokens are NOT issued for setup sessions — the setup user must
+  re-authenticate each time, preventing long-lived setup credentials.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -51,6 +68,28 @@ _EMBY_AUTH = (
 )
 
 REFRESH_TOKEN_EXPIRE_HOURS = 8
+
+# ── Setup mode ────────────────────────────────────────────────────────────────
+
+SETUP_USER_ID = "jellydj-setup"
+
+def _setup_credentials() -> tuple[str, str] | None:
+    """
+    Return (username, password) from env vars if setup mode is configured,
+    or None if the vars are absent/empty.
+    Both SETUP_USERNAME and SETUP_PASSWORD must be set for setup mode to activate.
+    """
+    u = os.getenv("SETUP_USERNAME", "").strip()
+    p = os.getenv("SETUP_PASSWORD", "").strip()
+    if u and p:
+        return u, p
+    return None
+
+
+def _jellyfin_is_configured(db: Session) -> bool:
+    """Return True if Jellyfin URL has been saved to the database."""
+    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+    return bool(row and row.base_url)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -151,6 +190,22 @@ class LoginResponse(BaseModel):
     is_admin: bool
 
 
+class SetupLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class SetupLoginResponse(BaseModel):
+    access_token: str
+    username: str
+    is_admin: bool
+
+
+class SetupStatusResponse(BaseModel):
+    setup_available: bool   # True when env vars are set AND Jellyfin is not yet configured
+    jellyfin_configured: bool
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 
@@ -171,6 +226,79 @@ class MeResponse(BaseModel):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get("/setup-status", response_model=SetupStatusResponse)
+def setup_status(db: Session = Depends(get_db)):
+    """
+    Returns whether setup mode is currently available.
+    The frontend uses this to decide whether to show the setup-login UI.
+    """
+    creds = _setup_credentials()
+    configured = _jellyfin_is_configured(db)
+    allow_after = os.getenv("SETUP_ALLOW_AFTER_CONFIGURE", "").lower() in ("1", "true", "yes")
+
+    setup_available = (
+        creds is not None
+        and (not configured or allow_after)
+    )
+    return SetupStatusResponse(
+        setup_available=setup_available,
+        jellyfin_configured=configured,
+    )
+
+
+@router.post("/setup-login", response_model=SetupLoginResponse)
+def setup_login(body: SetupLoginRequest, db: Session = Depends(get_db)):
+    """
+    First-time setup login using SETUP_USERNAME / SETUP_PASSWORD env vars.
+
+    Security properties:
+    - Only accepted when Jellyfin is not yet configured (bootstrap window).
+    - Credentials compared with secrets.compare_digest to prevent timing attacks.
+    - Issues a short-lived access JWT only — no refresh token is stored.
+    - The synthetic user_id "jellydj-setup" is never written to managed_users.
+    - Once Jellyfin URL is saved, this endpoint returns 403 (unless
+      SETUP_ALLOW_AFTER_CONFIGURE=true, which is not recommended for
+      internet-facing instances).
+    """
+    creds = _setup_credentials()
+    if creds is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup mode is not enabled. Set SETUP_USERNAME and SETUP_PASSWORD in your .env to activate it.",
+        )
+
+    configured = _jellyfin_is_configured(db)
+    allow_after = os.getenv("SETUP_ALLOW_AFTER_CONFIGURE", "").lower() in ("1", "true", "yes")
+    if configured and not allow_after:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup login is disabled once Jellyfin is configured. Log in with your Jellyfin account.",
+        )
+
+    env_username, env_password = creds
+
+    # Constant-time comparison to prevent timing attacks
+    username_ok = secrets.compare_digest(body.username.encode(), env_username.encode())
+    password_ok = secrets.compare_digest(body.password.encode(), env_password.encode())
+
+    if not (username_ok and password_ok):
+        log.warning("Failed setup login attempt for username=%r", body.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid setup credentials",
+        )
+
+    log.info("Setup login successful — issuing short-lived admin token")
+    access_token = create_access_token(
+        {"user_id": SETUP_USER_ID, "username": env_username, "is_admin": True}
+    )
+
+    return SetupLoginResponse(
+        access_token=access_token,
+        username=env_username,
+        is_admin=True,
+    )
 
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, db: Session = Depends(get_db)):

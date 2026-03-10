@@ -67,7 +67,22 @@ export function AuthProvider({ children }) {
     return data.access_token
   }, [applyAccessToken])
 
-  // ── Login ─────────────────────────────────────────────────────────────────
+  // ── Setup Login (no refresh token — setup sessions are short-lived only) ──
+  const setupLogin = useCallback(async (username, password) => {
+    const resp = await fetch('/api/auth/setup-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    })
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}))
+      throw new Error(err.detail || 'Setup login failed')
+    }
+    const data = await resp.json()
+    // No refresh token for setup sessions — access token only
+    applyAccessToken(data.access_token)
+    // Do NOT store a refresh token
+  }, [applyAccessToken])
   const login = useCallback(async (username, password) => {
     const resp = await fetch('/api/auth/login', {
       method: 'POST',
@@ -132,6 +147,7 @@ export function AuthProvider({ children }) {
     isAuthenticated: !!accessToken,
     accessToken,
     login,
+    setupLogin,
     logout,
     refresh,
     loading,

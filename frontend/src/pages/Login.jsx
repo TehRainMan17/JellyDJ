@@ -1,21 +1,33 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { Loader2, AlertCircle } from 'lucide-react'
+import { Loader2, AlertCircle, Wrench, ShieldCheck } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import logoUrl from '/logo-64.png'
 
 export default function Login() {
-  const { login } = useAuth()
+  const { login, setupLogin } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
 
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError]       = useState('')
-  const [loading, setLoading]   = useState(false)
+  const [username, setUsername]     = useState('')
+  const [password, setPassword]     = useState('')
+  const [error, setError]           = useState('')
+  const [loading, setLoading]       = useState(false)
+
+  // Setup mode state
+  const [setupStatus, setSetupStatus]       = useState(null)   // null = loading, then {setup_available, jellyfin_configured}
+  const [setupMode, setSetupMode]           = useState(false)   // true = showing setup login form
 
   // Where to go after successful login (preserved redirect state)
   const from = location.state?.from?.pathname || '/'
+
+  // Check setup status on mount
+  useEffect(() => {
+    fetch('/api/auth/setup-status')
+      .then(r => r.json())
+      .then(data => setSetupStatus(data))
+      .catch(() => setSetupStatus({ setup_available: false, jellyfin_configured: false }))
+  }, [])
 
   const handleSubmit = async () => {
     if (!username || !password) {
@@ -25,7 +37,11 @@ export default function Login() {
     setLoading(true)
     setError('')
     try {
-      await login(username, password)
+      if (setupMode) {
+        await setupLogin(username, password)
+      } else {
+        await login(username, password)
+      }
       navigate(from, { replace: true })
     } catch (err) {
       setError(err.message || 'Login failed. Check your credentials.')
@@ -36,6 +52,13 @@ export default function Login() {
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') handleSubmit()
+  }
+
+  const switchMode = (toSetup) => {
+    setSetupMode(toSetup)
+    setUsername('')
+    setPassword('')
+    setError('')
   }
 
   return (
@@ -79,10 +102,32 @@ export default function Login() {
               }}>DJ</span>
             </span>
             <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4 }}>
-              Sign in to continue
+              {setupMode ? 'First-time setup' : 'Sign in to continue'}
             </p>
           </div>
         </div>
+
+        {/* Setup mode banner */}
+        {setupMode && (
+          <div
+            className="flex items-start gap-2.5 px-3 py-3 rounded-xl text-sm mb-4 anim-scale-in"
+            style={{
+              background: 'rgba(91,230,245,0.07)',
+              border: '1px solid rgba(91,230,245,0.25)',
+              color: 'var(--text-primary)',
+            }}
+          >
+            <ShieldCheck size={15} style={{ flexShrink: 0, marginTop: 1, color: '#5be6f5' }} />
+            <span style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.5 }}>
+              You're using the <strong style={{ color: 'var(--text-primary)' }}>setup account</strong> to
+              configure JellyDJ for the first time. Connect Jellyfin on the{' '}
+              <strong style={{ color: 'var(--text-primary)' }}>Connections</strong> page, then sign in with
+              your Jellyfin account. Remove <code style={{ fontSize: 11 }}>SETUP_USERNAME</code> and{' '}
+              <code style={{ fontSize: 11 }}>SETUP_PASSWORD</code> from your <code style={{ fontSize: 11 }}>.env</code>{' '}
+              when done.
+            </span>
+          </div>
+        )}
 
         {/* Card */}
         <div
@@ -95,7 +140,7 @@ export default function Login() {
               htmlFor="username"
               className="section-label"
             >
-              Username
+              {setupMode ? 'Setup Username' : 'Username'}
             </label>
             <input
               id="username"
@@ -105,7 +150,7 @@ export default function Login() {
               value={username}
               onChange={e => setUsername(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="admin"
+              placeholder={setupMode ? 'admin' : 'Jellyfin username'}
               className="input"
             />
           </div>
@@ -116,7 +161,7 @@ export default function Login() {
               htmlFor="password"
               className="section-label"
             >
-              Password
+              {setupMode ? 'Setup Password' : 'Password'}
             </label>
             <input
               id="password"
@@ -154,10 +199,34 @@ export default function Login() {
           >
             {loading
               ? <><Loader2 size={15} className="animate-spin" /> Signing in…</>
-              : 'Sign in'
+              : setupMode ? 'Enter Setup' : 'Sign in'
             }
           </button>
         </div>
+
+        {/* Setup mode toggle — only shown when setup is available */}
+        {setupStatus?.setup_available && (
+          <div className="mt-4 text-center">
+            {setupMode ? (
+              <button
+                onClick={() => switchMode(false)}
+                className="text-xs"
+                style={{ color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}
+              >
+                ← Back to Jellyfin login
+              </button>
+            ) : (
+              <button
+                onClick={() => switchMode(true)}
+                className="flex items-center gap-1.5 mx-auto text-xs"
+                style={{ color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}
+              >
+                <Wrench size={12} />
+                First time setup? Use setup account
+              </button>
+            )}
+          </div>
+        )}
 
         <p
           className="text-center mt-6 text-xs"

@@ -67,12 +67,17 @@ networks:
 JELLYDJ_PORT=7879
 TZ=America/New_York
 SECRET_KEY=your_generated_key_here
+
+# First-time setup account (remove after Jellyfin is connected — see step 5)
+SETUP_USERNAME=admin
+SETUP_PASSWORD=your_strong_setup_password_here
 ```
 
-Generate a secret key:
+Generate strong values for `SECRET_KEY` and `SETUP_PASSWORD`:
 
 ```bash
-python -c "import secrets; print(secrets.token_hex(32))"
+python -c "import secrets; print(secrets.token_hex(32))"   # for SECRET_KEY
+python -c "import secrets; print(secrets.token_urlsafe(24))"  # for SETUP_PASSWORD
 ```
 
 > ⚠️ Set `SECRET_KEY` once and don't change it — it encrypts your stored API keys. Changing it later will require re-entering all credentials.
@@ -89,7 +94,25 @@ docker compose up -d
 http://localhost:7879
 ```
 
-Complete setup on the **Connections** page, then hit **Index Now** to run your first library scan. Everything else — Jellyfin URL, API keys, Lidarr — is configured from the web UI.
+### 5. First-time setup
+
+JellyDJ requires a Jellyfin connection to log in — but you need to log in to configure the Jellyfin connection. The **setup account** breaks this chicken-and-egg problem.
+
+1. On the login page, click **"First time setup? Use setup account"** at the bottom.
+2. Sign in with the `SETUP_USERNAME` and `SETUP_PASSWORD` you set in your `.env`.
+3. Go to the **Connections** page and enter your Jellyfin URL and API key.
+4. Once connected, log out and sign back in with your **Jellyfin** credentials.
+5. **Remove `SETUP_USERNAME` and `SETUP_PASSWORD` from your `.env`** and restart:
+
+```bash
+docker compose up -d
+```
+
+The setup login is automatically disabled once you remove those variables. It is also automatically blocked once Jellyfin is configured, so leaving them in is safe for a brief setup window — but removing them is best practice, especially for internet-facing installs.
+
+> 🔒 **Security note:** The setup account uses `SETUP_PASSWORD` from your `.env` — never the password of any Jellyfin user. Use a strong, randomly generated value and remove it as soon as setup is complete. The setup login endpoint is protected against timing attacks and is automatically rejected once Jellyfin is configured.
+
+Hit **Index Now** on the Settings page after connecting Jellyfin to run your first library scan.
 
 ---
 
@@ -110,7 +133,7 @@ It watches what everyone in the house listens to, builds taste profiles per pers
 ---
 
 ## ❗ Disclaimer
-I am not a professional programmer and this is not a professionally created piece of enterprise software.  I'm just a single dude making a thing he wanted.  I don't claim to make a production quality piece of software.  I'm using this project as much as a learning tool for software development and AI assisted code generation as I am genuinely creating a piece of desirable software.  There will be updates that break depoloyments or features.  I will debug in production.
+I am not a professional programmer and this is not a professionally created piece of enterprise software.  I'm just a single dude making a thing he wanted.  I don't claim to make a production quality piece of software.  I'm using this project as much as a learning tool for software development and AI assisted code generation as I am genuinely creating a piece of desirable software.  There will be updates that break deployments or features.  I will debug in production.
 This is early days on this project and, as such, large portions are unfinished, buggy, or plain missing.  
 
 <br/>
