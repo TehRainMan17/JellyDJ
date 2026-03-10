@@ -1,3 +1,4 @@
+
 /**
  * BlockChainEditor.jsx
  *
@@ -14,7 +15,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users,
-  Tag, ChevronDown, ChevronUp, Trash2, Plus, X, Search
+  Tag, ChevronDown, ChevronUp, Trash2, Plus, X, Search,
+  Zap, RefreshCw, Compass, BarChart2, SkipForward
 } from 'lucide-react'
 
 // ── Filter catalogue ──────────────────────────────────────────────────────────
@@ -30,7 +32,13 @@ export const FILTER_TYPES = {
   affinity:          { label: 'Affinity Range',      icon: Star,       color: '#a78bfa',        desc: 'Tracks within a specific artist + genre affinity score range' },
   favorites:         { label: 'Favorites Only',      icon: Star,       color: '#fde68a',        desc: 'Only tracks you have explicitly marked as favorites' },
   played_status:     { label: 'Played Status',       icon: TrendingUp, color: '#94a3b8',        desc: 'Narrow to only played tracks, or only tracks you\'ve never played' },
-  artist_cap:        { label: 'Artist Cap',          icon: Users,      color: '#94a3b8',        desc: 'Limit how many tracks from any single artist can appear in this chain' },
+  artist_cap:        { label: 'Artist Cap',          icon: Users,        color: '#94a3b8',        desc: 'Limit how many tracks from any single artist can appear in this chain' },
+  // New blocks
+  skip_rate:         { label: 'Skip Rate Filter',    icon: SkipForward,  color: '#f97316',        desc: 'Filter by how often you skip a track — 0 = never skip, 1 = always skip' },
+  replay_boost:      { label: 'Replay Boost',        icon: RefreshCw,    color: '#22d3ee',        desc: "Tracks from artists you've been voluntarily seeking out recently" },
+  novelty:           { label: 'Novelty Score',       icon: Compass,      color: '#a78bfa',        desc: 'Unplayed tracks ranked by how well they match your artist + genre taste profile' },
+  recency_score:     { label: 'Recency Score',       icon: BarChart2,    color: '#fb923c',        desc: 'Smooth recency gradient — 100 = played last month, 0 = over a year ago' },
+  skip_streak:       { label: 'Skip Streak',         icon: Zap,          color: '#f43f5e',        desc: 'Filter by consecutive skip count — great for zero-tolerance skip filtering' },
 }
 
 const DEFAULT_PARAMS = {
@@ -45,6 +53,12 @@ const DEFAULT_PARAMS = {
   favorites:         {},
   played_status:     { played_filter: 'played' },
   artist_cap:        { max_per_artist: 3 },
+  // New blocks
+  skip_rate:         { skip_penalty_min: 0.0, skip_penalty_max: 0.3, played_filter: 'all' },
+  replay_boost:      { boost_min: 0.1, played_filter: 'all' },
+  novelty:           { novelty_min: 0, novelty_max: 100 },
+  recency_score:     { recency_min: 0, recency_max: 100, played_filter: 'played' },
+  skip_streak:       { streak_min: 0, streak_max: 2, played_filter: 'all' },
 }
 
 let _uid = 1000
@@ -389,6 +403,108 @@ function AffinityEditor({ p, set }) {
   )
 }
 
+// ── New block param editors ────────────────────────────────────────────────────
+
+function SkipRateEditor({ p, set }) {
+  const lo = p.skip_penalty_min ?? 0.0
+  const hi = p.skip_penalty_max ?? 0.3
+  return (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Skip penalty (0 = never skip · 100 = always skip)"
+        lo={Math.round(lo * 100)} hi={Math.round(hi * 100)}
+        min={0} max={100} step={1}
+        onLo={v => set({ ...p, skip_penalty_min: v / 100 })}
+        onHi={v => set({ ...p, skip_penalty_max: v / 100 })}
+        unit="%"
+      />
+      <div>
+        <div className="section-label mb-1.5">Track status</div>
+        <Chips value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })}
+          options={[{ v: 'all', label: 'All' }, { v: 'played', label: 'Played' }, { v: 'unplayed', label: 'Unplayed' }]} />
+      </div>
+    </div>
+  )
+}
+
+function ReplayBoostEditor({ p, set }) {
+  return (
+    <div className="space-y-4">
+      <SingleSlider
+        label="Minimum replay boost"
+        value={parseFloat((p.boost_min ?? 0.1).toFixed(1))}
+        min={0.1} max={12} step={0.1}
+        onChange={v => set({ ...p, boost_min: v })}
+      />
+      <div>
+        <div className="section-label mb-1.5">Track status</div>
+        <Chips value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })}
+          options={[{ v: 'all', label: 'All' }, { v: 'played', label: 'Played' }, { v: 'unplayed', label: 'Unplayed' }]} />
+      </div>
+    </div>
+  )
+}
+
+function NoveltyEditor({ p, set }) {
+  return (
+    <RangeInputs
+      label="Novelty score (0 = low taste fit · 100 = perfect match)"
+      lo={p.novelty_min ?? 0} hi={p.novelty_max ?? 100}
+      min={0} max={100} step={1}
+      onLo={v => set({ ...p, novelty_min: v })}
+      onHi={v => set({ ...p, novelty_max: v })}
+    />
+  )
+}
+
+function RecencyScoreEditor({ p, set }) {
+  return (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Recency score (0 = over a year ago · 100 = last 30 days)"
+        lo={p.recency_min ?? 0} hi={p.recency_max ?? 100}
+        min={0} max={100} step={1}
+        onLo={v => set({ ...p, recency_min: v })}
+        onHi={v => set({ ...p, recency_max: v })}
+      />
+      <div>
+        <div className="section-label mb-1.5">Track status</div>
+        <Chips value={p.played_filter ?? 'played'} onChange={v => set({ ...p, played_filter: v })}
+          options={[{ v: 'played', label: 'Played' }, { v: 'unplayed', label: 'Unplayed' }, { v: 'all', label: 'All' }]} />
+      </div>
+    </div>
+  )
+}
+
+function SkipStreakEditor({ p, set }) {
+  const lo = p.streak_min ?? 0
+  const hi = p.streak_max ?? 2
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <div className="flex-1">
+          <div className="section-label mb-1">Min streak</div>
+          <input type="number" min={0} max={20} value={lo}
+            onChange={e => set({ ...p, streak_min: Math.max(0, Math.min(hi, Number(e.target.value))) })}
+            className="input w-full text-center text-xs" />
+        </div>
+        <div className="text-xs pt-4" style={{ color: 'var(--text-muted)' }}>to</div>
+        <div className="flex-1">
+          <div className="section-label mb-1">Max streak</div>
+          <input type="number" min={0} max={20} value={hi}
+            onChange={e => set({ ...p, streak_max: Math.max(lo, Math.min(20, Number(e.target.value))) })}
+            className="input w-full text-center text-xs" />
+        </div>
+      </div>
+      <div>
+        <div className="section-label mb-1.5">Track status</div>
+        <Chips value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })}
+          options={[{ v: 'all', label: 'All' }, { v: 'played', label: 'Played' }, { v: 'unplayed', label: 'Unplayed' }]} />
+      </div>
+    </div>
+  )
+}
+
 const PARAM_EDITORS = {
   final_score:       FinalScoreEditor,
   play_recency:      PlayRecencyEditor,
@@ -410,6 +526,12 @@ const PARAM_EDITORS = {
     <SingleSlider label="Max tracks per artist" value={p.max_per_artist ?? 3} min={1} max={20} step={1}
       onChange={v => set({ ...p, max_per_artist: v })} />
   ),
+  // New blocks
+  skip_rate:     SkipRateEditor,
+  replay_boost:  ReplayBoostEditor,
+  novelty:       NoveltyEditor,
+  recency_score: RecencyScoreEditor,
+  skip_streak:   SkipStreakEditor,
 }
 
 // ── AddFilterButton ───────────────────────────────────────────────────────────

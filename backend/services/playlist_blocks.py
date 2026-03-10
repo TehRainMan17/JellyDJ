@@ -690,16 +690,21 @@ def execute_skip_streak_block(
     (e.g. a "tracks I keep skipping" debug playlist).
 
     Params:
-      streak_max   : int — keep only tracks with streak <= this value (default 2)
       streak_min   : int — keep only tracks with streak >= this value (default 0)
+      streak_max   : int — keep only tracks with streak <= this value (default 0)
       played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+
+    Default streak_max=0 means "no current skip streak" — ideal as an AND child
+    to exclude tracks the user has skipped consecutively at least once. This is
+    stricter than cooldown (which fires at 3+ skips) but softer than permanent
+    suppression.  Set streak_min=3 to build a skip-pile diagnostic playlist.
 
     Data source: TrackScore.skip_streak (written by scoring_engine Phase 3
                  from SkipPenalty.consecutive_skips).
     """
     from models import TrackScore
     streak_min    = int(params.get("streak_min", 0))
-    streak_max    = int(params.get("streak_max", 2))
+    streak_max    = int(params.get("streak_max", 0))
     played_filter = params.get("played_filter", "all")
 
     query = (

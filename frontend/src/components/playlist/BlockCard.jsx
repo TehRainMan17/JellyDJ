@@ -1,3 +1,4 @@
+
 /**
  * BlockCard.jsx — Single block display/edit card for the Block Editor.
  * All numeric ranges have both a drag slider AND a type-in number input.
@@ -5,19 +6,26 @@
 import { useState } from 'react'
 import {
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users,
-  Tag, Layers, ChevronDown, ChevronUp, ArrowUp, ArrowDown, Trash2
+  Tag, Layers, ChevronDown, ChevronUp, ArrowUp, ArrowDown, Trash2,
+  Zap, RefreshCw, Compass, BarChart2, SkipForward
 } from 'lucide-react'
 
 export const BLOCK_TYPES = {
-  final_score:       { label: 'Final Score',        icon: Sparkles,   color: 'var(--accent)',   desc: 'Affinity-weighted picks ranked by composite score' },
-  affinity:          { label: 'Affinity',            icon: Star,       color: '#a78bfa',         desc: 'Tracks ranked by artist + genre affinity average' },
-  genre:             { label: 'Genre',               icon: Tag,        color: '#34d399',         desc: 'Tracks filtered by genre with affinity ranking' },
-  artist:            { label: 'Artist',              icon: Users,      color: '#fb923c',         desc: 'Tracks from specific artists ranked by affinity' },
-  play_count:        { label: 'Play Count',          icon: TrendingUp, color: '#f87171',         desc: 'Your most (or least) played tracks' },
-  play_recency:      { label: 'Play Recency',        icon: Clock,      color: '#fbbf24',         desc: 'Tracks played recently or a while ago' },
-  global_popularity: { label: 'Global Popularity',  icon: Globe,      color: '#60a5fa',         desc: 'Globally popular tracks from your library' },
-  discovery:         { label: 'Discovery',           icon: Radio,      color: '#f472b6',         desc: 'Novel tracks by familiarity tier' },
-  favorites:         { label: 'Favorites',           icon: Star,       color: '#fde68a',         desc: 'Your favorited tracks only' },
+  final_score:       { label: 'Final Score',        icon: Sparkles,     color: 'var(--accent)',   desc: 'Affinity-weighted picks ranked by composite score' },
+  affinity:          { label: 'Affinity',            icon: Star,         color: '#a78bfa',         desc: 'Tracks ranked by artist + genre affinity average' },
+  genre:             { label: 'Genre',               icon: Tag,          color: '#34d399',         desc: 'Tracks filtered by genre with affinity ranking' },
+  artist:            { label: 'Artist',              icon: Users,        color: '#fb923c',         desc: 'Tracks from specific artists ranked by affinity' },
+  play_count:        { label: 'Play Count',          icon: TrendingUp,   color: '#f87171',         desc: 'Your most (or least) played tracks' },
+  play_recency:      { label: 'Play Recency',        icon: Clock,        color: '#fbbf24',         desc: 'Tracks played recently or a while ago' },
+  global_popularity: { label: 'Global Popularity',  icon: Globe,        color: '#60a5fa',         desc: 'Globally popular tracks from your library' },
+  discovery:         { label: 'Discovery',           icon: Radio,        color: '#f472b6',         desc: 'Novel tracks by familiarity tier' },
+  favorites:         { label: 'Favorites',           icon: Star,         color: '#fde68a',         desc: 'Your favorited tracks only' },
+  // New blocks
+  skip_rate:         { label: 'Skip Rate Filter',    icon: SkipForward,  color: '#f97316',         desc: 'Filter by skip penalty — 0 = never skipped, 100 = always skipped' },
+  replay_boost:      { label: 'Replay Boost',        icon: RefreshCw,    color: '#22d3ee',         desc: "Tracks from artists you've been actively replaying lately" },
+  novelty:           { label: 'Novelty Score',       icon: Compass,      color: '#a78bfa',         desc: 'Unplayed tracks ranked by taste-profile fit' },
+  recency_score:     { label: 'Recency Score',       icon: BarChart2,    color: '#fb923c',         desc: 'Smooth recency gradient: 100 = last month, 0 = over a year ago' },
+  skip_streak:       { label: 'Skip Streak',         icon: Zap,          color: '#f43f5e',         desc: 'Filter by consecutive skip count — great for zero-tolerance filtering' },
 }
 
 // ── RangeWithInputs ───────────────────────────────────────────────────────────
@@ -528,6 +536,100 @@ function FavoritesFilters({ params, onChange }) {
   )
 }
 
+function SkipRateFilters({ params, onChange }) {
+  const lo = params.skip_penalty_min ?? 0.0
+  const hi = params.skip_penalty_max ?? 0.3
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Skip penalty range (0 = never skipped · 100 = always)"
+        minVal={Math.round(lo * 100)}
+        maxVal={Math.round(hi * 100)}
+        absMin={0} absMax={100} step={1}
+        onMinChange={v => onChange({ ...params, skip_penalty_min: v / 100 })}
+        onMaxChange={v => onChange({ ...params, skip_penalty_max: v / 100 })}
+        unit="%"
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function ReplayBoostFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <SingleSliderWithInput
+        label="Minimum replay boost"
+        value={parseFloat((params.boost_min ?? 0.1).toFixed(1))}
+        min={0.1} max={12} step={0.1}
+        onChange={v => onChange({ ...params, boost_min: v })}
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+      <MaxPerArtist value={params.max_per_artist} onChange={v => onChange({ ...params, max_per_artist: v })} />
+    </div>
+  )
+}
+
+function NoveltyFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Novelty score range (0 = low fit · 100 = perfect match)"
+        minVal={params.novelty_min ?? 0}
+        maxVal={params.novelty_max ?? 100}
+        absMin={0} absMax={100} step={1}
+        onMinChange={v => onChange({ ...params, novelty_min: v })}
+        onMaxChange={v => onChange({ ...params, novelty_max: v })}
+      />
+      <MaxPerArtist value={params.max_per_artist} onChange={v => onChange({ ...params, max_per_artist: v })} />
+    </div>
+  )
+}
+
+function RecencyScoreFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Recency score (0 = over a year ago · 100 = last 30 days)"
+        minVal={params.recency_min ?? 0}
+        maxVal={params.recency_max ?? 100}
+        absMin={0} absMax={100} step={1}
+        onMinChange={v => onChange({ ...params, recency_min: v })}
+        onMaxChange={v => onChange({ ...params, recency_max: v })}
+      />
+      <PlayedFilter value={params.played_filter ?? 'played'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function SkipStreakFilters({ params, onChange }) {
+  const lo = params.streak_min ?? 0
+  const hi = params.streak_max ?? 2
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="section-label mb-2">Consecutive skip streak range</div>
+        <div className="flex items-center gap-3">
+          <div className="flex-1">
+            <div className="text-[10px] mb-1" style={{ color: 'var(--text-muted)' }}>Min</div>
+            <input type="number" min={0} max={20} value={lo}
+              onChange={e => onChange({ ...params, streak_min: Math.max(0, Math.min(hi, Number(e.target.value))) })}
+              className="input w-full text-center text-xs" />
+          </div>
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>to</div>
+          <div className="flex-1">
+            <div className="text-[10px] mb-1" style={{ color: 'var(--text-muted)' }}>Max</div>
+            <input type="number" min={0} max={20} value={hi}
+              onChange={e => onChange({ ...params, streak_max: Math.max(lo, Math.min(20, Number(e.target.value))) })}
+              className="input w-full text-center text-xs" />
+          </div>
+        </div>
+      </div>
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
 const FILTER_COMPONENTS = {
   final_score:       FinalScoreFilters,
   affinity:          AffinityFilters,
@@ -538,6 +640,12 @@ const FILTER_COMPONENTS = {
   global_popularity: GlobalPopularityFilters,
   discovery:         DiscoveryFilters,
   favorites:         FavoritesFilters,
+  // New blocks
+  skip_rate:         SkipRateFilters,
+  replay_boost:      ReplayBoostFilters,
+  novelty:           NoveltyFilters,
+  recency_score:     RecencyScoreFilters,
+  skip_streak:       SkipStreakFilters,
 }
 
 // ── BlockCard ─────────────────────────────────────────────────────────────────
