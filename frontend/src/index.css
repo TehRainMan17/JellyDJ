@@ -189,6 +189,36 @@
   .text-purple-glow { color: var(--purple); text-shadow: 0 0 20px var(--purple-glow); }
 }
 
+/* Native select — browsers don't inherit CSS variables on <select>, so we force the
+   dark theme here. The appearance:none removes the OS chrome; we add our own
+   chevron via a background SVG so it stays readable on dark backgrounds. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--bg-surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d9fc4' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.6rem center;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-primary);
+  padding: 0.375rem 2rem 0.375rem 0.625rem;
+  font-size: 0.875rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+select:hover  { border-color: var(--border-mid); }
+select:focus  {
+  outline: none;
+  border-color: rgba(83, 236, 252, 0.5);
+  box-shadow: 0 0 0 3px rgba(83, 236, 252, 0.08);
+}
+select option {
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
 /* Range inputs */
 input[type=range] { -webkit-appearance:none; appearance:none; height:4px; border-radius:99px; background:var(--bg-overlay); cursor:pointer; width:100%; }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--accent); border:2px solid var(--bg); box-shadow:0 0 8px var(--accent-glow); transition:transform 150ms,box-shadow 150ms; }

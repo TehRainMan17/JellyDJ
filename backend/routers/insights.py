@@ -12,12 +12,13 @@ New in v3 (UI column expansion):
   - Both endpoints: cooldown_filter (all|active|clear) already wired
     in /tracks
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, asc, func
 from typing import Optional
 from datetime import datetime
 
+from auth import UserContext, get_current_user
 from database import get_db
 from models import TrackScore, ArtistProfile, GenreProfile, ManagedUser, Play, SkipPenalty
 
@@ -35,9 +36,29 @@ def _resolve_user(user_id: Optional[str], username: Optional[str], db: Session) 
     raise HTTPException(400, "Provide user_id or username")
 
 
+def _assert_can_view_user(requested_user_id: str, current_user: UserContext) -> None:
+    """Raise 403 if a non-admin tries to view another user's data."""
+    if not current_user.is_admin and requested_user_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own insights.",
+        )
+
+
 @router.get("/users")
-def list_users(db: Session = Depends(get_db)):
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+def list_users(
+    db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
+):
+    """Return enabled users. Non-admins only see themselves."""
+    if not current_user.is_admin:
+        # Return just the current user — no cross-user visibility
+        u = db.query(ManagedUser).filter_by(jellyfin_user_id=current_user.user_id, has_activated=True).first()
+        if not u:
+            return []
+        return [{"jellyfin_user_id": u.jellyfin_user_id, "username": u.username}]
+
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     return [
         {"jellyfin_user_id": u.jellyfin_user_id, "username": u.username}
         for u in users
@@ -58,8 +79,10 @@ def get_tracks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
     db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
 ):
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
 
     q = db.query(TrackScore).filter_by(user_id=uid)
 
@@ -293,8 +316,10 @@ def get_artists(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
     db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
 ):
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
 
     q = db.query(ArtistProfile).filter_by(user_id=uid)
 
@@ -577,8 +602,10 @@ def get_summary(
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
 ):
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
 
     total_tracks = db.query(TrackScore).filter_by(user_id=uid).count()
     played_tracks = db.query(TrackScore).filter_by(user_id=uid, is_played=True).count()

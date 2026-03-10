@@ -103,7 +103,7 @@ def list_recommendable_users(db: Session = Depends(get_db)):
     users = (
         db.query(ManagedUser, UserSyncStatus)
         .join(UserSyncStatus, ManagedUser.jellyfin_user_id == UserSyncStatus.user_id, isouter=True)
-        .filter(ManagedUser.is_enabled == True)
+        .filter(ManagedUser.has_activated == True)
         .all()
     )
     return [

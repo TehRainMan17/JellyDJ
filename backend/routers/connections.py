@@ -62,9 +62,10 @@ class ConnectionResponse(BaseModel):
 
 
 class ManagedUserToggle(BaseModel):
+    """Kept for API backward-compat only — no longer used by the UI."""
     jellyfin_user_id: str
     is_enabled: bool
-    username: str = ""   # optional — frontend sends the known display name
+    username: str = ""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -142,67 +143,111 @@ async def test_jellyfin(db: Session = Depends(get_db)):
     return {"ok": True, "message": "Jellyfin connected successfully."}
 
 
-@router.get("/jellyfin/users")
-async def get_jellyfin_users(db: Session = Depends(get_db)):
-    """Fetch all users from Jellyfin and return them with their managed status."""
-    obj = _get_or_create(db, "jellyfin")
-    if not obj.base_url or not obj.api_key_encrypted:
-        raise HTTPException(400, "Jellyfin not configured.")
-
-    api_key = decrypt(obj.api_key_encrypted)
-    url = f"{obj.base_url}/Users"
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, headers={"X-Emby-Token": api_key})
-        resp.raise_for_status()
-        jf_users = resp.json()
-    except Exception:
-        raise HTTPException(502, "Failed to fetch users from Jellyfin.")
-
-    # Get currently managed users
-    managed = {u.jellyfin_user_id: u.is_enabled
-               for u in db.query(ManagedUser).all()}
-
+@router.get("/jellyfin/users/tracked")
+def get_tracked_users(db: Session = Depends(get_db)):
+    """
+    Return all users who have activated JellyDJ (pushed at least one playlist).
+    Used by the admin Connections page to show who has data and offer a delete option.
+    """
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     return [
         {
-            "jellyfin_user_id": u["Id"],
-            "username": u["Name"],
-            "is_enabled": managed.get(u["Id"], False),
+            "jellyfin_user_id": u.jellyfin_user_id,
+            "username": u.username,
+            "is_admin": u.is_admin,
+            "last_login_at": u.last_login_at,
         }
-        for u in jf_users
+        for u in users
     ]
 
 
+@router.delete("/jellyfin/users/{jellyfin_user_id}")
+def delete_user_data(jellyfin_user_id: str, db: Session = Depends(get_db)):
+    """
+    Wipe all JellyDJ data for a user and de-activate them.
+
+    Deletes: plays, track_scores, artist_profiles, genre_profiles,
+             discovery_queue, playlist_run_items, user_playlists, refresh_tokens.
+    Sets has_activated=False so the user won't be indexed until they push
+    another playlist.
+    """
+    from models import (
+        Play, TrackScore, ArtistProfile, GenreProfile,
+        DiscoveryQueueItem, PlaylistRunItem, UserPlaylist, RefreshToken,
+    )
+
+    uid = jellyfin_user_id
+
+    deleted = {}
+
+    def _del(model, label):
+        n = db.query(model).filter_by(user_id=uid).delete(synchronize_session=False)
+        deleted[label] = n
+
+    _del(Play,               "plays")
+    _del(TrackScore,         "track_scores")
+    _del(ArtistProfile,      "artist_profiles")
+    _del(GenreProfile,       "genre_profiles")
+    _del(DiscoveryQueueItem, "discovery_queue")
+    _del(PlaylistRunItem,    "playlist_run_items")
+
+    # UserPlaylist uses owner_user_id, not user_id
+    n = db.query(UserPlaylist).filter_by(owner_user_id=uid).delete(synchronize_session=False)
+    deleted["user_playlists"] = n
+
+    # RefreshTokens use user_id
+    n = db.query(RefreshToken).filter_by(user_id=uid).delete(synchronize_session=False)
+    deleted["refresh_tokens"] = n
+
+    # Also clear SkipPenalty and UserTasteProfile if they exist
+    try:
+        from models import SkipPenalty
+        n = db.query(SkipPenalty).filter_by(user_id=uid).delete(synchronize_session=False)
+        deleted["skip_penalties"] = n
+    except Exception:
+        pass
+    try:
+        from models import UserTasteProfile
+        n = db.query(UserTasteProfile).filter_by(user_id=uid).delete(synchronize_session=False)
+        deleted["taste_profiles"] = n
+    except Exception:
+        pass
+    try:
+        from models import UserSyncStatus
+        n = db.query(UserSyncStatus).filter_by(user_id=uid).delete(synchronize_session=False)
+        deleted["sync_status"] = n
+    except Exception:
+        pass
+
+    # De-activate the user — they won't be indexed until they push another playlist
+    user = db.query(ManagedUser).filter_by(jellyfin_user_id=uid).first()
+    if user:
+        user.has_activated = False
+        user.is_enabled = False
+
+    db.commit()
+
+    import logging
+    logging.getLogger(__name__).info(
+        "Admin wiped data for user %s: %s", uid, deleted
+    )
+    return {"ok": True, "deleted": deleted}
+
+
+# ── Legacy toggle — kept so any existing integrations don't 500 ───────────────
+
 @router.post("/jellyfin/users/toggle")
 async def toggle_managed_user(payload: ManagedUserToggle, db: Session = Depends(get_db)):
-    user = db.query(ManagedUser).filter_by(
-        jellyfin_user_id=payload.jellyfin_user_id
-    ).first()
-    if not user:
-        # Fetch the real username from Jellyfin immediately — never use ID as placeholder
-        username = payload.username or payload.jellyfin_user_id  # frontend-provided name, fallback to ID
-        try:
-            obj = _get_or_create(db, "jellyfin")
-            if obj.base_url and obj.api_key_encrypted:
-                api_key = decrypt(obj.api_key_encrypted)
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    resp = await client.get(
-                        f"{obj.base_url}/Users",
-                        headers={"X-Emby-Token": api_key}
-                    )
-                if resp.status_code == 200:
-                    jf_users = {u["Id"]: u["Name"] for u in resp.json()}
-                    username = jf_users.get(payload.jellyfin_user_id, payload.jellyfin_user_id)
-        except Exception:
-            pass  # use fallback
-        user = ManagedUser(
-            jellyfin_user_id=payload.jellyfin_user_id,
-            username=username,
-        )
-        db.add(user)
-    user.is_enabled = payload.is_enabled
-    db.commit()
-    return {"ok": True}
+    """Deprecated. Kept for backward-compat only. Has no effect on activation."""
+    return {"ok": True, "deprecated": True}
+
+
+# ── Legacy list — kept so any existing integrations don't 500 ────────────────
+
+@router.get("/jellyfin/users")
+async def get_jellyfin_users(db: Session = Depends(get_db)):
+    """Deprecated list endpoint — returns tracked users only."""
+    return await get_tracked_users.__wrapped__(db) if hasattr(get_tracked_users, '__wrapped__') else get_tracked_users(db)
 
 
 @router.post("/jellyfin/users/sync")

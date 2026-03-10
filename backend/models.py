@@ -37,7 +37,8 @@ class ManagedUser(Base):
     id = Column(Integer, primary_key=True, index=True)
     jellyfin_user_id = Column(String, unique=True, nullable=False)
     username = Column(String, nullable=False)
-    is_enabled = Column(Boolean, default=False)
+    is_enabled = Column(Boolean, default=False)   # legacy — kept for zero-downtime; use has_activated
+    has_activated = Column(Boolean, default=False, nullable=False)  # True once first playlist pushed
     added_at = Column(DateTime, default=datetime.utcnow)
     # Auth Phase 1: Jellyfin login integration
     is_admin = Column(Boolean, default=False, nullable=False)

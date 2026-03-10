@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../lib/api.js'
+import { useAuth } from '../contexts/AuthContext.jsx'
 import {
   Telescope, RefreshCw, Check, X, Clock, Send, Loader2, Music2,
   ChevronDown, ChevronUp, Trash2, Download, Pin, PinOff, ShieldAlert,
@@ -44,7 +45,7 @@ function StatusPill({ status, lidarrSent }) {
 }
 
 // ── Queue card ─────────────────────────────────────────────────────────────────
-function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab }) {
+function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab, isAdmin }) {
   const [expanded, setExpanded]   = useState(false)
   const [actioning, setActioning] = useState(null)
   const [sending, setSending]     = useState(false)
@@ -175,28 +176,32 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
       {/* Action row */}
       {activeTab === 'pending' && (
         <div className="flex flex-wrap gap-2 mt-3 pt-3" style={{ borderTop:'1px solid var(--border)' }}>
-          {/* Queue actions */}
-          <button onClick={() => handleAction('approved')} disabled={!!actioning}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
-                  style={{ background:'rgba(0,212,170,0.12)', border:'1px solid rgba(0,212,170,0.25)', color:'var(--accent)' }}>
-            {actioning==='approved' ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
-            Approve
-          </button>
-          <button onClick={() => handleAction('rejected')} disabled={!!actioning}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
-                  style={{ background:'rgba(248,113,113,0.1)', border:'1px solid rgba(248,113,113,0.2)', color:'var(--danger)' }}>
-            {actioning==='rejected' ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
-            Reject
-          </button>
-          <button onClick={() => handleAction('snoozed')} disabled={!!actioning}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
-                  style={{ background:'rgba(255,255,255,0.05)', border:'1px solid var(--border)', color:'var(--text-secondary)' }}>
-            {actioning==='snoozed' ? <Loader2 size={11} className="animate-spin" /> : <Clock size={11} />}
-            Snooze
-          </button>
+          {/* Admin-only queue actions */}
+          {isAdmin && (
+            <>
+              <button onClick={() => handleAction('approved')} disabled={!!actioning}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
+                      style={{ background:'rgba(0,212,170,0.12)', border:'1px solid rgba(0,212,170,0.25)', color:'var(--accent)' }}>
+                {actioning==='approved' ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+                Approve
+              </button>
+              <button onClick={() => handleAction('rejected')} disabled={!!actioning}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
+                      style={{ background:'rgba(248,113,113,0.1)', border:'1px solid rgba(248,113,113,0.2)', color:'var(--danger)' }}>
+                {actioning==='rejected' ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
+                Reject
+              </button>
+              <button onClick={() => handleAction('snoozed')} disabled={!!actioning}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40"
+                      style={{ background:'rgba(255,255,255,0.05)', border:'1px solid var(--border)', color:'var(--text-secondary)' }}>
+                {actioning==='snoozed' ? <Loader2 size={11} className="animate-spin" /> : <Clock size={11} />}
+                Snooze
+              </button>
+            </>
+          )}
 
-          {/* Auto-download controls */}
-          <div className="ml-auto flex gap-1.5 flex-wrap">
+          {/* Auto-download pin — available to all users for their own items */}
+          <div className={isAdmin ? 'ml-auto flex gap-1.5 flex-wrap' : 'flex gap-1.5 flex-wrap'}>
             {!isPinned && !isSkipped && (
               <button onClick={handlePin} disabled={pinning==='pin'}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all disabled:opacity-40"
@@ -213,7 +218,8 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
                 Unpin
               </button>
             )}
-            {isSkipped && (
+            {/* Admin-only: skip-auto / not-that-one */}
+            {isAdmin && isSkipped && (
               <button onClick={handlePin} disabled={pinning==='pin'}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all disabled:opacity-40"
                       style={{ background:'rgba(0,212,170,0.08)', border:'1px solid rgba(0,212,170,0.2)', color:'var(--accent)' }}>
@@ -221,7 +227,7 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
                 Re-include
               </button>
             )}
-            {!isPinned && !isSkipped && (
+            {isAdmin && !isPinned && !isSkipped && (
               <button onClick={handleSkipAuto} disabled={pinning==='skip'}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all disabled:opacity-40"
                       style={{ background:'rgba(255,255,255,0.04)', border:'1px solid var(--border)', color:'var(--text-muted)' }}>
@@ -273,6 +279,7 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab 
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function DiscoveryQueue() {
+  const { isAdmin, user } = useAuth()
   const [activeTab, setActiveTab]     = useState('pending')
   const [items, setItems]             = useState([])
   const [counts, setCounts]           = useState({})
@@ -292,14 +299,18 @@ export default function DiscoveryQueue() {
   const fetchItems = useCallback((tab) => {
     if (tab === 'auto_downloaded') return
     setLoading(true)
-    api.get(`/api/discovery?status=${tab}`)
+    // Non-admins always scope to their own user_id
+    const userParam = !isAdmin && user?.user_id ? `&user_id=${user.user_id}` : ''
+    api.get(`/api/discovery?status=${tab}${userParam}`)
       .then(setItems).catch(() => setItems([]))
       .finally(() => setLoading(false))
-  }, [])
+  }, [isAdmin, user])
 
   const fetchCounts = useCallback(() => {
-    api.get('/api/discovery/counts').then(setCounts).catch(() => {})
-  }, [])
+    // Non-admins get counts scoped to their own queue
+    const userParam = !isAdmin && user?.user_id ? `?user_id=${user.user_id}` : ''
+    api.get(`/api/discovery/counts${userParam}`).then(setCounts).catch(() => {})
+  }, [isAdmin, user])
 
   useEffect(() => {
     if (activeTab === 'auto_downloaded') fetchDlHistory()
@@ -347,14 +358,16 @@ export default function DiscoveryQueue() {
             Discovery Queue
           </h1>
           <p className="text-sm mt-1" style={{ color:'var(--text-secondary)' }}>
-            Album recommendations ranked by affinity and novelty
+            {isAdmin ? 'Album recommendations ranked by affinity and novelty' : 'Your personal album recommendations'}
           </p>
         </div>
-        <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
-          <button onClick={handlePopulate} disabled={populating} className="btn-primary">
-            {populating ? <><Loader2 size={14} className="animate-spin" />Generating…</> : <><Sparkles size={14} />Refresh Recs</>}
-          </button>
-        </div>
+        {isAdmin && (
+          <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
+            <button onClick={handlePopulate} disabled={populating} className="btn-primary">
+              {populating ? <><Loader2 size={14} className="animate-spin" />Generating…</> : <><Sparkles size={14} />Refresh Recs</>}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Progress / result */}
@@ -460,7 +473,7 @@ export default function DiscoveryQueue() {
       ) : (
         <div className="space-y-3 stagger">
           {items.map(item => (
-            <QueueCard key={item.id} item={item} activeTab={activeTab}
+            <QueueCard key={item.id} item={item} activeTab={activeTab} isAdmin={isAdmin}
                        onAction={handleAction} onSendToLidarr={handleSendToLidarr}
                        onDelete={handleDelete} onPin={handlePin} />
           ))}

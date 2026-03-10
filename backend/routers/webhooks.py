@@ -181,12 +181,12 @@ def _parse_body(body: dict) -> Optional[dict]:
 def _is_managed(user_id: str, db: Session) -> bool:
     normalised = _norm_id(user_id)
     result = db.query(ManagedUser).filter_by(
-        jellyfin_user_id=normalised, is_enabled=True
+        jellyfin_user_id=normalised, has_activated=True
     ).first()
     if not result:
-        all_enabled = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        all_activated = db.query(ManagedUser).filter_by(has_activated=True).all()
         result = next(
-            (u for u in all_enabled
+            (u for u in all_activated
              if _norm_id(u.jellyfin_user_id) == normalised),
             None,
         )
@@ -202,7 +202,7 @@ def _is_managed(user_id: str, db: Session) -> bool:
             None,
         )
         if exists:
-            log.warning(f"Webhook from known user '{exists.username}' but is_enabled=False — skipping")
+            log.warning(f"Webhook from known user '{exists.username}' but not yet activated — skipping")
         else:
             log.warning(
                 f"Webhook from UNKNOWN user_id='{user_id}'. "
@@ -722,7 +722,7 @@ def managed_users_diagnostic(db: Session = Depends(get_db)):
         result.append({
             "username":            u.username,
             "jellyfin_user_id":    uid,
-            "is_enabled":          u.is_enabled,
+            "has_activated":       u.has_activated,
             "db_total_events":     total_events,
             "db_skip_events":      skip_events,
             "db_ambiguous_events": ambiguous,

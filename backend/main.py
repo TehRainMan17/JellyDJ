@@ -118,8 +118,10 @@ def _run_migrations():
         ("automation_settings", "popularity_cache_refresh_interval_hours", "INTEGER",  "24"),
         ("automation_settings", "last_popularity_cache_refresh",           "DATETIME", "NULL"),
         # Auth Phase 1: Jellyfin login integration on managed_users
-        ("managed_users", "is_admin",      "BOOLEAN",  "0"),
-        ("managed_users", "last_login_at", "DATETIME", "NULL"),
+        ("managed_users", "is_admin",        "BOOLEAN",  "0"),
+        ("managed_users", "last_login_at",   "DATETIME", "NULL"),
+        # Activation model: user activates automatically on first playlist push
+        ("managed_users", "has_activated",   "BOOLEAN",  "0"),
         # Phase 3: playlist template system — new column on playlist_run_items
         ("playlist_run_items", "user_playlist_id", "INTEGER", "NULL"),
     ]
@@ -132,6 +134,18 @@ def _run_migrations():
                 conn.commit()
             except Exception:
                 pass  # column already exists — expected on every startup after the first
+
+    # Backfill: any user previously is_enabled=True (old manual-enable model)
+    # is considered activated under the new self-activation model.
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(
+                "UPDATE managed_users SET has_activated = 1 "
+                "WHERE is_enabled = 1 AND has_activated = 0"
+            ))
+            conn.commit()
+        except Exception:
+            pass
 
 
 def _fix_various_artists_enrichment():

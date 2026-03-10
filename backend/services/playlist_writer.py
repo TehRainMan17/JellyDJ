@@ -893,7 +893,7 @@ async def run_playlist_generation(
         return {"ok": False, "error": "Could not get Jellyfin admin user ID", "results": []}
 
     # Get users to process
-    q = db.query(ManagedUser).filter_by(is_enabled=True)
+    q = db.query(ManagedUser).filter_by(has_activated=True)
     if user_ids:
         q = q.filter(ManagedUser.jellyfin_user_id.in_(user_ids))
     users = q.all()

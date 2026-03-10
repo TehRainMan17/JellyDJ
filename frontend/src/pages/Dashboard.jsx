@@ -9,6 +9,7 @@ import { Link } from 'react-router-dom'
 import { useJobStatus } from '../hooks/useJobStatus.js'
 import JobProgress from '../components/JobProgress.jsx'
 import { api } from '../lib/api.js'
+import { useAuth } from '../contexts/AuthContext.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
@@ -633,6 +634,7 @@ export default function Dashboard() {
   const [schedulerStatus, setSched] = useState(null)
   const [activity, setActivity]     = useState([])
   const [indexing, setIndexing]     = useState(false)
+  const { isAdmin } = useAuth()
 
   const { indexStatus, cacheStatus, enrichStatus, discoverStatus, playlistStatus, downloadStatus, startPolling } = useJobStatus((finalState) => {
     setIndexing(false)
@@ -675,13 +677,15 @@ export default function Dashboard() {
             System overview and recent activity
           </p>
         </div>
-        <button onClick={handleIndex} disabled={isIndexRunning}
-                className="btn-primary">
-          {isIndexRunning
-            ? <><Loader2 size={14} className="animate-spin" />Indexing…</>
-            : <><RefreshCw size={14} />Index Now</>
-          }
-        </button>
+        {isAdmin && (
+          <button onClick={handleIndex} disabled={isIndexRunning}
+                  className="btn-primary">
+            {isIndexRunning
+              ? <><Loader2 size={14} className="animate-spin" />Indexing…</>
+              : <><RefreshCw size={14} />Index Now</>
+            }
+          </button>
+        )}
       </div>
 
       {/* Live progress */}

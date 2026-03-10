@@ -176,7 +176,7 @@ def get_users_for_generation(db: Session = Depends(get_db)):
     Return all enabled managed users with readiness status.
     New users (never indexed) appear with ready=False instead of being hidden.
     """
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     sync_map = {
         s.user_id: s
         for s in db.query(UserSyncStatus).all()

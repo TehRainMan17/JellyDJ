@@ -1,4 +1,3 @@
-
 """
 Discovery Queue router — Module 6
 
@@ -14,10 +13,11 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+from auth import UserContext, get_current_user, require_admin
 from database import get_db
 from models import DiscoveryQueueItem, ConnectionSettings, ManagedUser
 from services.events import log_event
@@ -525,13 +525,19 @@ def get_queue(
     status: str = Query(default="pending"),
     user_id: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
 ):
-    """Return discovery queue items, optionally filtered by status and user."""
+    """Return discovery queue items. Non-admins always see only their own items."""
     q = db.query(DiscoveryQueueItem)
     if status != "all":
         q = q.filter_by(status=status)
-    if user_id:
+
+    # Non-admins are scoped to their own user_id regardless of query param
+    if not current_user.is_admin:
+        q = q.filter_by(user_id=current_user.user_id)
+    elif user_id:
         q = q.filter_by(user_id=user_id)
+
     q = q.order_by(DiscoveryQueueItem.popularity_score.desc(), DiscoveryQueueItem.added_at.desc())
     items = q.all()
 
@@ -567,15 +573,22 @@ def get_queue(
 
 
 @router.get("/counts")
-def get_counts(db: Session = Depends(get_db)):
-    """Return item counts per status — used by the dashboard badge."""
+def get_counts(
+    user_id: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
+):
+    """Return item counts per status. Non-admins see only their own counts."""
     from sqlalchemy import func
-    rows = (
-        db.query(DiscoveryQueueItem.status, func.count(DiscoveryQueueItem.id))
-        .group_by(DiscoveryQueueItem.status)
-        .all()
-    )
-    counts = {status: count for status, count in rows}
+    q = db.query(DiscoveryQueueItem.status, func.count(DiscoveryQueueItem.id))
+
+    if not current_user.is_admin:
+        q = q.filter(DiscoveryQueueItem.user_id == current_user.user_id)
+    elif user_id:
+        q = q.filter(DiscoveryQueueItem.user_id == user_id)
+
+    rows = q.group_by(DiscoveryQueueItem.status).all()
+    counts = {s: count for s, count in rows}
     return {
         "pending": counts.get("pending", 0),
         "approved": counts.get("approved", 0),
@@ -595,7 +608,7 @@ async def populate_queue(
     immediately refresh the list. Limit is always read from AutomationSettings.
     """
     from models import AutomationSettings
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     if not users:
         raise HTTPException(400, "No enabled managed users found.")
 
@@ -647,8 +660,9 @@ def action_item(
     item_id: int,
     payload: ActionPayload,
     db: Session = Depends(get_db),
+    current_user: UserContext = Depends(require_admin),
 ):
-    """Approve, reject, or snooze a queue item."""
+    """Approve, reject, or snooze a queue item. Admin-only."""
     if payload.status not in ("approved", "rejected", "snoozed", "pending"):
         raise HTTPException(400, f"Invalid status '{payload.status}'")
 
@@ -665,8 +679,12 @@ def action_item(
 
 
 @router.post("/{item_id}/send-to-lidarr")
-async def send_to_lidarr(item_id: int, db: Session = Depends(get_db)):
-    """Send an approved item to Lidarr."""
+async def send_to_lidarr(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserContext = Depends(require_admin),
+):
+    """Send an approved item to Lidarr. Admin-only."""
     item = db.query(DiscoveryQueueItem).filter_by(id=item_id).first()
     if not item:
         raise HTTPException(404, "Item not found")
@@ -695,14 +713,21 @@ async def send_to_lidarr(item_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{item_id}/pin")
-def pin_item(item_id: int, db: Session = Depends(get_db)):
+def pin_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserContext = Depends(get_current_user),
+):
     """
     Mark an item as 'getting this next' for auto-download.
+    Users may only pin items that belong to them.
     Clears the pin from any other item for this user first (only one can be pinned).
     """
     item = db.query(DiscoveryQueueItem).filter_by(id=item_id).first()
     if not item:
         raise HTTPException(404, "Item not found")
+    if not current_user.is_admin and item.user_id != current_user.user_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only pin your own items")
     if item.lidarr_sent:
         raise HTTPException(400, "Item already sent to Lidarr")
 
@@ -718,10 +743,14 @@ def pin_item(item_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{item_id}/skip-auto")
-def skip_auto_item(item_id: int, db: Session = Depends(get_db)):
+def skip_auto_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserContext = Depends(require_admin),
+):
     """
     Mark 'not that one' — exclude this item from auto-download selection.
-    Does not reject the item from the queue; it stays visible for manual approval.
+    Admin-only. Does not reject the item from the queue; stays visible for manual approval.
     """
     item = db.query(DiscoveryQueueItem).filter_by(id=item_id).first()
     if not item:

@@ -58,6 +58,14 @@ function RequireAuth({ children }) {
   return children
 }
 
+// ── Admin-only route guard ────────────────────────────────────────────────────
+function RequireAdmin({ children }) {
+  const { isAdmin, loading } = useAuth()
+  if (loading) return null
+  if (!isAdmin) return <Navigate to="/dashboard" replace />
+  return children
+}
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -79,10 +87,10 @@ export default function App() {
           <Route path="dashboard"   element={<Dashboard />} />
           <Route path="playlists"   element={<Playlists />} />
           <Route path="discovery"   element={<DiscoveryQueue />} />
-          <Route path="settings"    element={<Settings />} />
-          <Route path="connections" element={<Connections />} />
           <Route path="insights"    element={<Insights />} />
-          <Route path="exclusions"  element={<AlbumExclusions />} />
+          <Route path="exclusions"  element={<RequireAdmin><AlbumExclusions /></RequireAdmin>} />
+          <Route path="connections" element={<RequireAdmin><Connections /></RequireAdmin>} />
+          <Route path="settings"    element={<RequireAdmin><Settings /></RequireAdmin>} />
         </Route>
       </Routes>
     </BrowserRouter>

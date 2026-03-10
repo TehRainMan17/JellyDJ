@@ -1,4 +1,3 @@
-
 """
 Jellyfin play history indexer.
 
@@ -521,7 +520,7 @@ async def run_full_index():
         _set_job(True, "Connecting", "Reaching Jellyfin server…", 2)
         db = SessionLocal()
         base_url, api_key = _get_jellyfin_creds(db)
-        users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        users = db.query(ManagedUser).filter_by(has_activated=True).all()
 
         if not users:
             log.info("No managed users enabled — skipping index.")

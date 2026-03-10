@@ -342,6 +342,15 @@ async def push_user_playlist(
     playlist.last_track_count = len(track_ids)
     playlist.updated_at = now
 
+    # Activate the user on their first successful push — this is the signal that
+    # they've set up JellyDJ and want to be indexed/tracked going forward.
+    managed = db.query(ManagedUser).filter_by(jellyfin_user_id=effective_user_id).first()
+    if managed and not managed.has_activated:
+        managed.has_activated = True
+        managed.is_enabled = True   # keep legacy column in sync
+        log.info("User %s (%s) activated via first playlist push", effective_user_id,
+                 managed.username if managed else effective_user_id)
+
     # Create a PlaylistRunItem record (run_id=0 for template-driven pushes — no PlaylistRun row)
     run_item = PlaylistRunItem(
         run_id=0,

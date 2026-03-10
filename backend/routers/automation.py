@@ -452,7 +452,7 @@ def auto_download_preview(db: Session = Depends(get_db)):
     from sqlalchemy import text as satext
 
     s = _get_or_create_settings(db)
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     result = []
 
     for user in users:
@@ -530,7 +530,7 @@ async def _run_discovery_refresh():
     try:
         from models import ManagedUser
         s = _get_or_create_settings(db)
-        users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        users = db.query(ManagedUser).filter_by(has_activated=True).all()
         if not users:
             _set_discovery_state(running=False, phase="No enabled users", detail="", users_done=0, users_total=0, items_added=0, error=None)
             return
@@ -665,7 +665,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
             log.info("Auto-download: running discovery refresh before picking candidates...")
             _set_download_state(phase="Refreshing discovery queue…", detail="Pre-run queue update")
             try:
-                users_for_refresh = db.query(ManagedUser).filter_by(is_enabled=True).all()
+                users_for_refresh = db.query(ManagedUser).filter_by(has_activated=True).all()
                 from routers.discovery import _populate_queue_for_user
                 for u in users_for_refresh:
                     try:
@@ -684,7 +684,7 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
         # Pass 2 — fill remaining slots up to max_per_run with best unpinned
         #   candidates, skipping users who already got something in pass 1.
         from sqlalchemy import text as satext
-        users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+        users = db.query(ManagedUser).filter_by(has_activated=True).all()
         total_sent = 0
         max_total  = s.auto_download_max_per_run
         users_sent_this_run: set = set()

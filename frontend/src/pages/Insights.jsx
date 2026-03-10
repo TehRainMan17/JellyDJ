@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api } from '../lib/api.js'
+import { useAuth } from '../contexts/AuthContext.jsx'
 import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
   ChevronUp, ChevronDown, ChevronsUpDown, Star, Loader2,
@@ -1448,14 +1449,19 @@ function HolidayTable() {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Insights() {
+  const { isAdmin, user } = useAuth()
   const [users, setUsers] = useState([])
   const [selectedUser, setSelectedUser] = useState(null)
   const [summary, setSummary] = useState(null)
   const [tab, setTab] = useState('tracks')
 
   useEffect(() => {
+    if (!isAdmin) {
+      // Non-admins only see their own data — no user-picker needed
+      if (user?.user_id) setSelectedUser(user.user_id)
+      return
+    }
     api.get('/api/insights/users')
-      
       .then(data => {
         setUsers(data)
         if (data.length > 0) setSelectedUser(data[0].jellyfin_user_id)
@@ -1478,7 +1484,7 @@ export default function Insights() {
           <p className="text-sm text-[var(--text-secondary)] mt-1">Audit what JellyDJ knows about your taste</p>
         </div>
 
-        {users.length > 1 && (
+        {isAdmin && users.length > 1 && (
           <div className="flex bg-[var(--bg-overlay)] rounded-lg border border-[var(--border)] overflow-hidden">
             {users.map(u => (
               <button key={u.jellyfin_user_id}

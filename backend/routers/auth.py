@@ -117,8 +117,9 @@ def _upsert_managed_user(
     """
     Auto-create or update the ManagedUser row for a Jellyfin user.
 
-    - New users are created with is_enabled=False (admin enables them separately).
-    - is_admin and last_login_at are always refreshed.
+    - Any Jellyfin user can log in; new rows are created with has_activated=False.
+    - Activation happens automatically when the user pushes their first playlist.
+    - is_admin and last_login_at are always refreshed on each login.
     """
     user = (
         db.query(ManagedUser)
@@ -130,7 +131,8 @@ def _upsert_managed_user(
         user = ManagedUser(
             jellyfin_user_id=jellyfin_user_id,
             username=username,
-            is_enabled=False,
+            is_enabled=False,       # legacy column — left False for new rows
+            has_activated=False,    # flipped to True on first playlist push
             is_admin=is_admin,
             last_login_at=now,
         )

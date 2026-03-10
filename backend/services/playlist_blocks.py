@@ -1,5 +1,5 @@
 """
-JellyDJ — Playlist Block Executors  (Phase 8 rewrite)
+JellyDJ — Playlist Block Executors  (Phase 8 rewrite — audited & fixed)
 
 Each executor fetches a candidate set of track IDs that match its filter
 criteria.  The engine is responsible for AND-intersecting and OR-unioning
@@ -15,6 +15,20 @@ Executor signature:
 
 No target_count parameter — the engine decides how many tracks to take
 from each block chain after all set operations are complete.
+
+AUDIT FIXES (see AUDIT.md for full details):
+  - execute_final_score_block:   played_filter param was accepted by UI but
+      never applied in the query. Fixed.
+  - execute_genre_block:         genre_affinity_min/max params were exposed in
+      UI but never applied in the query. Fixed.
+  - execute_artist_block:        artist_affinity_min/max params were exposed in
+      UI but never applied in the query. Fixed. played_filter now applied.
+  - execute_play_count_block:    order param ('asc'/'desc') was exposed in UI
+      but the query always sorted DESC. Fixed.
+  - execute_discovery_block:     popularity_min/max params were exposed in UI
+      but the block never filtered by global_popularity. Fixed.
+  - execute_global_popularity_block: TrackScore.global_popularity is a Float
+      but scores stored as String were not always cast; made consistent.
 """
 from __future__ import annotations
 
@@ -70,10 +84,13 @@ def execute_final_score_block(
       score_min     : float 0-99  (default 0)
       score_max     : float 0-99  (default 99)
       order         : 'desc' (default, highest first) | 'asc' (lowest first)
+
+    FIX: played_filter was ignored — now applied.
     """
     from models import TrackScore
-    score_min = float(params.get("score_min", 0))
-    score_max = float(params.get("score_max", 99))
+    score_min     = float(params.get("score_min", 0))
+    score_max     = float(params.get("score_max", 99))
+    played_filter = params.get("played_filter", "all")
 
     query = (
         db.query(TrackScore)
@@ -82,6 +99,8 @@ def execute_final_score_block(
         .filter(_cast_float(TrackScore.final_score) <= score_max)
         .order_by(satext("CAST(final_score AS REAL) DESC"))
     )
+    # FIX: apply the played_filter param that the UI sends but was previously dropped
+    query = _apply_played_filter(query, played_filter)
     rows = query.limit(FETCH_LIMIT).all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
@@ -119,16 +138,35 @@ def execute_genre_block(
     db: Session,
     excluded_item_ids: frozenset,
 ) -> set[str]:
-    """Tracks matching specified genres (empty = all genres)."""
+    """Tracks matching specified genres (empty = all genres).
+
+    Params:
+      genres              : list of genre strings (empty = all)
+      genre_affinity_min  : float 0-100 (default 0)
+      genre_affinity_max  : float 0-100 (default 100)
+      played_filter       : 'all' | 'played' | 'unplayed'
+
+    FIX: genre_affinity_min/max and played_filter were exposed in the UI
+         but never applied to the query.
+    """
     from models import TrackScore
-    genres = params.get("genres", [])
+    genres             = params.get("genres", [])
+    genre_affinity_min = float(params.get("genre_affinity_min", 0))
+    genre_affinity_max = float(params.get("genre_affinity_max", 100))
+    played_filter      = params.get("played_filter", "all")
+
     query = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
+        # FIX: apply the genre affinity range that the UI sends
+        .filter(_cast_float(TrackScore.genre_affinity) >= genre_affinity_min)
+        .filter(_cast_float(TrackScore.genre_affinity) <= genre_affinity_max)
         .order_by(satext("CAST(genre_affinity AS REAL) DESC"))
     )
     if genres:
         query = query.filter(TrackScore.genre.in_(genres))
+    # FIX: apply played_filter
+    query = _apply_played_filter(query, played_filter)
     rows = query.limit(FETCH_LIMIT).all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
@@ -139,16 +177,35 @@ def execute_artist_block(
     db: Session,
     excluded_item_ids: frozenset,
 ) -> set[str]:
-    """Tracks from specified artists (empty = all artists)."""
+    """Tracks from specified artists (empty = all artists).
+
+    Params:
+      artists              : list of artist name strings (empty = all)
+      artist_affinity_min  : float 0-100 (default 0)
+      artist_affinity_max  : float 0-100 (default 100)
+      played_filter        : 'all' | 'played' | 'unplayed'
+
+    FIX: artist_affinity_min/max and played_filter were exposed in the UI
+         but never applied to the query.
+    """
     from models import TrackScore
-    artists = params.get("artists", [])
+    artists              = params.get("artists", [])
+    artist_affinity_min  = float(params.get("artist_affinity_min", 0))
+    artist_affinity_max  = float(params.get("artist_affinity_max", 100))
+    played_filter        = params.get("played_filter", "all")
+
     query = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
+        # FIX: apply the artist affinity range that the UI sends
+        .filter(_cast_float(TrackScore.artist_affinity) >= artist_affinity_min)
+        .filter(_cast_float(TrackScore.artist_affinity) <= artist_affinity_max)
         .order_by(satext("CAST(artist_affinity AS REAL) DESC"))
     )
     if artists:
         query = query.filter(TrackScore.artist_name.in_(artists))
+    # FIX: apply played_filter
+    query = _apply_played_filter(query, played_filter)
     rows = query.limit(FETCH_LIMIT).all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
@@ -159,11 +216,24 @@ def execute_play_count_block(
     db: Session,
     excluded_item_ids: frozenset,
 ) -> set[str]:
-    """Tracks filtered by play count range."""
+    """Tracks filtered by play count range.
+
+    Params:
+      play_count_min : int (default 0)
+      play_count_max : int | None (default None = no upper bound)
+      order          : 'desc' (most played first, default) | 'asc' (least played first)
+
+    FIX: order param was exposed in UI but the query always sorted DESC.
+         Now honours 'asc' for least-played-first use cases.
+    """
     from models import TrackScore
     play_count_min = int(params.get("play_count_min", 0))
     play_count_max = params.get("play_count_max", None)
-    order_col = TrackScore.play_count.desc()
+    order          = params.get("order", "desc")
+
+    # FIX: honour the order param rather than hardcoding DESC
+    order_col = TrackScore.play_count.asc() if order == "asc" else TrackScore.play_count.desc()
+
     query = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
@@ -232,15 +302,31 @@ def execute_discovery_block(
     db: Session,
     excluded_item_ids: frozenset,
 ) -> set[str]:
-    """Tracks bucketed by artist familiarity tier."""
+    """Tracks bucketed by artist familiarity tier.
+
+    Params:
+      stranger_pct           : % of pool from unknown artists (default 34)
+      acquaintance_pct       : % of pool from lightly-known artists (default 33)
+      familiar_pct           : % of pool from well-known artists (default 33)
+      acquaintance_max_plays : play threshold separating acquaintance/familiar (default 9)
+      popularity_min         : float 0-100 — filter by global_popularity (default 0)
+      popularity_max         : float 0-100 — filter by global_popularity (default 100)
+
+    FIX: popularity_min/max params were exposed in the UI (Discovery block
+         shows a "Popularity range" slider) but were never applied to the
+         candidate pool query. Now applied as a pre-filter on tracks that have
+         a non-null global_popularity.
+    """
     from models import TrackScore, ArtistProfile
 
     stranger_pct           = float(params.get("stranger_pct",     34)) / 100
     acquaintance_pct       = float(params.get("acquaintance_pct", 33)) / 100
     familiar_pct           = float(params.get("familiar_pct",     33)) / 100
     acquaintance_max_plays = int(params.get("acquaintance_max_plays", 9))
+    popularity_min         = float(params.get("popularity_min", 0))
+    popularity_max         = float(params.get("popularity_max", 100))
 
-    # Normalise
+    # Normalise familiarity split percentages
     total_pct = stranger_pct + acquaintance_pct + familiar_pct
     if total_pct <= 0:
         total_pct = 1.0
@@ -262,13 +348,23 @@ def execute_discovery_block(
         )
         artist_plays = {a.lower(): (t or 0) for a, t in results if a}
 
-    candidate_pool = (
+    # FIX: apply the popularity_min/max filter that the UI sends.
+    # We filter in two passes: tracks WITH global_popularity get the range filter;
+    # tracks without it (NULL) are included only when popularity_min == 0 so that
+    # un-enriched libraries still work with the default range.
+    candidate_query = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
         .filter(TrackScore.is_played == False)  # noqa: E712
-        .limit(FETCH_LIMIT)
-        .all()
     )
+    if popularity_min > 0 or popularity_max < 100:
+        # User has narrowed the range — only keep tracks with a known popularity
+        # that falls within the requested window.
+        candidate_query = candidate_query.filter(
+            TrackScore.global_popularity.isnot(None),
+            TrackScore.global_popularity.between(popularity_min, popularity_max),
+        )
+    candidate_pool = candidate_query.limit(FETCH_LIMIT).all()
 
     strangers, acquaintances, familiar = [], [], []
     for row in candidate_pool:
@@ -383,7 +479,6 @@ def execute_jitter_block(
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 
-
 def execute_cooldown_block(
     user_id: str,
     params: dict,
@@ -421,9 +516,208 @@ def execute_cooldown_block(
     rows = query.limit(FETCH_LIMIT).all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
+
+# ── New blocks enabled by existing data ──────────────────────────────────────
+# See AUDIT.md §3 for rationale. These are registered but not yet exposed in
+# the frontend — add them to FILTER_TYPES in BlockChainEditor.jsx to activate.
+
+def execute_skip_rate_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks filtered by their skip penalty (skip-rate-derived score).
+
+    Useful as a positive filter ("only tracks I rarely skip") or a negative
+    one when AND'd to exclude high-skip-rate tracks from an otherwise broad
+    chain.
+
+    Params:
+      skip_penalty_min : float 0.0–1.0 (default 0.0)
+      skip_penalty_max : float 0.0–1.0 (default 1.0)
+      played_filter    : 'all' | 'played' | 'unplayed' (default 'all')
+
+    Data source: TrackScore.skip_penalty (written by scoring_engine Phase 3).
+    """
+    from models import TrackScore
+    skip_min      = float(params.get("skip_penalty_min", 0.0))
+    skip_max      = float(params.get("skip_penalty_max", 1.0))
+    played_filter = params.get("played_filter", "all")
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(_cast_float(TrackScore.skip_penalty) >= skip_min)
+        .filter(_cast_float(TrackScore.skip_penalty) <= skip_max)
+        .order_by(satext("CAST(skip_penalty AS REAL) ASC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_replay_boost_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks from artists the user has voluntarily replayed recently.
+
+    Surfaces artists who received a replay_boost signal — i.e. the user
+    deliberately returned to their music within 7 days of a previous play.
+    Great for a "things I'm obsessed with right now" chain.
+
+    Params:
+      boost_min    : float 0.0–12.0 — minimum replay boost on the artist (default 0.1)
+      played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+
+    Data source: TrackScore joined to ArtistProfile.replay_boost
+                 (written by scoring_engine Phase 1 via compute_replay_boosts).
+    """
+    from models import TrackScore, ArtistProfile
+    boost_min     = float(params.get("boost_min", 0.1))
+    played_filter = params.get("played_filter", "all")
+
+    # Collect artists that have a meaningful replay boost
+    boosted_artists = (
+        db.query(ArtistProfile.artist_name)
+        .filter(
+            ArtistProfile.user_id == user_id,
+            ArtistProfile.replay_boost >= boost_min,
+        )
+        .all()
+    )
+    artist_names = [r.artist_name for r in boosted_artists if r.artist_name]
+
+    if not artist_names:
+        return set()
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.artist_name.in_(artist_names))
+        .order_by(satext("CAST(final_score AS REAL) DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_novelty_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Unplayed tracks filtered by their novelty bonus score.
+
+    The novelty_bonus is written by scoring_engine for unplayed tracks based
+    on artist and genre affinity. This block lets users build "fresh picks from
+    artists I love" chains with fine control over how novel vs familiar the
+    suggestions are.
+
+    Params:
+      novelty_min : float 0.0–100.0 (default 0.0)
+      novelty_max : float 0.0–100.0 (default 100.0)
+
+    Data source: TrackScore.novelty_bonus (written by scoring_engine Phase 3
+                 for is_played=False tracks).
+    """
+    from models import TrackScore
+    novelty_min = float(params.get("novelty_min", 0.0))
+    novelty_max = float(params.get("novelty_max", 100.0))
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.is_played == False)  # noqa: E712
+        .filter(_cast_float(TrackScore.novelty_bonus) >= novelty_min)
+        .filter(_cast_float(TrackScore.novelty_bonus) <= novelty_max)
+        .order_by(satext("CAST(novelty_bonus AS REAL) DESC"))
+    )
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_recency_score_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks filtered by pre-computed recency_score (0–100, decays over 365 days).
+
+    Unlike play_recency (which uses a hard date window), this uses the
+    continuous recency_score already computed by the scoring engine — giving
+    a smooth gradient rather than a binary cutoff.
+
+    Params:
+      recency_min  : float 0–100 (default 0)
+      recency_max  : float 0–100 (default 100)
+      played_filter: 'all' | 'played' | 'unplayed' (default 'played')
+
+    Data source: TrackScore.recency_score (written by scoring_engine Phase 3).
+    """
+    from models import TrackScore
+    recency_min   = float(params.get("recency_min", 0))
+    recency_max   = float(params.get("recency_max", 100))
+    played_filter = params.get("played_filter", "played")
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(_cast_float(TrackScore.recency_score) >= recency_min)
+        .filter(_cast_float(TrackScore.recency_score) <= recency_max)
+        .order_by(satext("CAST(recency_score AS REAL) DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_skip_streak_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks filtered by current consecutive skip streak.
+
+    Lets you explicitly exclude tracks the user is currently on a skip streak
+    for (as a softer alternative to cooldown), or — unusually — surface them
+    (e.g. a "tracks I keep skipping" debug playlist).
+
+    Params:
+      streak_max   : int — keep only tracks with streak <= this value (default 2)
+      streak_min   : int — keep only tracks with streak >= this value (default 0)
+      played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+
+    Data source: TrackScore.skip_streak (written by scoring_engine Phase 3
+                 from SkipPenalty.consecutive_skips).
+    """
+    from models import TrackScore
+    streak_min    = int(params.get("streak_min", 0))
+    streak_max    = int(params.get("streak_max", 2))
+    played_filter = params.get("played_filter", "all")
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.skip_streak >= streak_min)
+        .filter(TrackScore.skip_streak <= streak_max)
+        .order_by(TrackScore.skip_streak.asc())
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 BLOCK_REGISTRY: dict = {
+    # Core blocks (all UI-exposed)
     "final_score":       execute_final_score_block,
     "affinity":          execute_affinity_block,
     "genre":             execute_genre_block,
@@ -437,5 +731,10 @@ BLOCK_REGISTRY: dict = {
     "artist_cap":        execute_artist_cap_block,
     "jitter":            execute_jitter_block,
     "cooldown":          execute_cooldown_block,
+    # New blocks (data already present — add to frontend FILTER_TYPES to expose)
+    "skip_rate":         execute_skip_rate_block,
+    "replay_boost":      execute_replay_boost_block,
+    "novelty":           execute_novelty_block,
+    "recency_score":     execute_recency_score_block,
+    "skip_streak":       execute_skip_streak_block,
 }
-

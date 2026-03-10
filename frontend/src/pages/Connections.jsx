@@ -3,7 +3,8 @@ import WebhookSetupPanel from '../components/WebhookSetupPanel.jsx'
 import { api } from '../lib/api.js'
 import {
   Plug, CheckCircle2, XCircle, Loader2, Eye, EyeOff,
-  RefreshCw, Users, ChevronDown, ChevronUp, Save,
+  RefreshCw, Users, ChevronDown, ChevronUp, Save, Trash2,
+  AlertCircle, ShieldCheck,
 } from 'lucide-react'
 
 // ── Shared sub-components ─────────────────────────────────────────────────────
@@ -82,22 +83,23 @@ function ActionButton({ onClick, disabled, loading, variant = 'primary', childre
   )
 }
 
-// ── Managed Users Panel ───────────────────────────────────────────────────────
+// ── Tracked Users Panel ───────────────────────────────────────────────────────
 
-function ManagedUsersPanel() {
+function TrackedUsersPanel() {
   const [users, setUsers] = useState([])
   const [loading, setLoading] = useState(true)
-  const [toggling, setToggling] = useState({})
+  const [deleting, setDeleting] = useState({})
+  const [confirmId, setConfirmId] = useState(null)
   const [error, setError] = useState('')
 
   const fetchUsers = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      const data = await api.get('/api/connections/jellyfin/users')
+      const data = await api.get('/api/connections/jellyfin/users/tracked')
       setUsers(data)
     } catch {
-      setError('Could not load users. Is Jellyfin connected?')
+      setError('Could not load tracked users.')
     } finally {
       setLoading(false)
     }
@@ -105,73 +107,112 @@ function ManagedUsersPanel() {
 
   useEffect(() => { fetchUsers() }, [fetchUsers])
 
-  const toggle = async (user) => {
-    setToggling(p => ({ ...p, [user.jellyfin_user_id]: true }))
+  const handleDelete = async (userId) => {
+    setDeleting(p => ({ ...p, [userId]: true }))
     try {
-      await api.post('/api/connections/jellyfin/users/toggle', {
-          jellyfin_user_id: user.jellyfin_user_id,
-          username: user.username,
-          is_enabled: !user.is_enabled,
-        })
-      setUsers(prev => prev.map(u =>
-        u.jellyfin_user_id === user.jellyfin_user_id
-          ? { ...u, is_enabled: !u.is_enabled }
-          : u
-      ))
+      await api.delete(`/api/connections/jellyfin/users/${userId}`)
+      setUsers(prev => prev.filter(u => u.jellyfin_user_id !== userId))
     } finally {
-      setToggling(p => ({ ...p, [user.jellyfin_user_id]: false }))
+      setDeleting(p => ({ ...p, [userId]: false }))
+      setConfirmId(null)
     }
   }
 
   if (loading)
     return (
       <div className="flex items-center gap-2 text-xs text-[var(--text-secondary)] mt-4">
-        <Loader2 size={13} className="animate-spin" /> Fetching users…
+        <Loader2 size={13} className="animate-spin" /> Loading tracked users…
       </div>
     )
 
   if (error)
     return <p className="text-xs text-[var(--danger)] mt-4">{error}</p>
 
-  if (users.length === 0)
-    return <p className="text-xs text-[var(--text-secondary)] mt-4">No users found in Jellyfin.</p>
-
   return (
     <div className="mt-4 space-y-1">
       <p className="text-xs text-[var(--text-secondary)] mb-3">
-        Toggle which users JellyDJ should track and generate playlists for.
+        Users below have activated JellyDJ by pushing their first playlist.
+        Deleting a user wipes all their JellyDJ data and pauses tracking until
+        they push another playlist.
       </p>
-      {users.map(user => (
-        <div
-          key={user.jellyfin_user_id}
-          className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-[var(--bg-overlay)] transition-colors"
-        >
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-full bg-[var(--bg-overlay)] border border-[var(--border)] flex items-center justify-center text-xs font-semibold text-[var(--text-secondary)]">
-              {user.username[0]?.toUpperCase()}
-            </div>
-            <span className="text-sm text-[var(--text-primary)]">{user.username}</span>
-          </div>
-          <button
-            onClick={() => toggle(user)}
-            disabled={!!toggling[user.jellyfin_user_id]}
-            className={`relative w-10 h-5 rounded-full transition-colors duration-200 flex-shrink-0
-              ${user.is_enabled ? 'bg-[var(--accent)]' : 'bg-[var(--border)]'}
-              disabled:opacity-50`}
-          >
-            <span
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200
-                ${user.is_enabled ? 'translate-x-5' : 'translate-x-0.5'}`}
-            />
-          </button>
+
+      {users.length === 0 ? (
+        <div className="flex items-center gap-2 text-xs text-[var(--text-secondary)] py-2">
+          <AlertCircle size={13} className="text-[var(--text-secondary)]" />
+          No users have activated JellyDJ yet. Users activate automatically
+          when they create and push their first playlist.
         </div>
-      ))}
+      ) : (
+        users.map(user => (
+          <div
+            key={user.jellyfin_user_id}
+            className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-[var(--bg-overlay)] transition-colors"
+          >
+            <div className="flex items-center gap-2.5">
+              <div className="w-7 h-7 rounded-full bg-[var(--bg-overlay)] border border-[var(--border)] flex items-center justify-center text-xs font-semibold text-[var(--text-secondary)]">
+                {user.username[0]?.toUpperCase()}
+              </div>
+              <div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm text-[var(--text-primary)]">{user.username}</span>
+                  {user.is_admin && (
+                    <span className="flex items-center gap-0.5 text-[10px] text-[var(--accent)] font-semibold">
+                      <ShieldCheck size={10} /> Admin
+                    </span>
+                  )}
+                </div>
+                {user.last_login_at && (
+                  <div className="text-[10px] text-[var(--text-secondary)]">
+                    Last login: {new Date(user.last_login_at).toLocaleDateString()}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Delete / Confirm */}
+            {confirmId === user.jellyfin_user_id ? (
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-[var(--danger)]">Delete all data?</span>
+                <button
+                  onClick={() => handleDelete(user.jellyfin_user_id)}
+                  disabled={!!deleting[user.jellyfin_user_id]}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold
+                             bg-[var(--danger)]/10 border border-[var(--danger)]/25
+                             text-[var(--danger)] hover:bg-[var(--danger)]/20 transition-colors disabled:opacity-40"
+                >
+                  {deleting[user.jellyfin_user_id] ? <Loader2 size={10} className="animate-spin" /> : null}
+                  Confirm
+                </button>
+                <button
+                  onClick={() => setConfirmId(null)}
+                  className="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmId(user.jellyfin_user_id)}
+                title="Delete all JellyDJ data for this user"
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium
+                           text-[var(--text-secondary)] hover:text-[var(--danger)]
+                           hover:bg-[var(--danger)]/8 border border-transparent
+                           hover:border-[var(--danger)]/20 transition-all"
+              >
+                <Trash2 size={12} />
+                Delete data
+              </button>
+            )}
+          </div>
+        ))
+      )}
+
       <div className="pt-2">
         <button
           onClick={fetchUsers}
           className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
         >
-          <RefreshCw size={11} /> Refresh users
+          <RefreshCw size={11} /> Refresh
         </button>
       </div>
     </div>
@@ -318,12 +359,12 @@ function JellyfinCard() {
             className="flex items-center gap-2 text-sm font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors w-full"
           >
             <Users size={14} />
-            Managed Users
+            JellyDJ Users
             {showUsers
               ? <ChevronUp size={13} className="ml-auto" />
               : <ChevronDown size={13} className="ml-auto" />}
           </button>
-          {showUsers && <ManagedUsersPanel />}
+          {showUsers && <TrackedUsersPanel />}
         </div>
       )}
     </div>

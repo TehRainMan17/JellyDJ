@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -79,7 +78,7 @@ def get_status(db: Session = Depends(get_db)):
         for r in db.query(UserSyncStatus).all()
     }
     # All enabled managed users — source of truth
-    users = db.query(ManagedUser).filter_by(is_enabled=True).all()
+    users = db.query(ManagedUser).filter_by(has_activated=True).all()
     result = []
     for u in users:
         s = sync_map.get(u.jellyfin_user_id)
