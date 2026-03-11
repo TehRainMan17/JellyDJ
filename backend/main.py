@@ -296,7 +296,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="JellyDJ",
-    version="0.1.0",
+    version="1.0.0",
     description="Self-hosted music recommendation engine for Jellyfin",
     lifespan=lifespan,
 )
@@ -336,7 +336,7 @@ async def health_check():
     Returns 200 as soon as the app is running — no DB or external calls.
     The frontend container waits for this to pass before starting.
     """
-    return {"status": "ok", "service": "JellyDJ", "version": "0.1.0"}
+    return {"status": "ok", "service": "JellyDJ", "version": "1.0.0"}
 
 
 def _backfill_top_album_cache():

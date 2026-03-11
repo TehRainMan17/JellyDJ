@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/release-v1.0.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.0.0" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/stargazers"><img src="https://img.shields.io/github/stars/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=5be6f5&labelColor=090b22&logoColor=5be6f5" alt="Stars" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/network/members"><img src="https://img.shields.io/github/forks/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=a28ffb&labelColor=090b22&logoColor=a28ffb" alt="Forks" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/issues"><img src="https://img.shields.io/github/issues/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=f87171&labelColor=090b22&logoColor=f87171" alt="Issues" /></a>
@@ -13,7 +14,7 @@
 
 <p align="center">
   <strong>A self-hosted music recommendation engine that turns your static Jellyfin library into a living, breathing music ecosystem.</strong><br/>
-  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Lidarr integration
+  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Lidarr integration
 </p>
 
 <br/>
@@ -124,7 +125,7 @@ But my girls missed something real: **the magic of discovery**. That moment when
 
 So I built JellyDJ to fill that void — with some help from AI along the way.
 
-It watches what everyone in the house listens to, builds taste profiles per person, and quietly surfaces new artists and albums they're likely to love — sending approved ones straight to Lidarr for download. My kids wake up and there's new music in their library that they didn't have to search for. My wife's playlists update themselves. Nobody has to touch a thing.
+It watches what everyone in the house listens to, builds taste profiles per person, and quietly surfaces new artists and albums they're likely to love — sending approved ones straight to Lidarr for download. My kid wakes up and there's new music in her library that she didn't have to search for. My wife's playlists update themselves. Nobody has to touch a thing.
 
 **JellyDJ is what Jellyfin's music experience should have been all along.**
 
@@ -146,6 +147,7 @@ This is early days on this project and, as such, large portions are unfinished, 
 |---|---|---|
 | 🧠 | **Per-User Taste Profiles** | Affinity scores built from play counts, recency, skips, favorites, and replay signals — per person |
 | 📋 | **Smart Playlists** | *For You*, *New For You*, *Most Played*, *Recently Played* — auto-generated directly in Jellyfin |
+| 🎛️ | **Playlist Customization** | Full block-based playlist editor — mix and chain scoring signals with fine-grained controls |
 | 🔭 | **Discovery Queue** | New artist and album recommendations ranked by affinity + novelty, ready to approve or reject |
 | 📥 | **Auto-Download** | Approved discoveries go straight to Lidarr — your library grows while you sleep |
 | 🔥 | **Billboard Hot 100** | Weekly chart data cross-referenced with your library so you never miss a trending track |
@@ -172,12 +174,57 @@ This is early days on this project and, as such, large portions are unfinished, 
   <img src=".github/images/shot-discovery-insights.png" alt="Discovery Queue and Insights" width="100%" />
 </p>
 
+### Playlist Customization
+*Build any playlist you can imagine — chain scoring blocks with AND/OR logic, tune sliders, and let it rip*
+
+<p align="center">
+  <img src=".github/images/screenshot-playlists.PNG" alt="Playlist Customization" width="100%" />
+</p>
+
 ### Automation Settings
 *Control every scheduler interval, enable auto-download, and tune enrichment — all from the UI*
 
 <p align="center">
   <img src=".github/images/shot-settings.png" alt="Settings" width="50%" />
 </p>
+
+---
+
+## 🎛️ Playlist Customization
+
+JellyDJ's playlist editor lets you build entirely custom playlists using a block-based scoring system. Every playlist is a chain of **filter blocks** connected by AND/OR logic — combine as many signals as you want and the engine handles the rest.
+
+### How It Works
+
+Each playlist is built from one or more **OR groups**, each containing one or more **AND filter blocks**. A track must satisfy all AND conditions within at least one OR group to be included.
+
+### Available Filter Blocks
+
+| Block | What It Does |
+|---|---|
+| **Final Score** | Filter by your personal blended score for every track (0–99). Use a high minimum (e.g. 81–99) to get only your most loved songs. |
+| **Replay Boost** | Surface tracks you've been deliberately seeking out. Set a low minimum (e.g. 0.1) for any replay signal, or a high maximum (e.g. 2.0) to exclude current obsessions. |
+| **Jitter** | Randomize track ordering so every playlist generation feels different. 15% = gentle shuffle; higher values = more chaos. |
+
+### Replay Boost Explained
+
+Replay boost is calculated from deliberate artist volume within 7 days — passive listening doesn't count. This makes it a strong signal for "I keep going back to this" vs. "this came up on shuffle."
+
+- **Low min (e.g. 0.1):** surface mildly-replayed artists
+- **High max (e.g. 2.0):** exclude your current obsessions to keep playlists varied
+- Requires skip/replay training to have run at least once
+
+### Block Chaining
+
+Blocks can be chained with **AND** (track must match all) or **OR** (track matches any group). This lets you build sophisticated playlists like:
+
+> *(High Final Score AND Low Replay Boost)* **OR** *(High Replay Boost AND Jitter)*
+
+Which would translate to: "Give me songs I love that I haven't been hammering lately, OR my current obsessions in a random order."
+
+### Playlist Templates
+
+Pre-built playlist templates are available for common use cases (*For You*, *New For You*, *Most Played*, *Recently Played*, *I Remember That Song*). You can use these as-is or clone and customize them as a starting point.
 
 ---
 

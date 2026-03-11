@@ -110,7 +110,7 @@ function SidebarContent({ onClose }) {
         {/* Version */}
         <div className="flex items-center gap-2 px-3 pt-1">
           <div className="w-2 h-2 rounded-full anim-glow" style={{ background: 'var(--accent)' }} />
-          <span style={{ fontSize:11, color:'var(--text-muted)', fontFamily:'JetBrains Mono,monospace' }}>v0.1.0</span>
+          <span style={{ fontSize:11, color:'var(--text-muted)', fontFamily:'JetBrains Mono,monospace' }}>v1.0.0</span>
         </div>
       </div>
     </div>
