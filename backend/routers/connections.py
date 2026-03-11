@@ -1,3 +1,4 @@
+
 """
 JellyDJ Connections router
 
@@ -59,13 +60,6 @@ class ConnectionResponse(BaseModel):
     is_connected: bool
     last_tested: Optional[datetime]
     has_api_key: bool
-
-
-class ManagedUserToggle(BaseModel):
-    """Kept for API backward-compat only — no longer used by the UI."""
-    jellyfin_user_id: str
-    is_enabled: bool
-    username: str = ""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -232,22 +226,6 @@ def delete_user_data(jellyfin_user_id: str, db: Session = Depends(get_db)):
         "Admin wiped data for user %s: %s", uid, deleted
     )
     return {"ok": True, "deleted": deleted}
-
-
-# ── Legacy toggle — kept so any existing integrations don't 500 ───────────────
-
-@router.post("/jellyfin/users/toggle")
-async def toggle_managed_user(payload: ManagedUserToggle, db: Session = Depends(get_db)):
-    """Deprecated. Kept for backward-compat only. Has no effect on activation."""
-    return {"ok": True, "deprecated": True}
-
-
-# ── Legacy list — kept so any existing integrations don't 500 ────────────────
-
-@router.get("/jellyfin/users")
-async def get_jellyfin_users(db: Session = Depends(get_db)):
-    """Deprecated list endpoint — returns tracked users only."""
-    return await get_tracked_users.__wrapped__(db) if hasattr(get_tracked_users, '__wrapped__') else get_tracked_users(db)
 
 
 @router.post("/jellyfin/users/sync")

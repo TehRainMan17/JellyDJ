@@ -1,3 +1,4 @@
+
 /**
  * api.js — Centralized fetch wrapper for JellyDJ.
  *
@@ -7,7 +8,7 @@
  *
  * Usage:
  *   import { api } from '../lib/api.js'
- *   const data = await api.get('/api/playlists/current')
+ *   const data = await api.get('/api/user-playlists')
  *   const data = await api.post('/api/auth/login', { username, password })
  */
 

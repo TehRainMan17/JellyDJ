@@ -1094,83 +1094,6 @@ def compute_replay_boosts(db: Session, user_id: str) -> dict[str, float]:
     return boosts
 
 
-# ── Archival / housekeeping ───────────────────────────────────────────────────
-
-def archive_old_play_events(db: Session) -> int:
-    """
-    Roll up PlaybackEvent rows older than 90 days into PlayEventSummary.
-    Returns number of events archived.
-    """
-    from models import PlaybackEvent, PlayEventSummary
-    from sqlalchemy import func
-
-    cutoff = datetime.utcnow() - timedelta(days=90)
-
-    old_events = (
-        db.query(PlaybackEvent)
-        .filter(PlaybackEvent.received_at < cutoff)
-        .all()
-    )
-
-    if not old_events:
-        return 0
-
-    # Group by user + item + month
-    buckets: dict[tuple, dict] = {}
-    for ev in old_events:
-        month_key = ev.received_at.strftime("%Y-%m")
-        key = (ev.user_id, ev.jellyfin_item_id, month_key)
-        if key not in buckets:
-            buckets[key] = {
-                "artist_name": ev.artist_name,
-                "total_plays": 0,
-                "total_skips": 0,
-                "manual_plays": 0,
-                "playlist_plays": 0,
-            }
-        b = buckets[key]
-        b["total_plays"] += 1
-        if ev.was_skip:
-            b["total_skips"] += 1
-        ctx = ev.source_context or ""
-        if "jellydj" in ctx:
-            b["playlist_plays"] += 1
-        else:
-            b["manual_plays"] += 1
-
-    # Upsert summaries
-    for (uid, jid, month), data in buckets.items():
-        existing = db.query(PlayEventSummary).filter_by(
-            user_id=uid, jellyfin_item_id=jid, month=month
-        ).first()
-        if existing:
-            existing.total_plays += data["total_plays"]
-            existing.total_skips += data["total_skips"]
-            existing.manual_plays += data["manual_plays"]
-            existing.playlist_plays += data["playlist_plays"]
-            existing.updated_at = datetime.utcnow()
-        else:
-            db.add(PlayEventSummary(
-                user_id=uid,
-                jellyfin_item_id=jid,
-                artist_name=data["artist_name"],
-                month=month,
-                total_plays=data["total_plays"],
-                total_skips=data["total_skips"],
-                manual_plays=data["manual_plays"],
-                playlist_plays=data["playlist_plays"],
-            ))
-
-    # Delete the archived events
-    archived = len(old_events)
-    for ev in old_events:
-        db.delete(ev)
-
-    db.commit()
-    log.info(f"Archival: archived {archived} play events into {len(buckets)} summary buckets")
-    return archived
-
-
 # ── Top-level enrichment job ──────────────────────────────────────────────────
 
 def run_enrichment(db: Session, force: bool = False) -> dict:
@@ -1230,31 +1153,4 @@ def run_enrichment(db: Session, force: bool = False) -> dict:
     }
 
 
-def run_enrichment_legacy(db: Session, force: bool = False) -> dict:
-    """
-    Full enrichment pass: tracks + artists + archival.
-    Called by the scheduler every 48 hours (configurable).
-    """
-    log.info("=== Enrichment job starting ===")
 
-    track_result = enrich_tracks(db, force=force)
-    time.sleep(1.0)
-    artist_result = enrich_artists(db, force=force)
-    archived = archive_old_play_events(db)
-
-    # Update AutomationSettings.last_enrichment
-    try:
-        from models import AutomationSettings
-        s = db.query(AutomationSettings).first()
-        if s:
-            s.last_enrichment = datetime.utcnow()
-            db.commit()
-    except Exception:
-        pass
-
-    log.info("=== Enrichment job complete ===")
-    return {
-        "tracks": track_result,
-        "artists": artist_result,
-        "events_archived": archived,
-    }
