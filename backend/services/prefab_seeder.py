@@ -13,38 +13,45 @@ Responsibilities
                                  • Never changes template.id (UserPlaylist.template_id
                                    foreign keys remain valid)
                                  • Never touches user-created or user-forked templates
-                                 • Idempotent: guarded by a sentinel in
-                                   the template description — runs exactly once
+                                 • Idempotent: guarded by block-type sentinel check —
+                                   runs exactly once per design revision
 
 Both are called from main.py lifespan on every boot; they no-op instantly
 after the first successful run.
 
-v6 change — "New For You" template overhaul:
-  The old template used a single discovery block that AND-intersected with
-  global_popularity >= 50.  This meant:
-    • Tracks with NULL global_popularity (un-enriched library items, including
-      newly downloaded albums) were excluded entirely.
-    • Niche-but-loved artists (Simon & Garfunkel deep cuts, White Stripes B-sides)
-      often score below 50 on global charts and were therefore never surfaced.
+v7 change — "New For You" philosophy inversion:
+  Previous designs (v5, v6) both had a large block that pulled from
+  high-affinity artists (artists you already listen to a lot).  The result
+  was a playlist dominated by deep cuts from your heavy-rotation artists —
+  exactly the opposite of what "New For You" should do.
 
-  New design has three blocks:
+  The correct intent is:
+    - Prioritise globally popular unheard tracks from artists you don't
+      already know well (strangers + acquaintances ranked by global_popularity).
+    - Allow a familiar artist's song in only if it is overwhelmingly globally
+      popular (popularity >= 80) — i.e. you'd be embarrassed not to know it.
+    - Keep a small buffer of high-score played tracks as anchors so the
+      playlist isn't 100% unfamiliar.
 
-    Block 0 — "Loved Artist New Arrivals" (weight 40)
-      Uses the novelty block (affinity-driven unplayed scoring, v6) AND-intersected
-      with a high artist-affinity filter.  No popularity floor — these are tracks
-      you haven't heard from artists you already love.  This is the primary channel
-      for newly added albums from favourite artists.
+  New three-block design:
 
-    Block 1 — "Discovery" (weight 40)
-      Retains the existing discovery block but lowers the popularity floor to 25
-      (was 50) and adds NULL-safe handling by removing the hard global_popularity
-      AND-child entirely in favour of a soft preference via the novelty block.
-      The artist_cap is reduced to 1 to maximise diversity.
+    Block 0 — "Popular Strangers & Acquaintances" (weight 60)
+      Unplayed tracks from artists you have NOT listened to much
+      (stranger + acquaintance tiers only, familiar_pct = 0), hard-filtered
+      to global_popularity >= 60.  This surfaces the best new-to-you music
+      with a real quality signal behind it.
 
-    Block 2 — "Familiar Anchors" (weight 20)
-      A small slice of high-scoring played tracks to keep the playlist listenable
-      and prevent it from being 100% cold-start unfamiliar music.  Unchanged from
-      the old 30% familiar block, just reduced in weight.
+    Block 1 — "Mega-Hits from Familiar Artists" (weight 25)
+      Unplayed tracks from artists you DO know well, but only those with
+      global_popularity >= 80.  The high floor is intentional — if you
+      listen to Imagine Dragons constantly and there's a song you haven't
+      heard, it should only surface here if it's genuinely one of their
+      biggest tracks, not a B-side.
+
+    Block 2 — "Familiar Anchors" (weight 15)
+      A small slice of recently played, high-scoring tracks.  Keeps the
+      playlist listenable and prevents cold-start overwhelm.  This is the
+      only place where your heavy-rotation artists appear without restriction.
 """
 
 from __future__ import annotations
@@ -104,80 +111,79 @@ def _blocks_for_you() -> list[dict]:
              ])),
     ]
 
+
 def _blocks_new_for_you() -> list[dict]:
     """
-    Three-block design for maximum new-music diversity:
+    Popularity-first discovery: best globally popular unheard tracks,
+    familiar artists only when overwhelmingly popular.
 
-      40% — Loved Artist New Arrivals
-        Unplayed tracks from high-affinity artists, ranked by novelty_bonus
-        (which v6 now scales with artist_affinity).  No popularity floor so
-        newly added albums from niche-but-loved artists always qualify.
+      60% — Popular Strangers & Acquaintances
+        Unplayed tracks from artists you don't know well yet, filtered to
+        global_popularity >= 60.  Uses the discovery block with familiar_pct=0
+        so your heavy-rotation artists are completely excluded from this slot.
+        Ranked by popularity (jitter keeps it from being identical every run).
 
-      40% — Broad Discovery
-        Unplayed tracks across all artist familiarity tiers.  Popularity floor
-        lowered to 25 (was 50) so less mainstream but chart-adjacent music is
-        included.  NULL-popularity tracks (un-enriched) are allowed through
-        by the novelty block's unplayed filter rather than the old hard
-        global_popularity AND-child.
+      25% — Mega-Hits from Familiar Artists
+        Unplayed tracks from well-known artists (artists you play often), but
+        only those scoring >= 80 global popularity.  This is the "you love
+        Imagine Dragons but somehow missed this massive song" slot.  The high
+        floor prevents deep cuts from heavy-rotation artists leaking in.
 
-      20% — Familiar Anchors
-        A small slice of recent high-scoring played tracks so the playlist
-        stays listenable and isn't 100% cold-start unfamiliar music.
+      15% — Familiar Anchors
+        Small slice of recently played high-scoring tracks so the playlist
+        stays listenable.
     """
     return [
-        # Block 0: Loved Artist New Arrivals — primary channel for new albums
-        dict(block_type="novelty", weight=40, position=0,
-             params=_tree([
-                 # novelty block returns unplayed tracks ranked by novelty_bonus.
-                 # v6: novelty_bonus scales with artist_affinity (0–17 pts) so
-                 # tracks from loved artists naturally sort to the top.
-                 _node("novelty", {"novelty_min": 0.0, "novelty_max": 100.0}, children=[
-                     # Only tracks from artists the user has demonstrated affinity for.
-                     # affinity_min=50 is intentionally permissive — captures artists
-                     # the user likes but hasn't played to exhaustion.
-                     _node("artist", {"artist_affinity_min": 50, "artist_affinity_max": 100,
-                                      "played_filter": "unplayed"}),
-                     _cooldown(),
-                     # Cap at 2 per artist so a big new album doesn't dominate the whole block.
-                     _artist_cap(2),
-                     _jitter(0.15),
-                 ]),
-             ])),
-
-        # Block 1: Broad Discovery — surfaces music from across the affinity spectrum
-        dict(block_type="discovery", weight=40, position=1,
+        # Block 0: Popular strangers & acquaintances — the main discovery engine
+        dict(block_type="discovery", weight=60, position=0,
              params=_tree([
                  _node("discovery", {
-                     # Rebalance tiers: more weight on acquaintances (artists you've heard
-                     # a little of) and less on strangers vs the old 50/35/15 split.
-                     # This means "artists you've sampled but not dug into" get more airtime.
-                     "familiar_pct": 30,
-                     "acquaintance_pct": 45,
-                     "stranger_pct": 25,
+                     # familiar_pct = 0: completely exclude artists you listen to a lot.
+                     # All slots go to strangers and acquaintances.
+                     "familiar_pct": 0,
+                     "acquaintance_pct": 55,
+                     "stranger_pct": 45,
                  }, children=[
-                     # Lowered floor from 50 → 25.  This lets in less-mainstream music
-                     # from artists like Simon & Garfunkel or White Stripes deep cuts.
-                     # Tracks with NULL global_popularity (un-enriched) are still allowed
-                     # through because popularity_min=0 keeps the NULL-inclusive path active
-                     # in execute_discovery_block (see playlist_blocks.py FIX comment).
-                     _node("global_popularity", {"popularity_min": 25, "popularity_max": 100}),
+                     # Hard floor of 60 so only genuinely popular tracks surface.
+                     # The discovery block's NULL-safe path keeps un-enriched tracks
+                     # out when a floor > 0 is set — intentional; we want a real
+                     # quality signal here, not a random un-scored track.
+                     _node("global_popularity", {"popularity_min": 60, "popularity_max": 100}),
+                     # 1 per artist max — maximise breadth of new artists heard.
                      _artist_cap(1),
-                     _jitter(0.20),
+                     _jitter(0.18),
                  ]),
              ])),
 
-        # Block 2: Familiar Anchors — keeps the playlist listenable
-        dict(block_type="final_score", weight=20, position=2,
+        # Block 1: Mega-hits from familiar artists — high bar, tight filter
+        dict(block_type="global_popularity", weight=25, position=1,
+             params=_tree([
+                 _node("global_popularity", {"popularity_min": 80, "popularity_max": 100,
+                                             "played_filter": "unplayed"}, children=[
+                     # affinity_min=70 targets artists you genuinely listen to a lot.
+                     # Combined with popularity >= 80 this is a very tight filter:
+                     # only the biggest songs from your most-played artists.
+                     _node("affinity", {"affinity_min": 70, "affinity_max": 100,
+                                        "played_filter": "unplayed"}),
+                     _cooldown(),
+                     # 1 per artist so one beloved artist can't dominate.
+                     _artist_cap(1),
+                     _jitter(0.10),
+                 ]),
+             ])),
+
+        # Block 2: Familiar anchors — keeps the playlist listenable
+        dict(block_type="final_score", weight=15, position=2,
              params=_tree([
                  _node("final_score", {"score_min": 70, "score_max": 99}, children=[
-                     _node("affinity", {"affinity_min": 55, "affinity_max": 100, "played_filter": "all"}),
-                     _node("played_status", {"played_filter": "played"}),
+                     _node("play_recency", {"mode": "within", "days": 60}),
                      _cooldown(),
                      _artist_cap(2),
                      _jitter(0.12),
                  ]),
              ])),
     ]
+
 
 def _blocks_most_played() -> list[dict]:
     """All-time most-played, cooldown-filtered."""
@@ -191,6 +197,7 @@ def _blocks_most_played() -> list[dict]:
                  ]),
              ])),
     ]
+
 
 def _blocks_recently_played() -> list[dict]:
     """Played in last 30 days, cooldown-filtered."""
@@ -218,7 +225,7 @@ _PREFABS = [
     ),
     (
         dict(name="New For You",
-             description="New music you're likely to love: unheard tracks from your favourite artists, broader discovery picks, and a few familiar anchors.",
+             description="Globally popular tracks from artists you don't know yet, plus the biggest hits from artists you love that you've somehow missed.",
              owner_user_id=None, is_public=True, is_system=True,
              total_tracks=50, blend_mode="weighted_shuffle"),
         _blocks_new_for_you(),
@@ -281,29 +288,18 @@ def seed_prefabs(db) -> None:
 
 def migrate_system_templates(db) -> None:
     """
-    In-place migration of existing system playlist templates to the new
-    filter_tree block format.
+    In-place migration of existing system playlist templates.
 
     Safety guarantees
     ─────────────────
     - Touches ONLY rows where is_system = True.
     - Never changes template.id — UserPlaylist.template_id foreign keys
       remain valid; no user playlists are affected.
-    - Never touches user-created templates (is_system=False), including
-      any user forks of system templates.
-    - Idempotent: templates whose blocks already use the filter_tree schema
-      are skipped, so this is safe to call on every boot.
-    - Per-template transactions: a failure on one template is rolled back
-      and logged; the others still complete.
-
-    v6 note: "New For You" now uses a novelty block (block_type="novelty")
-    as its primary block.  The migration detects the old design by checking
-    if any block uses block_type="discovery" with weight >= 60 — that was
-    the signature of the old single-block 70% discovery design.  If found,
-    the template is rewritten with the new three-block design.
-
-    All other system templates are still detected by the existing
-    filter_tree sentinel check and skipped if already migrated.
+    - Never touches user-created templates (is_system=False).
+    - Idempotent: "New For You" migration is detected by checking whether
+      any block uses block_type="global_popularity" at position=1 (the v7
+      mega-hits slot).  If already present, the template is skipped.
+    - Per-template transactions: failure on one rolls back; others complete.
     """
     from models import PlaylistTemplate, PlaylistBlock
 
@@ -335,44 +331,48 @@ def migrate_system_templates(db) -> None:
             PlaylistBlock.template_id == template.id
         ).all()
 
-        # Check if this is the old "New For You" that needs upgrading:
-        # Old design: one discovery block at weight=70, one final_score at weight=30,
-        # with global_popularity >= 50 hard-filter.
-        # New design: novelty block at weight=40 is the primary block.
-        needs_nfy_upgrade = False
+        # v7 sentinel: the new "New For You" design is identified by having a
+        # global_popularity block at position 1.  Any prior design used
+        # discovery (v5 original), novelty (v6), or final_score at position 1.
         if name == "New For You":
-            has_novelty_block = any(b.block_type == "novelty" for b in existing_blocks)
-            if not has_novelty_block:
-                needs_nfy_upgrade = True
-                log.info(
-                    "migrate_system_templates: '%s' (id=%d) — old discovery-only design "
-                    "detected, upgrading to v6 three-block design.",
-                    name, template.id,
+            has_v7_design = any(
+                b.block_type == "global_popularity" and b.position == 1
+                for b in existing_blocks
+            )
+            if has_v7_design:
+                log.debug(
+                    "migrate_system_templates: '%s' already on v7 design — skipping.", name
                 )
-
-        # For non-NFY templates: skip if already on filter_tree schema
-        if not needs_nfy_upgrade:
+                skipped += 1
+                continue
+            log.info(
+                "migrate_system_templates: '%s' (id=%d) — upgrading to v7 "
+                "popularity-first design.", name, template.id,
+            )
+        else:
             already_migrated = any(
-                "filter_tree" in (json.loads(b.params) if isinstance(b.params, str) else (b.params or {}))
+                "filter_tree" in (
+                    json.loads(b.params) if isinstance(b.params, str) else (b.params or {})
+                )
                 for b in existing_blocks
             )
             if already_migrated:
-                log.debug("migrate_system_templates: '%s' already on filter_tree schema — skipping.", name)
+                log.debug(
+                    "migrate_system_templates: '%s' already on filter_tree schema — skipping.",
+                    name,
+                )
                 skipped += 1
                 continue
 
         try:
-            # 1. Drop all existing blocks for this template
             db.query(PlaylistBlock).filter(
                 PlaylistBlock.template_id == template.id
             ).delete(synchronize_session=False)
 
-            # 2. Insert canonical new-format blocks
             new_blocks = _MIGRATION_BLOCKS[name]()
             for block_kwargs in new_blocks:
                 db.add(PlaylistBlock(template_id=template.id, **block_kwargs))
 
-            # 3. Update metadata and stamp the version tag
             meta = _MIGRATION_META[name]
             template.description  = meta["description"]
             template.total_tracks = meta["total_tracks"]
@@ -381,8 +381,7 @@ def migrate_system_templates(db) -> None:
             db.commit()
             migrated += 1
             log.info(
-                "migrate_system_templates: '%s' (id=%d) migrated to filter_tree schema — "
-                "%d block(s) written.",
+                "migrate_system_templates: '%s' (id=%d) migrated — %d block(s) written.",
                 name, template.id, len(new_blocks),
             )
 
