@@ -2,26 +2,28 @@ import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, ListMusic, Telescope, Settings,
-  Plug, BarChart2, Menu, X, ChevronRight, Ban, LogOut, User,
+  Plug, BarChart2, Menu, X, ChevronRight, Ban, LogOut, User, UserCog,
 } from 'lucide-react'
 import logoUrl from '/logo-64.png'
 import { useAuth } from '../contexts/AuthContext.jsx'
 
 // Nav items — mark admin-only ones
 const NAV = [
-  { to: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard'   },
-  { to: '/playlists',   icon: ListMusic,        label: 'Playlists'   },
-  { to: '/discovery',   icon: Telescope,        label: 'Discovery'   },
-  { to: '/insights',    icon: BarChart2,        label: 'Insights'    },
-  { to: '/exclusions',  icon: Ban,              label: 'Exclusions',  adminOnly: true },
-  { to: '/connections', icon: Plug,             label: 'Connections', adminOnly: true },
-  { to: '/settings',    icon: Settings,         label: 'Settings',    adminOnly: true },
+  { to: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard'                       },
+  { to: '/playlists',   icon: ListMusic,        label: 'Playlists'                       },
+  { to: '/discovery',   icon: Telescope,        label: 'Discovery'                       },
+  { to: '/insights',    icon: BarChart2,        label: 'Insights'                        },
+  { to: '/exclusions',  icon: Ban,              label: 'Exclusions',  adminOnly: true    },
+  { to: '/admin/users', icon: UserCog,          label: 'Users',       adminOnly: true    },
+  { to: '/connections', icon: Plug,             label: 'Connections', adminOnly: true    },
+  { to: '/settings',    icon: Settings,         label: 'Settings',    adminOnly: true    },
 ]
 
 const PAGE_LABELS = {
   dashboard: 'Dashboard', playlists: 'Playlists',
   discovery: 'Discovery', insights: 'Insights',
   connections: 'Connections', settings: 'Settings', exclusions: 'Exclusions',
+  admin: 'Admin', users: 'User Management',
 }
 
 function SidebarContent({ onClose }) {
@@ -199,7 +201,7 @@ export default function Layout() {
               <span style={{ fontSize:11, color:'var(--accent)', fontWeight:600 }}>Live</span>
             </div>
 
-            {/* Topbar user + logout (desktop only — sidebar handles this on desktop via the footer) */}
+            {/* Topbar user + logout (desktop only) */}
             {user && (
               <button
                 onClick={handleLogout}

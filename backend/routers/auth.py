@@ -349,6 +349,15 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
     jellyfin_token: str = data["AccessToken"]
 
     _upsert_managed_user(db, jellyfin_user_id, jellyfin_username, is_admin)
+
+    # Auto-provision default playlists for this user on every login.
+    # provision_user_defaults() is idempotent — already-covered templates are skipped.
+    try:
+        from routers.admin_defaults import provision_user_defaults
+        provision_user_defaults(jellyfin_user_id, db)
+    except Exception as _prov_err:
+        log.warning("Auto-provision on login failed for %s: %s", jellyfin_user_id, _prov_err)
+
     access_token, refresh_token = _issue_tokens(
         db, jellyfin_user_id, jellyfin_username, is_admin, jellyfin_token
     )

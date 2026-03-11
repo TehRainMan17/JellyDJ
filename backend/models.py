@@ -587,3 +587,24 @@ class UserPlaylist(Base):
     last_track_count     = Column(Integer, nullable=True)
     created_at           = Column(DateTime, default=datetime.utcnow)
     updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DefaultPlaylistConfig(Base):
+    """
+    Admin-configured default playlists provisioned to every user automatically:
+    on first login, on first push, or on-demand via the admin Users panel.
+
+    One row per default playlist slot. When a user is provisioned, a UserPlaylist
+    is created for each active row the user doesn't already have (deduped by
+    template_id). Users can rename, reschedule, or delete their provisioned
+    playlists without affecting this config table.
+    """
+    __tablename__ = "default_playlist_configs"
+    id                  = Column(Integer, primary_key=True, index=True)
+    template_id         = Column(Integer, nullable=False)      # references PlaylistTemplate.id
+    base_name           = Column(Text, nullable=False)         # playlist display name for users
+    schedule_enabled    = Column(Boolean, default=True,  nullable=False)
+    schedule_interval_h = Column(Integer, default=24,    nullable=False)
+    position            = Column(Integer, default=0,     nullable=False)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

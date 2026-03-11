@@ -15,6 +15,11 @@ Registered jobs
   playlist_regen          Regenerate all Jellyfin playlists from current scores.
                           Default: every 24 hours.
 
+  user_playlist_autopush  Check all UserPlaylist rows with schedule_enabled=True and
+                          push any that are past their next scheduled run time.
+                          Runs every 15 minutes (fine-grained poll; actual pushes are
+                          gated by each playlist's own interval).
+
   auto_download           Send top-scored pending discovery items to Lidarr.
                           Starts paused; only runs when auto_download_enabled=True.
                           Interval matches the cooldown_days setting.
@@ -41,13 +46,14 @@ log = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 # Stable job IDs — used to reschedule or pause individual jobs
-INDEX_JOB_ID          = "play_history_index"
-DISCOVERY_JOB_ID      = "discovery_refresh"
-PLAYLIST_JOB_ID       = "playlist_regen"
-AUTO_DOWNLOAD_JOB_ID  = "auto_download"
-BILLBOARD_JOB_ID      = "billboard_refresh"
-ENRICHMENT_JOB_ID     = "enrichment"
-POPULARITY_CACHE_JOB_ID = "popularity_cache_refresh"
+INDEX_JOB_ID               = "play_history_index"
+DISCOVERY_JOB_ID           = "discovery_refresh"
+PLAYLIST_JOB_ID            = "playlist_regen"
+USER_PLAYLIST_AUTOPUSH_ID  = "user_playlist_autopush"
+AUTO_DOWNLOAD_JOB_ID       = "auto_download"
+BILLBOARD_JOB_ID           = "billboard_refresh"
+ENRICHMENT_JOB_ID          = "enrichment"
+POPULARITY_CACHE_JOB_ID    = "popularity_cache_refresh"
 
 
 def _get_settings(db):
@@ -165,6 +171,187 @@ def _job_holiday_flags():
         db.close()
 
 
+async def _run_user_playlist_autopush():
+    """
+    Poll all UserPlaylist rows with schedule_enabled=True and push any whose
+    next scheduled run time has passed.
+
+    Next run = last_generated_at + schedule_interval_h.
+    If the playlist has never been pushed (last_generated_at is None), we
+    treat created_at as the base so it fires one interval after creation
+    rather than immediately on first boot.
+
+    This job runs every 15 minutes so the maximum push latency is 15 minutes
+    past the user's chosen interval.
+    """
+    from datetime import timedelta
+    from database import SessionLocal
+    from models import UserPlaylist
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        due_playlists = (
+            db.query(UserPlaylist)
+            .filter(UserPlaylist.schedule_enabled == True)  # noqa: E712
+            .all()
+        )
+
+        if not due_playlists:
+            return
+
+        # Import push logic — reuse the same code path as the manual push endpoint
+        from services.playlist_engine import generate_from_template
+        from services.playlist_writer import (
+            _add_to_playlist,
+            _clear_playlist,
+            _create_playlist,
+            _find_playlist,
+            _jellyfin_creds,
+        )
+
+        try:
+            base_url, api_key = _jellyfin_creds(db)
+        except RuntimeError as e:
+            log.warning(f"UserPlaylist autopush skipped — Jellyfin not configured: {e}")
+            return
+
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{base_url}/Users",
+                headers={"X-Emby-Token": api_key},
+            )
+            if resp.status_code != 200:
+                log.warning("UserPlaylist autopush: could not reach Jellyfin to get admin user ID")
+                return
+            users_json = resp.json()
+            admin = next((u for u in users_json if u.get("Policy", {}).get("IsAdministrator")), None)
+            jf_admin_id = (admin or (users_json[0] if users_json else None) or {}).get("Id")
+
+        if not jf_admin_id:
+            log.warning("UserPlaylist autopush: could not determine Jellyfin admin user ID")
+            return
+
+        from models import ManagedUser, PlaylistRunItem
+
+        pushed = 0
+        skipped = 0
+
+        for playlist in due_playlists:
+            try:
+                interval = timedelta(hours=playlist.schedule_interval_h or 24)
+
+                # Determine the base time for computing next_due
+                if playlist.last_generated_at is not None:
+                    base = playlist.last_generated_at
+                    if base.tzinfo is None:
+                        base = base.replace(tzinfo=timezone.utc)
+                else:
+                    # Never pushed — use created_at so it doesn't fire immediately
+                    # on every boot before the user has ever manually pushed
+                    base = playlist.created_at
+                    if base is None:
+                        base = now
+                    if base.tzinfo is None:
+                        base = base.replace(tzinfo=timezone.utc)
+
+                next_due = base + interval
+
+                if next_due > now:
+                    skipped += 1
+                    continue  # not yet due
+
+                if playlist.template_id is None:
+                    log.warning(
+                        "UserPlaylist id=%d has no template, skipping autopush", playlist.id
+                    )
+                    skipped += 1
+                    continue
+
+                # Look up the owner's username
+                user_row = db.query(ManagedUser).filter_by(
+                    jellyfin_user_id=playlist.owner_user_id
+                ).first()
+                username = user_row.username if user_row else playlist.owner_user_id
+                jf_name  = f"{playlist.base_name} - {username}"
+
+                # Generate track list
+                track_ids = await generate_from_template(
+                    playlist.template_id, playlist.owner_user_id, db
+                )
+
+                # Push to Jellyfin
+                existing_id = await _find_playlist(base_url, api_key, jf_name, jf_admin_id)
+                if existing_id:
+                    await _clear_playlist(base_url, api_key, existing_id, jf_admin_id)
+                    await _add_to_playlist(base_url, api_key, existing_id, track_ids, jf_admin_id)
+                    action = "updated"
+                    jf_playlist_id = existing_id
+                else:
+                    jf_playlist_id = await _create_playlist(
+                        base_url, api_key, jf_name, jf_admin_id, track_ids
+                    )
+                    action = "created"
+
+                if not jf_playlist_id:
+                    log.error(
+                        "UserPlaylist autopush: Jellyfin op failed for playlist id=%d", playlist.id
+                    )
+                    skipped += 1
+                    continue
+
+                # Stamp last_generated_at — this is the clock that drives the next push
+                push_time = datetime.utcnow()
+                playlist.last_generated_at = push_time
+                playlist.last_track_count  = len(track_ids)
+                # Do NOT touch updated_at — that's the user's edit timestamp,
+                # not the push timestamp, and the frontend uses updated_at for
+                # optimistic display.  last_generated_at is the correct field.
+
+                db.add(PlaylistRunItem(
+                    run_id=0,
+                    user_id=playlist.owner_user_id,
+                    username=username,
+                    playlist_type="template",
+                    playlist_name=jf_name,
+                    jellyfin_playlist_id=jf_playlist_id or "",
+                    tracks_added=len(track_ids),
+                    action=action,
+                    status="ok",
+                    created_at=push_time,
+                    user_playlist_id=playlist.id,
+                ))
+
+                db.commit()
+                pushed += 1
+                log.info(
+                    "UserPlaylist autopush: id=%d (%s) → %d tracks, action=%s",
+                    playlist.id, jf_name, len(track_ids), action,
+                )
+
+            except Exception as exc:
+                log.error(
+                    "UserPlaylist autopush failed for id=%d: %s", playlist.id, exc, exc_info=True
+                )
+                db.rollback()
+
+        if pushed or skipped:
+            log.info(
+                "UserPlaylist autopush complete: %d pushed, %d not yet due", pushed, skipped
+            )
+
+    except Exception as exc:
+        log.error("UserPlaylist autopush job crashed: %s", exc, exc_info=True)
+    finally:
+        db.close()
+
+
+def _job_user_playlist_autopush():
+    """Sync wrapper for the async autopush job — called by APScheduler."""
+    asyncio.run(_run_user_playlist_autopush())
+
+
 def _run_billboard_if_empty():
     """
     Run a billboard sync immediately if the table has never been populated.
@@ -194,7 +381,7 @@ def _run_billboard_if_empty():
 
 def start_scheduler(db_session_factory):
     """
-    Register all four jobs and start the scheduler.
+    Register all jobs and start the scheduler.
     Called once from the FastAPI lifespan in main.py.
 
     Jobs are registered with their default intervals first, then
@@ -229,6 +416,17 @@ def start_scheduler(db_session_factory):
         replace_existing=True,
         misfire_grace_time=600,
     )
+
+    # UserPlaylist per-row auto-push — polls every 15 minutes
+    # Actual push frequency is gated by each playlist's schedule_interval_h
+    scheduler.add_job(
+        _job_user_playlist_autopush,
+        trigger=IntervalTrigger(minutes=15),
+        id=USER_PLAYLIST_AUTOPUSH_ID,
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
     scheduler.add_job(
         _job_auto_download,
         trigger=IntervalTrigger(days=1),
@@ -274,7 +472,7 @@ def start_scheduler(db_session_factory):
     # Auto-download starts paused — reschedule_automation_jobs will enable it
     # only if auto_download_enabled=True is saved in the database
     scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (7 jobs registered).")
+    log.info("Scheduler started (8 jobs registered, including user_playlist_autopush).")
 
     # Run billboard sync immediately on first start if table is empty
     _run_billboard_if_empty()
@@ -306,7 +504,7 @@ def reschedule_index_job(db):
 
 def reschedule_automation_jobs(db):
     """
-    Apply current AutomationSettings to all four scheduler jobs.
+    Apply current AutomationSettings to all scheduler jobs.
 
     Called:
       - On startup (after registering jobs with defaults)
@@ -502,6 +700,7 @@ def reschedule_automation_jobs(db):
         f"({s.discovery_refresh_interval_hours}h) | "
         f"playlists={'on' if s.playlist_regen_enabled else 'off'} "
         f"({s.playlist_regen_interval_hours}h) | "
+        f"user_playlist_autopush=on (poll every 15m) | "
         f"auto_download={'on' if auto_dl_enabled else 'off'} "
         f"(every {cooldown_days}d) | "
         f"billboard={'on' if billboard_enabled else 'off'} "

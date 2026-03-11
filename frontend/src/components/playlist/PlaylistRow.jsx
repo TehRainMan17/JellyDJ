@@ -17,11 +17,27 @@ const SCHEDULE_OPTIONS = [
   { value: 168,  label: '7 days' },
 ]
 
-function nextRunTime(updatedAt, intervalH) {
-  if (!updatedAt || !intervalH) return null
-  const base = new Date(updatedAt.endsWith('Z') || updatedAt.includes('+') ? updatedAt : updatedAt + 'Z')
-  const next = new Date(base.getTime() + intervalH * 3600 * 1000)
-  return next
+/**
+ * Compute the next scheduled push time.
+ *
+ * We base this on last_generated_at (the last time the playlist was actually
+ * pushed) rather than updated_at (the last time the row was edited).
+ * Using updated_at caused the "Next" time to always appear in the past because
+ * updated_at changes on every schedule save but is never refreshed by a push.
+ *
+ * Fallback: if the playlist has never been pushed (last_generated_at is null)
+ * we use created_at + interval so the display is still meaningful.
+ */
+function nextRunTime(playlist, intervalH) {
+  if (!intervalH) return null
+
+  const baseStr = playlist.last_generated_at ?? playlist.created_at
+  if (!baseStr) return null
+
+  const base = new Date(
+    baseStr.endsWith('Z') || baseStr.includes('+') ? baseStr : baseStr + 'Z'
+  )
+  return new Date(base.getTime() + intervalH * 3600 * 1000)
 }
 
 export default function PlaylistRow({
@@ -161,7 +177,11 @@ export default function PlaylistRow({
     }
   }
 
-  const nextRun = schedEnabled ? nextRunTime(playlist.updated_at, schedInterval) : null
+  // Use last_generated_at as the base for next-run calculation.
+  // Falls back to created_at for playlists that have never been pushed.
+  const nextRun = schedEnabled ? nextRunTime(playlist, schedInterval) : null
+  const isPastDue = nextRun && nextRun < new Date()
+
   const lastGenFmt = playlist.last_generated_at
     ? new Date(playlist.last_generated_at.endsWith('Z') || playlist.last_generated_at.includes('+')
         ? playlist.last_generated_at : playlist.last_generated_at + 'Z').toLocaleString()
@@ -336,9 +356,13 @@ export default function PlaylistRow({
               </div>
 
               {nextRun && (
-                <span className="flex items-center gap-1 text-xs" style={{ color: 'var(--text-muted)' }}>
+                <span
+                  className="flex items-center gap-1 text-xs"
+                  style={{ color: isPastDue ? 'var(--accent)' : 'var(--text-muted)' }}
+                  title={isPastDue ? 'Push is due — will run within 15 minutes' : undefined}
+                >
                   <Calendar size={9} />
-                  Next: {nextRun.toLocaleString()}
+                  {isPastDue ? 'Pushing soon…' : `Next: ${nextRun.toLocaleString()}`}
                 </span>
               )}
             </>

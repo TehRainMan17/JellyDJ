@@ -1,0 +1,29 @@
+/**
+ * App.jsx — PATCH
+ *
+ * CHANGE 1: Add import near the top with the other page imports:
+ *
+ *   import AdminUsers from './pages/AdminUsers.jsx'
+ *
+ *
+ * CHANGE 2: Add the route inside the protected <Route path="/"> block,
+ * alongside the existing admin-only routes:
+ *
+ *   <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
+ *
+ * Full context — find this block and add the new line:
+ *
+ *   <Route path="dashboard"   element={<Dashboard />} />
+ *   <Route path="playlists"   element={<Playlists />} />
+ *   <Route path="discovery"   element={<DiscoveryQueue />} />
+ *   <Route path="insights"    element={<Insights />} />
+ *   <Route path="exclusions"  element={<RequireAdmin><AlbumExclusions /></RequireAdmin>} />
+ *   <Route path="connections" element={<RequireAdmin><Connections /></RequireAdmin>} />
+ *   <Route path="settings"    element={<RequireAdmin><Settings /></RequireAdmin>} />
+ *   <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />   ← ADD
+ *
+ *
+ * CHANGE 3: Update the route-map comment at the top of App.jsx:
+ *
+ *   /admin/users    → user management and default playlist configuration (admin only)
+ */

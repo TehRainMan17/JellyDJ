@@ -25,6 +25,7 @@ from routers import (
 from routers.auth import router as auth_router
 from routers.playlist_templates import router as playlist_templates_router
 from routers.user_playlists import router as user_playlists_router
+from routers.admin_defaults import router as admin_defaults_router
 
 
 def _run_migrations():
@@ -325,6 +326,7 @@ app.include_router(exclusions.router)     # /api/exclusions     — manual album
 app.include_router(auth_router)           # /api/auth           — Jellyfin login + JWT tokens
 app.include_router(playlist_templates_router)  # /api/playlist-templates — template + block CRUD
 app.include_router(user_playlists_router)      # /api/user-playlists     — user playlist CRUD + push
+app.include_router(admin_defaults_router)      # /api/admin/default-playlists — admin default playlist config
 
 
 @app.get("/api/health")

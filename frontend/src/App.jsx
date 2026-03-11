@@ -14,6 +14,7 @@
  *   /connections    → Jellyfin + Lidarr connection credentials
  *   /insights       → listening statistics and charts
  *   /exclusions     → manual album exclusions
+ *   /admin/users    → user management and default playlist configuration (admin only)
  */
 
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
@@ -26,6 +27,7 @@ import Settings from './pages/Settings.jsx'
 import Connections from './pages/Connections.jsx'
 import Insights from './pages/Insights.jsx'
 import AlbumExclusions from './pages/AlbumExclusions.jsx'
+import AdminUsers from './pages/AdminUsers.jsx'
 import Login from './pages/Login.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
 import { _wireAuth } from './lib/api.js'
@@ -91,6 +93,7 @@ export default function App() {
           <Route path="exclusions"  element={<RequireAdmin><AlbumExclusions /></RequireAdmin>} />
           <Route path="connections" element={<RequireAdmin><Connections /></RequireAdmin>} />
           <Route path="settings"    element={<RequireAdmin><Settings /></RequireAdmin>} />
+          <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
         </Route>
       </Routes>
     </BrowserRouter>
