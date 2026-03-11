@@ -1,48 +1,55 @@
-
 """
-JellyDJ Scoring Engine — v5
+JellyDJ Scoring Engine — v6
 
-Changes from v4:
-  Scoring normalisation overhaul to fix top-tier compression.
+Changes from v5:
+  New-album discovery fix.
 
-  After popularity enrichment was improved, many tracks started scoring 93-99
-  because additive bonuses (popularity +5, replay +12, favorite +6) stacked on
-  top of a raw score that was already near-ceilinged by the old constants:
+  After a month of operation users observed that newly added albums were
+  essentially never surfacing in "New For You" even when the added artist
+  was a firm favourite (e.g. Simon & Garfunkel, The White Stripes).
 
-    - SCORE_RESCALE_MAX was 91: any raw_base ≥ 91 clamped to compressed=100
-      before bonuses, collapsing all high-scoring tracks to a flat ceiling.
-    - COMPRESSION_EXP was 0.75: too aggressive — pulled moderate scores toward
-      the top and compressed the gap between "good" and "great".
-    - Popularity and replay bonuses were flat-additive, so a 93 + 5 pop = 98
-      regardless of how little headroom was left.
+  Root-cause analysis:
+    1. UNPLAYED_CAP was 65.0.  The "New For You" discovery block AND-intersects
+       with global_popularity >= 50.  Tracks from artists with high affinity
+       but no enrichment data (NULL global_popularity) or niche artists with
+       low chart popularity were therefore doubly suppressed: their score was
+       already low AND the popularity filter excluded them entirely.
 
-  v5 fixes:
-    1. SCORE_RESCALE_MAX raised 91 → 100: eliminates the premature ceiling so
-       the full raw_base range (0–100) maps cleanly to the compressed range.
-    2. COMPRESSION_EXP raised 0.75 → 0.85: closer to linear in the upper range,
-       giving meaningful point-gap between "frequently played" and "top track".
-    3. Popularity and replay bonuses are now proportional: each bonus is scaled
-       by the remaining headroom (1 - score/99) so a track at 90 receives less
-       absolute benefit than a track at 70. This prevents stacking bonuses from
-       pushing large swaths of the catalogue to 98-99.
+    2. novelty_bonus was a flat 2.0 regardless of artist/genre affinity.
+       A track from a beloved artist got exactly the same unplayed bonus as
+       a track from a completely unknown one — no lift whatsoever for "I love
+       this artist but haven't heard this album yet."
 
-  Resulting tiers (approximate, no bonuses):
-    38–45  barely liked
-    46–62  occasionally played
-    63–76  regularly played
-    77–86  frequently played
-    87–94  heavily played / top-affinity artist
-    95–99  favorites or max-played top-artist tracks (requires stacking)
+    3. The affinity contribution to unplayed scoring was small:
+         UNPLAYED_ARTIST_W = 0.20  × (a_aff * 0.70)  ≈ 14 pts at full affinity
+       So even a 100-affinity artist only pushed an unplayed track from 37 → 51,
+       still well below the "New For You" discovery thresholds.
 
-Changes from v3 (kept from v4):
-  Phase 1 (ArtistProfile): now pulls replay_boost from UserReplaySignal and
-    stamps it onto ArtistProfile.replay_boost. Also copies related_artists and
-    tags from ArtistEnrichment for use by Discover Weekly.
+  v6 fixes:
+    1. UNPLAYED_CAP raised 65 → 78.  High-affinity unplayed tracks can now
+       compete meaningfully with the discovery block's filters.
 
-  Phase 2 (GenreProfile): unchanged logic, kept for compatibility.
+    2. UNPLAYED_ARTIST_W raised 0.20 → 0.35, UNPLAYED_GENRE_W raised 0.14 → 0.20.
+       Affinity now drives a bigger share of unplayed score.
 
-  Phase 3 (TrackScore): factors in replay_boost, global_popularity,
-    cooldown_until, skip_streak (all unchanged from v4).
+    3. novelty_bonus is now DYNAMIC: a loved-artist unplayed track gets a bonus
+       proportional to its artist_affinity (0–15 pts) rather than a flat 2 pts.
+       Formula:  novelty_bonus = UNPLAYED_NOVELTY_BASE
+                               + UNPLAYED_NOVELTY_ARTIST_SCALE * (a_aff / 100)
+       (still capped by UNPLAYED_CAP, so it never inflates past the ceiling).
+
+    4. UNPLAYED_BASE unchanged at 35 so truly unknown tracks are still scored
+       conservatively — we only lift tracks from artists/genres the user has
+       demonstrated affinity for.
+
+  Resulting approximate unplayed score tiers (no popularity bonus):
+    35        zero artist/genre affinity (unchanged)
+    48–55     mild affinity (previously ~38–43)
+    62–70     moderate affinity (previously ~45–52)
+    71–78     high-affinity artist, loved genre (previously ~55–65 → now reaches cap)
+
+  These scores now fall cleanly within the discovery block's effective range
+  and above the "New For You" familiar-track threshold of 70.
 """
 from __future__ import annotations
 
@@ -69,20 +76,22 @@ W_ARTIST    = 0.20
 W_GENRE     = 0.10
 
 AFFINITY_SCALE        = 0.70
-# v5: raised from 91→100 so raw scores are no longer pre-clamped before compression.
-# The old value of 91 meant any raw_base ≥ 91 all mapped to compressed=100 before
-# bonuses were added, collapsing the top tier into a flat ceiling.
 SCORE_RESCALE_MAX     = 100.0
-# v5: raised from 0.75→0.85 (closer to linear) for more spread in the 70-95 range.
-# 0.75 was too aggressive — it pulled moderate scores up toward the ceiling and
-# compressed the distance between "good" and "great" tracks.
 COMPRESSION_EXP       = 0.85
 
 UNPLAYED_BASE         = 35.0
-UNPLAYED_ARTIST_W     = 0.20
-UNPLAYED_GENRE_W      = 0.14
-UNPLAYED_NOVELTY      = 2.0
-UNPLAYED_CAP          = 65.0
+# v6: raised from 0.20 → 0.35 so artist affinity drives more of the unplayed score
+UNPLAYED_ARTIST_W     = 0.35
+# v6: raised from 0.14 → 0.20
+UNPLAYED_GENRE_W      = 0.20
+# v6: novelty_bonus is now a *dynamic* range; these two constants define it:
+#   novelty_bonus = UNPLAYED_NOVELTY_BASE + UNPLAYED_NOVELTY_ARTIST_SCALE * (a_aff/100)
+# At zero affinity:  2.0 pts  (same as the old flat constant)
+# At full affinity: 17.0 pts  (meaningful lift for beloved unheard artists)
+UNPLAYED_NOVELTY_BASE         = 2.0
+UNPLAYED_NOVELTY_ARTIST_SCALE = 15.0
+# v6: raised from 65 → 78 so high-affinity unplayed tracks can reach discovery thresholds
+UNPLAYED_CAP          = 78.0
 
 RECENCY_GRACE_DAYS    = 30
 RECENCY_DECAY_DAYS    = 365
@@ -94,18 +103,10 @@ FAVORITE_BONUS        =  6.0
 FAVORITE_SKIP_SHIELD  = 0.35
 FAVORITE_ARTIST_BOOST = 15.0
 
-# v2: replay boost cap — a voluntary replay can add at most this many points
-# to a track's final_score. Keeps replayed tracks from vaulting above true
-# 90+ favourites purely from one enthusiastic week of replaying.
 REPLAY_BOOST_CAP      = 12.0
 
-# v5: popularity bonuses are now applied proportionally (scaled by remaining headroom)
-# so that already-high-scoring tracks receive a smaller absolute nudge than
-# lower-scoring tracks. A flat +5 / +10 was enough to vault a 90→99 or 93→99 when
-# stacked with replay and favorite bonuses.
-# These values are the *maximum* bonus at maximum popularity with full headroom.
-POPULARITY_PLAYED_MAX   = 5.0   # max pts for a played track (at pop=100, score=0)
-POPULARITY_UNPLAYED_MAX = 10.0  # max pts for an unplayed track
+POPULARITY_PLAYED_MAX   = 5.0
+POPULARITY_UNPLAYED_MAX = 10.0
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -374,6 +375,15 @@ def rebuild_track_scores(
       - global_popularity  copied from TrackEnrichment
       - cooldown_until  stamped from active TrackCooldown rows
       - skip_streak  copied from SkipPenalty.consecutive_skips
+
+    v6 additions (unplayed scoring overhaul):
+      - novelty_bonus is now dynamic: scales with artist_affinity so tracks
+        from loved artists receive a meaningful lift (up to +15 pts) rather
+        than a flat +2. Stored in TrackScore.novelty_bonus for transparency.
+      - UNPLAYED_ARTIST_W and UNPLAYED_GENRE_W increased so affinity drives
+        more of the unplayed base score.
+      - UNPLAYED_CAP raised 65 → 78 so high-affinity unplayed tracks can
+        reach the thresholds used by "New For You" discovery filters.
     """
     now = datetime.utcnow()
 
@@ -538,11 +548,20 @@ def rebuild_track_scores(
 
         else:
             # ── Unplayed track scoring ────────────────────────────────────────
+            # v6: novelty_bonus is now dynamic — scales with artist_affinity so
+            # unplayed tracks from loved artists receive a meaningful lift.
+            # At a_aff=0:   novelty_bonus = 2.0  (same as old flat constant)
+            # At a_aff=100: novelty_bonus = 17.0 (significant lift for loved artists)
+            novelty_bonus = round(
+                UNPLAYED_NOVELTY_BASE + UNPLAYED_NOVELTY_ARTIST_SCALE * (a_aff / 100.0),
+                2,
+            )
+
             unplayed_score = (
                 UNPLAYED_BASE
                 + UNPLAYED_ARTIST_W * (a_aff * AFFINITY_SCALE)
                 + UNPLAYED_GENRE_W  * (g_aff * AFFINITY_SCALE)
-                + UNPLAYED_NOVELTY
+                + novelty_bonus
             )
 
             if skip_pen > 0.3:
@@ -586,7 +605,7 @@ def rebuild_track_scores(
                 artist_affinity=str(a_aff),
                 genre_affinity=str(g_aff),
                 skip_penalty=str(round(skip_pen, 4)),
-                novelty_bonus=str(UNPLAYED_NOVELTY),
+                novelty_bonus=str(novelty_bonus),
                 final_score=str(final),
                 updated_at=now,
                 # v2
