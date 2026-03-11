@@ -55,7 +55,7 @@ const DEFAULT_PARAMS = {
   artist_cap:        { max_per_artist: 3 },
   // New blocks
   skip_rate:         { skip_penalty_min: 0.0, skip_penalty_max: 0.3, played_filter: 'all' },
-  replay_boost:      { boost_min: 0.1, played_filter: 'all' },
+  replay_boost:      { boost_min: 0.1, boost_max: 12, played_filter: 'all' },
   novelty:           { novelty_min: 0, novelty_max: 100 },
   recency_score:     { recency_min: 0, recency_max: 100, played_filter: 'played' },
   skip_streak:       { streak_min: 0, streak_max: 2, played_filter: 'all' },
@@ -428,13 +428,16 @@ function SkipRateEditor({ p, set }) {
 }
 
 function ReplayBoostEditor({ p, set }) {
+  const lo = parseFloat((p.boost_min ?? 0.1).toFixed(1))
+  const hi = parseFloat((p.boost_max ?? 12).toFixed(1))
   return (
     <div className="space-y-4">
-      <SingleSlider
-        label="Minimum replay boost"
-        value={parseFloat((p.boost_min ?? 0.1).toFixed(1))}
+      <RangeInputs
+        label="Replay boost range (0.1 = any signal · 12 = max obsession)"
+        lo={lo} hi={hi}
         min={0.1} max={12} step={0.1}
-        onChange={v => set({ ...p, boost_min: v })}
+        onLo={v => set({ ...p, boost_min: v, boost_max: Math.max(hi, v) })}
+        onHi={v => set({ ...p, boost_max: v, boost_min: Math.min(lo, v) })}
       />
       <div>
         <div className="section-label mb-1.5">Track status</div>

@@ -1,3 +1,4 @@
+
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
 plus the activity feed endpoint.
@@ -64,17 +65,6 @@ _discovery_state: dict = {
     "error": None,
 }
 
-_playlist_state: dict = {
-    "running": False,
-    "phase": "",
-    "detail": "",
-    "playlists_done": 0,
-    "playlists_total": 0,
-    "started_at": None,
-    "finished_at": None,
-    "error": None,
-}
-
 _download_state: dict = {
     "running": False,
     "phase": "",
@@ -95,15 +85,6 @@ def _set_discovery_state(**kwargs):
     if kwargs.get("running") is False:
         _discovery_state["finished_at"] = _dt.utcnow().isoformat()
 
-def _set_playlist_state(**kwargs):
-    from datetime import datetime as _dt
-    _playlist_state.update(kwargs)
-    if kwargs.get("running") and not _playlist_state.get("started_at"):
-        _playlist_state["started_at"] = _dt.utcnow().isoformat()
-        _playlist_state["finished_at"] = None
-    if kwargs.get("running") is False:
-        _playlist_state["finished_at"] = _dt.utcnow().isoformat()
-
 def _set_download_state(**kwargs):
     from datetime import datetime as _dt
     _download_state.update(kwargs)
@@ -121,9 +102,7 @@ class AutomationSettingsUpdate(BaseModel):
     discovery_refresh_enabled: Optional[bool] = None
     discovery_refresh_interval_hours: Optional[int] = None
     discovery_items_per_run: Optional[int] = None
-    playlist_regen_enabled: Optional[bool] = None
-    playlist_regen_interval_hours: Optional[int] = None
-    auto_download_enabled: Optional[bool] = None
+
     auto_download_max_per_run: Optional[int] = None
     auto_download_cooldown_days: Optional[int] = None
     popularity_cache_refresh_interval_hours: Optional[int] = None
@@ -151,8 +130,6 @@ def get_settings(db: Session = Depends(get_db)):
         "discovery_refresh_enabled": s.discovery_refresh_enabled,
         "discovery_refresh_interval_hours": s.discovery_refresh_interval_hours,
         "discovery_items_per_run": s.discovery_items_per_run,
-        "playlist_regen_enabled": s.playlist_regen_enabled,
-        "playlist_regen_interval_hours": s.playlist_regen_interval_hours,
         "auto_download_enabled": bool(s.auto_download_enabled),
         "auto_download_max_per_run": s.auto_download_max_per_run,
         "auto_download_cooldown_days": s.auto_download_cooldown_days,
@@ -160,7 +137,6 @@ def get_settings(db: Session = Depends(get_db)):
         "last_auto_download": s.last_auto_download,
         "last_index": s.last_index,
         "last_discovery_refresh": s.last_discovery_refresh,
-        "last_playlist_regen": s.last_playlist_regen,
         "last_popularity_cache_refresh": s.last_popularity_cache_refresh,
     }
 
@@ -192,14 +168,6 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
         if not (1 <= payload.discovery_items_per_run <= 50):
             raise HTTPException(400, "Items per run must be 1–50")
         s.discovery_items_per_run = payload.discovery_items_per_run
-
-    if payload.playlist_regen_enabled is not None:
-        s.playlist_regen_enabled = payload.playlist_regen_enabled
-
-    if payload.playlist_regen_interval_hours is not None:
-        if not (1 <= payload.playlist_regen_interval_hours <= 168):
-            raise HTTPException(400, "Playlist interval must be 1–168 hours")
-        s.playlist_regen_interval_hours = payload.playlist_regen_interval_hours
 
     # ── Auto-download controls ────────────────────────────────────────────────
     if payload.auto_download_enabled is not None:
@@ -390,16 +358,6 @@ def discovery_trigger_status():
     return {**state, "progress_pct": pct}
 
 
-@router.get("/trigger/playlists/status")
-def playlists_trigger_status():
-    """Poll this to get live progress of playlist regeneration."""
-    state = dict(_playlist_state)
-    done = state.get("playlists_done", 0)
-    total = state.get("playlists_total", 0)
-    pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
-    return {**state, "progress_pct": pct}
-
-
 @router.get("/trigger/auto-download/status")
 def download_trigger_status():
     """Poll this to get live progress of the auto-download run."""
@@ -415,13 +373,6 @@ async def trigger_discovery(db: Session = Depends(get_db)):
     """Manually trigger a discovery queue refresh for all enabled users."""
     asyncio.create_task(_run_discovery_refresh())
     return {"ok": True, "message": "Discovery refresh started in background"}
-
-
-@router.post("/trigger/playlists")
-async def trigger_playlists(db: Session = Depends(get_db)):
-    """Manually trigger playlist regeneration for all enabled users."""
-    asyncio.create_task(_run_playlist_regen())
-    return {"ok": True, "message": "Playlist regeneration started in background"}
 
 
 @router.post("/trigger/auto-download")
@@ -570,33 +521,6 @@ async def _run_discovery_refresh():
     except Exception as e:
         log.error(f"Discovery refresh run failed: {e}")
         _set_discovery_state(running=False, phase="Error", error=str(e))
-    finally:
-        db.close()
-
-
-async def _run_playlist_regen():
-    """Regenerate all playlists. Called by scheduler."""
-    db = SessionLocal()
-    try:
-        from services.playlist_writer import run_playlist_generation
-        log.info("Scheduled playlist regeneration starting...")
-        _set_playlist_state(
-            running=True, phase="Starting playlist generation",
-            detail="Scoring and writing playlists for all users",
-            playlists_done=0, playlists_total=0, error=None,
-        )
-        result = await run_playlist_generation(db)
-        written = result.get("playlists_written", 0)
-        total   = result.get("playlists_total", written)
-        log.info(f"Playlist regen complete: {written} written")
-        _set_playlist_state(
-            running=False, phase="Complete",
-            detail=f"{written} playlist(s) written",
-            playlists_done=written, playlists_total=total, error=None,
-        )
-    except Exception as e:
-        log.error(f"Playlist regen failed: {e}")
-        _set_playlist_state(running=False, phase="Error", error=str(e))
     finally:
         db.close()
 
@@ -898,7 +822,5 @@ def scheduler_status(db: Session = Depends(get_db)):
             "index_interval_hours": s.index_interval_hours,
             "discovery_refresh_enabled": s.discovery_refresh_enabled,
             "discovery_refresh_interval_hours": s.discovery_refresh_interval_hours,
-            "playlist_regen_enabled": s.playlist_regen_enabled,
-            "playlist_regen_interval_hours": s.playlist_regen_interval_hours,
         }
     }

@@ -1,3 +1,4 @@
+
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3 + Auth Phase 1 + Phase 3).
 
@@ -328,15 +329,12 @@ class AutomationSettings(Base):
     discovery_refresh_enabled = Column(Boolean, default=True)
     discovery_refresh_interval_hours = Column(Integer, nullable=False, default=24)
     discovery_items_per_run = Column(Integer, nullable=False, default=10)
-    playlist_regen_enabled = Column(Boolean, default=True)
-    playlist_regen_interval_hours = Column(Integer, nullable=False, default=24)
     auto_download_enabled = Column(Boolean, default=False)
     auto_download_max_per_run = Column(Integer, nullable=False, default=1)
     auto_download_cooldown_days = Column(Integer, nullable=False, default=7)
     last_auto_download = Column(DateTime, nullable=True)
     last_index = Column(DateTime, nullable=True)
     last_discovery_refresh = Column(DateTime, nullable=True)
-    last_playlist_regen = Column(DateTime, nullable=True)
     # v2
     enrichment_enabled = Column(Boolean, default=True)
     enrichment_interval_hours = Column(Integer, nullable=False, default=48)

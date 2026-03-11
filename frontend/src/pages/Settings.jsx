@@ -1,3 +1,4 @@
+
 import { useEffect } from 'react'
 import AutomationPanel from '../components/AutomationPanel.jsx'
 import JobProgress from '../components/JobProgress.jsx'
@@ -10,7 +11,6 @@ export default function Settings() {
     cacheStatus,
     enrichStatus,
     discoverStatus,
-    playlistStatus,
     downloadStatus,
     startPolling,
   } = useJobStatus()
@@ -31,12 +31,11 @@ export default function Settings() {
         cacheStatus={cacheStatus}
         enrichStatus={enrichStatus}
         discoverStatus={discoverStatus}
-        playlistStatus={playlistStatus}
         downloadStatus={downloadStatus}
       />
 
       <AutomationPanel
-        jobStatuses={{ indexStatus, cacheStatus, enrichStatus, discoverStatus, playlistStatus, downloadStatus }}
+        jobStatuses={{ indexStatus, cacheStatus, enrichStatus, discoverStatus, downloadStatus }}
         onTrigger={startPolling}
       />
     </div>

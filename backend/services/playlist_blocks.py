@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Playlist Block Executors  (Phase 8 rewrite — audited & fixed)
 
@@ -571,6 +572,7 @@ def execute_replay_boost_block(
 
     Params:
       boost_min    : float 0.0–12.0 — minimum replay boost on the artist (default 0.1)
+      boost_max    : float 0.0–12.0 — maximum replay boost on the artist (default 12.0)
       played_filter: 'all' | 'played' | 'unplayed' (default 'all')
 
     Data source: TrackScore joined to ArtistProfile.replay_boost
@@ -578,14 +580,16 @@ def execute_replay_boost_block(
     """
     from models import TrackScore, ArtistProfile
     boost_min     = float(params.get("boost_min", 0.1))
+    boost_max     = float(params.get("boost_max", 12.0))
     played_filter = params.get("played_filter", "all")
 
-    # Collect artists that have a meaningful replay boost
+    # Collect artists whose replay boost falls within the min–max range
     boosted_artists = (
         db.query(ArtistProfile.artist_name)
         .filter(
             ArtistProfile.user_id == user_id,
             ArtistProfile.replay_boost >= boost_min,
+            ArtistProfile.replay_boost <= boost_max,
         )
         .all()
     )

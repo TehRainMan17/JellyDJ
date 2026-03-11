@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Central background job scheduler.
 
@@ -11,9 +12,6 @@ Registered jobs
 
   discovery_refresh       Populate the discovery queue with new album recommendations
                           for all enabled users. Default: every 24 hours.
-
-  playlist_regen          Regenerate all Jellyfin playlists from current scores.
-                          Default: every 24 hours.
 
   user_playlist_autopush  Check all UserPlaylist rows with schedule_enabled=True and
                           push any that are past their next scheduled run time.
@@ -48,7 +46,6 @@ scheduler = AsyncIOScheduler()
 # Stable job IDs — used to reschedule or pause individual jobs
 INDEX_JOB_ID               = "play_history_index"
 DISCOVERY_JOB_ID           = "discovery_refresh"
-PLAYLIST_JOB_ID            = "playlist_regen"
 USER_PLAYLIST_AUTOPUSH_ID  = "user_playlist_autopush"
 AUTO_DOWNLOAD_JOB_ID       = "auto_download"
 BILLBOARD_JOB_ID           = "billboard_refresh"
@@ -76,8 +73,6 @@ def _get_settings(db):
         discovery_refresh_enabled         = True
         discovery_refresh_interval_hours  = 24
         discovery_items_per_run           = 10
-        playlist_regen_enabled            = True
-        playlist_regen_interval_hours     = 24
         auto_download_enabled             = False
         auto_download_cooldown_days       = 7
     return Defaults()
@@ -112,11 +107,6 @@ def _job_run_index():
 def _job_discovery_refresh():
     from routers.automation import _run_discovery_refresh
     _sync_wrap(_run_discovery_refresh)
-
-
-def _job_playlist_regen():
-    from routers.automation import _run_playlist_regen
-    _sync_wrap(_run_playlist_regen)
 
 
 def _job_auto_download():
@@ -409,13 +399,6 @@ def start_scheduler(db_session_factory):
         replace_existing=True,
         misfire_grace_time=600,
     )
-    scheduler.add_job(
-        _job_playlist_regen,
-        trigger=IntervalTrigger(hours=24),
-        id=PLAYLIST_JOB_ID,
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
 
     # UserPlaylist per-row auto-push — polls every 15 minutes
     # Actual push frequency is gated by each playlist's schedule_interval_h
@@ -556,37 +539,6 @@ def reschedule_automation_jobs(db):
         except Exception:
             pass
 
-    # Playlist regen — can be fully disabled
-    if s.playlist_regen_enabled:
-        from datetime import timedelta as _td
-        _pl_interval = _td(hours=s.playlist_regen_interval_hours)
-        _pl_last     = getattr(s, "last_playlist_regen", None)
-        _now         = datetime.now(timezone.utc)
-        if _pl_last is None:
-            _pl_next = _now + _pl_interval
-        else:
-            if _pl_last.tzinfo is None:
-                _pl_last = _pl_last.replace(tzinfo=timezone.utc)
-            _pl_next = _pl_last + _pl_interval
-            if _pl_next < _now:
-                _pl_next = _now + _td(minutes=3)
-        scheduler.reschedule_job(
-            PLAYLIST_JOB_ID,
-            trigger=IntervalTrigger(
-                hours=s.playlist_regen_interval_hours,
-                start_date=_pl_next,
-            ),
-        )
-        try:
-            scheduler.resume_job(PLAYLIST_JOB_ID)
-        except Exception:
-            pass
-    else:
-        try:
-            scheduler.pause_job(PLAYLIST_JOB_ID)
-        except Exception:
-            pass
-
     # Auto-download — disabled by default; interval = cooldown_days
     # The job itself also enforces the cooldown internally as a safety net.
     auto_dl_enabled = getattr(s, "auto_download_enabled", False)
@@ -698,8 +650,6 @@ def reschedule_automation_jobs(db):
         f"Automation rescheduled: index={s.index_interval_hours}h | "
         f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
         f"({s.discovery_refresh_interval_hours}h) | "
-        f"playlists={'on' if s.playlist_regen_enabled else 'off'} "
-        f"({s.playlist_regen_interval_hours}h) | "
         f"user_playlist_autopush=on (poll every 15m) | "
         f"auto_download={'on' if auto_dl_enabled else 'off'} "
         f"(every {cooldown_days}d) | "

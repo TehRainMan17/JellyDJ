@@ -1,3 +1,4 @@
+
 /**
  * BlockEditor.jsx — Full-screen playlist template editor.
  *
@@ -214,7 +215,7 @@ const DEFAULT_PARAMS = {
   cooldown:          { mode: 'exclude_active' },
   // New blocks — defaults tuned so "just add the block" gives sensible behaviour
   skip_rate:         { skip_penalty_min: 0.0, skip_penalty_max: 0.3, played_filter: 'all' },
-  replay_boost:      { boost_min: 0.1, played_filter: 'all' },
+  replay_boost:      { boost_min: 0.1, boost_max: 12, played_filter: 'all' },
   novelty:           { novelty_min: 50, novelty_max: 100 },
   recency_score:     { recency_min: 0, recency_max: 100, played_filter: 'played' },
   skip_streak:       { streak_min: 0, streak_max: 0, played_filter: 'all' },
@@ -692,24 +693,46 @@ const Editors = {
   /**
    * replay_boost
    * Backend field: ArtistProfile.replay_boost (Float, 0.0–12.0)
-   * Params sent: boost_min, played_filter
-   * Threshold-only (no max) because users care about "artists I'm into now", not a ceiling.
+   * Params sent: boost_min, boost_max, played_filter
+   * Both min and max are wired so users can target any band of the range —
+   * e.g. set max to 2.0 to get light-replay artists while excluding obsession-
+   * tier artists, or set min to 6.0 to get only the strongly-boosted ones.
    */
   replay_boost: ({ p, set }) => {
-    const boost = p.boost_min ?? 0.1
-    const hint = boost < 1.0 ? '— any replay signal' : boost < 3.0 ? '— light current interest' : boost < 6.0 ? '— clear active interest' : '— strong obsession signal'
+    const lo = parseFloat(Number(p.boost_min ?? 0.1).toFixed(1))
+    const hi = parseFloat(Number(p.boost_max ?? 12).toFixed(1))
+
+    const hintForValue = v =>
+      v < 1.0 ? '— any replay signal'
+      : v < 3.0 ? '— light current interest'
+      : v < 6.0 ? '— clear active interest'
+      : '— strong obsession signal'
+
     return (
       <div className="space-y-4">
         <Slider
           label="Minimum replay boost"
-          value={parseFloat(Number(boost).toFixed(1))}
+          value={lo}
           min={0.1} max={12} step={0.1}
-          onChange={v => set({ ...p, boost_min: parseFloat(Number(v).toFixed(1)) })}
-          hint={hint}
+          onChange={v => {
+            const next = parseFloat(Number(v).toFixed(1))
+            set({ ...p, boost_min: next, boost_max: Math.max(hi, next) })
+          }}
+          hint={hintForValue(lo)}
+        />
+        <Slider
+          label="Maximum replay boost"
+          value={hi}
+          min={0.1} max={12} step={0.1}
+          onChange={v => {
+            const next = parseFloat(Number(v).toFixed(1))
+            set({ ...p, boost_max: next, boost_min: Math.min(lo, next) })
+          }}
+          hint={hintForValue(hi)}
         />
         <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
         <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-          Replay boost is calculated from deliberate artist returns within 7 days — passive listening doesn't count. Requires skip/replay tracking to have run at least once.
+          Replay boost is calculated from deliberate artist returns within 7 days — passive listening doesn't count. Set a low max (e.g. 2.0) to surface mildly-replayed artists while excluding your current obsessions. Requires skip/replay tracking to have run at least once.
         </p>
       </div>
     )

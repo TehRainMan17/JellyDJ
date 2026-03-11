@@ -1,3 +1,4 @@
+
 /**
  * JobProgress — universal progress panel for all background jobs.
  *
@@ -6,10 +7,10 @@
  *
  * Props (all optional — pass what the parent has from useJobStatus):
  *   indexStatus    enrichStatus   discoverStatus
- *   cacheStatus    playlistStatus downloadStatus
+ *   cacheStatus    enrichStatus discoverStatus downloadStatus
  */
 import { useState, useEffect, useRef } from 'react'
-import { Database, Sparkles, Star, Telescope, Music2, Download } from 'lucide-react'
+import { Database, Sparkles, Star, Telescope, Download } from 'lucide-react'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -199,14 +200,6 @@ const JOB_ROWS = [
     getDetail: s => s?.detail || s?.phase || null,
   },
   {
-    key: 'playlist',
-    icon: Music2,
-    label: 'Playlist Generation',
-    color: '#f78166',
-    getPct: s => Math.max(0, Math.min(100, s?.progress_pct ?? 0)),
-    getDetail: s => s?.detail || s?.phase || null,
-  },
-  {
     key: 'download',
     icon: Download,
     label: 'Auto-Download',
@@ -223,7 +216,6 @@ export default function JobProgress({
   cacheStatus,
   enrichStatus,
   discoverStatus,
-  playlistStatus,
   downloadStatus,
 }) {
   injectPulseStyle()
@@ -233,7 +225,6 @@ export default function JobProgress({
     cache:    cacheStatus,
     enrich:   enrichStatus,
     discover: discoverStatus,
-    playlist: playlistStatus,
     download: downloadStatus,
   }
 

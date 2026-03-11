@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback } from 'react'
 import {
   Activity, Music2, Telescope, CheckCircle2, XCircle, Loader2,
@@ -636,7 +637,7 @@ export default function Dashboard() {
   const [indexing, setIndexing]     = useState(false)
   const { isAdmin } = useAuth()
 
-  const { indexStatus, cacheStatus, enrichStatus, discoverStatus, playlistStatus, downloadStatus, startPolling } = useJobStatus((finalState) => {
+  const { indexStatus, cacheStatus, enrichStatus, discoverStatus, downloadStatus, startPolling } = useJobStatus((finalState) => {
     setIndexing(false)
     fetchAll()
   })
@@ -694,7 +695,6 @@ export default function Dashboard() {
         cacheStatus={cacheStatus}
         enrichStatus={enrichStatus}
         discoverStatus={discoverStatus}
-        playlistStatus={playlistStatus}
         downloadStatus={downloadStatus}
       />
 

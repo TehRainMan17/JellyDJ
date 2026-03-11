@@ -1,5 +1,6 @@
+
 import { useState, useEffect } from 'react'
-import { Clock, RefreshCw, Loader2, Save, Play, Music2, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp, Trash2 } from 'lucide-react'
+import { Clock, RefreshCw, Loader2, Save, Play, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp, Trash2 } from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
 // Python's datetime.utcnow().isoformat() produces "2026-02-24T14:30:00" with no
@@ -94,7 +95,7 @@ function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, ena
 }
 
 export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
-  // jobStatuses: { indexStatus, cacheStatus, enrichStatus, discoverStatus, playlistStatus, downloadStatus }
+  // jobStatuses: { indexStatus, cacheStatus, enrichStatus, discoverStatus, downloadStatus }
   // onTrigger: () => void — call this after any trigger POST so the parent re-starts polling
   const enrichStatus = jobStatuses.enrichStatus
 
@@ -109,9 +110,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [discEnabled,  setDiscEnabled]    = useState(true)
   const [discInterval, setDiscInterval]   = useState(24)
   const [discItems,    setDiscItems]      = useState(10)
-  // Playlists
-  const [plEnabled,  setPlEnabled]        = useState(true)
-  const [plInterval, setPlInterval]       = useState(24)
   // Auto-download
   const [autoEnabled,   setAutoEnabled]   = useState(false)
   const [autoMax,       setAutoMax]       = useState(1)
@@ -128,7 +126,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   // Trigger loading states (button spinner while POST is in-flight)
   const [trigIndex,     setTrigIndex]     = useState(false)
   const [trigDisc,      setTrigDisc]      = useState(false)
-  const [trigPl,        setTrigPl]        = useState(false)
   const [trigAuto,      setTrigAuto]      = useState(false)
   const [trigEnrich,    setTrigEnrich]    = useState(false)
   const [trigPopCache,  setTrigPopCache]  = useState(false)
@@ -141,8 +138,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       setDiscEnabled(!!d.discovery_refresh_enabled)
       setDiscInterval(d.discovery_refresh_interval_hours ?? 24)
       setDiscItems(d.discovery_items_per_run ?? 10)
-      setPlEnabled(!!d.playlist_regen_enabled)
-      setPlInterval(d.playlist_regen_interval_hours ?? 24)
       setAutoEnabled(!!d.auto_download_enabled)
       setAutoMax(d.auto_download_max_per_run ?? 1)
       setAutoCooldown(d.auto_download_cooldown_days ?? 7)
@@ -181,8 +176,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
           discovery_refresh_enabled: discEnabled,
           discovery_refresh_interval_hours: discInterval,
           discovery_items_per_run: discItems,
-          playlist_regen_enabled: plEnabled,
-          playlist_regen_interval_hours: plInterval,
           auto_download_enabled: autoEnabled,
           auto_download_max_per_run: autoMax,
           auto_download_cooldown_days: autoCooldown,
@@ -250,17 +243,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
           <Slider label="Max new items per user per run" value={discItems} onChange={setDiscItems}
                   min={1} max={30} unit="" markers={['1','10','30']} />
         </div>
-      </TaskCard>
-
-      {/* Playlists */}
-      <TaskCard icon={Music2} color="#f78166" title="Playlist Generation"
-                description="Writes updated playlists to Jellyfin for each user"
-                lastRun={s?.last_playlist_regen} nextRun={jobStatus.playlist_regen}
-                enabled={plEnabled} onToggle={setPlEnabled}
-                triggerLabel="Regenerate" triggering={trigPl}
-                onTrigger={() => trigger('/api/playlists/generate', setTrigPl)}>
-        <Slider label="Run every" value={plInterval} onChange={setPlInterval}
-                min={1} max={168} unit="h" markers={['1h','24h','1w']} />
       </TaskCard>
 
       {/* Auto-download */}

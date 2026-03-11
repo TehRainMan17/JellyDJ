@@ -1,13 +1,13 @@
+
 /**
  * useJobStatus — polls all background jobs and exposes their live state.
  *
- * Six background processes on the server, each with its own status endpoint:
- *   1. Indexer         → /api/indexer/job-status
+ * Five background processes on the server, each with its own status endpoint:
+ *   1. Indexer          → /api/indexer/job-status
  *   2. Popularity cache → /api/automation/trigger/popularity-cache/status
  *   3. Enrichment       → /api/automation/trigger/enrichment/status
  *   4. Discovery        → /api/automation/trigger/discovery/status
- *   5. Playlists        → /api/automation/trigger/playlists/status
- *   6. Auto-download    → /api/automation/trigger/auto-download/status
+ *   5. Auto-download    → /api/automation/trigger/auto-download/status
  *
  * Key behaviours:
  *   - Polling starts immediately on mount — any already-running job appears
@@ -22,7 +22,6 @@ const URLS = {
   cache:    '/api/automation/trigger/popularity-cache/status',
   enrich:   '/api/automation/trigger/enrichment/status',
   discover: '/api/automation/trigger/discovery/status',
-  playlist: '/api/automation/trigger/playlists/status',
   download: '/api/automation/trigger/auto-download/status',
 }
 const INTERVAL_MS = 2000
@@ -32,7 +31,6 @@ export function useJobStatus(onComplete) {
   const [cacheStatus,    setCacheStatus]    = useState(null)
   const [enrichStatus,   setEnrichStatus]   = useState(null)
   const [discoverStatus, setDiscoverStatus] = useState(null)
-  const [playlistStatus, setPlaylistStatus] = useState(null)
   const [downloadStatus, setDownloadStatus] = useState(null)
 
   const timerRef        = useRef(null)
@@ -49,7 +47,7 @@ export function useJobStatus(onComplete) {
       const results = await Promise.allSettled(
         Object.values(URLS).map(url => fetch(url).then(r => r.ok ? r.json() : null))
       )
-      const [ir, cr, er, dr, pr, dlr] = results.map(r =>
+      const [ir, cr, er, dr, dlr] = results.map(r =>
         r.status === 'fulfilled' ? r.value : null
       )
 
@@ -57,7 +55,6 @@ export function useJobStatus(onComplete) {
       if (cr)  setCacheStatus(cr)
       if (er)  setEnrichStatus(er)
       if (dr)  setDiscoverStatus(dr)
-      if (pr)  setPlaylistStatus(pr)
       if (dlr) setDownloadStatus(dlr)
 
       // Fire onComplete when index transitions running → idle
@@ -89,7 +86,6 @@ export function useJobStatus(onComplete) {
     cacheStatus,
     enrichStatus,
     discoverStatus,
-    playlistStatus,
     downloadStatus,
     startPolling,
     stopPolling,

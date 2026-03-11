@@ -556,13 +556,21 @@ function SkipRateFilters({ params, onChange }) {
 }
 
 function ReplayBoostFilters({ params, onChange }) {
+  const lo = parseFloat((params.boost_min ?? 0.1).toFixed(1))
+  const hi = parseFloat((params.boost_max ?? 12).toFixed(1))
   return (
     <div className="space-y-5">
       <SingleSliderWithInput
         label="Minimum replay boost"
-        value={parseFloat((params.boost_min ?? 0.1).toFixed(1))}
+        value={lo}
         min={0.1} max={12} step={0.1}
-        onChange={v => onChange({ ...params, boost_min: v })}
+        onChange={v => onChange({ ...params, boost_min: v, boost_max: Math.max(hi, v) })}
+      />
+      <SingleSliderWithInput
+        label="Maximum replay boost"
+        value={hi}
+        min={0.1} max={12} step={0.1}
+        onChange={v => onChange({ ...params, boost_max: v, boost_min: Math.min(lo, v) })}
       />
       <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
       <MaxPerArtist value={params.max_per_artist} onChange={v => onChange({ ...params, max_per_artist: v })} />
