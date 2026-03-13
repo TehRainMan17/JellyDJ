@@ -1,3 +1,4 @@
+
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react'
 
 const AuthContext = createContext(null)
@@ -76,7 +77,9 @@ export function AuthProvider({ children }) {
     })
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}))
-      throw new Error(err.detail || 'Setup login failed')
+      const detail = err.detail
+      const msg = typeof detail === 'string' ? detail : (err.error || 'Setup login failed')
+      throw new Error(msg)
     }
     const data = await resp.json()
     // No refresh token for setup sessions — access token only
@@ -91,7 +94,9 @@ export function AuthProvider({ children }) {
     })
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}))
-      throw new Error(err.detail || 'Login failed')
+      const detail = err.detail
+      const msg = typeof detail === 'string' ? detail : (err.error || 'Login failed')
+      throw new Error(msg)
     }
     const data = await resp.json()
     applyAccessToken(data.access_token)

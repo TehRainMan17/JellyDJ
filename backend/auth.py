@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Shared authentication utilities.
 
@@ -7,8 +8,14 @@ Provides:
   - FastAPI dependencies: get_current_user, require_admin
   - Permission helpers: assert_owns_template, assert_owns_playlist
 
-JWT signing key is the existing SECRET_KEY env var — the same key used by
-crypto.py for Fernet credential encryption. No new env vars are introduced.
+JWT signing uses JWT_SECRET_KEY (separate from SECRET_KEY used by crypto.py
+for Fernet credential encryption).  Keeping the two keys separate means a
+leaked JWT cannot be used to probe the encryption surface, and rotating one
+does not invalidate the other.
+
+If JWT_SECRET_KEY is unset, we fall back to SECRET_KEY so existing deployments
+keep working.  New or hardened installs should set JWT_SECRET_KEY explicitly:
+  python -c "import secrets; print(secrets.token_hex(32))"
 """
 
 import os
@@ -34,8 +41,11 @@ _bearer = HTTPBearer(auto_error=True)
 
 
 def _secret_key() -> str:
-    """Return the app secret key. Fails loudly if unset in production."""
-    return os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
+    """Return the JWT signing key.  Prefers JWT_SECRET_KEY; falls back to SECRET_KEY."""
+    return (
+        os.getenv("JWT_SECRET_KEY")
+        or os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
+    )
 
 
 # ── Token dataclass ───────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+
 """
 JellyDJ Network Graph API — v2
 
@@ -36,6 +37,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from auth import get_current_user, UserContext
 from database import get_db
 from models import ManagedUser, ArtistProfile, ArtistEnrichment, ArtistRelation, GenreProfile
 
@@ -99,6 +101,7 @@ def get_network_graph(
     username: Optional[str] = Query(None),
     limit: int = Query(80, ge=10, le=200, description="Max artist nodes to include"),
     min_affinity: float = Query(0.0, ge=0.0, le=100.0, description="Minimum affinity to include an artist"),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -304,6 +307,7 @@ def get_artist_detail(
     artist_name: str,
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
+    _: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """

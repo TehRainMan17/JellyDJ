@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+from auth import get_current_user, require_admin, UserContext
 from database import get_db, SessionLocal
 from models import AutomationSettings, SystemEvent, ManagedUser
 
@@ -123,7 +124,7 @@ def _get_or_create_settings(db: Session) -> AutomationSettings:
 # ── Settings endpoints ────────────────────────────────────────────────────────
 
 @router.get("/settings")
-def get_settings(db: Session = Depends(get_db)):
+def get_settings(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     s = _get_or_create_settings(db)
     return {
         "index_interval_hours": s.index_interval_hours,
@@ -142,7 +143,7 @@ def get_settings(db: Session = Depends(get_db)):
 
 
 @router.post("/settings")
-def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get_db)):
+def update_settings(payload: AutomationSettingsUpdate, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     s = _get_or_create_settings(db)
 
     if payload.index_interval_hours is not None:
@@ -204,7 +205,7 @@ def update_settings(payload: AutomationSettingsUpdate, db: Session = Depends(get
 # ── Manual trigger endpoints ──────────────────────────────────────────────────
 
 @router.post("/trigger/index")
-async def trigger_index(db: Session = Depends(get_db)):
+async def trigger_index(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Manually trigger a full index run immediately."""
     import threading
     from services.indexer import run_full_index, get_job_state
@@ -218,7 +219,7 @@ async def trigger_index(db: Session = Depends(get_db)):
 
 
 @router.post("/trigger/enrichment")
-async def trigger_enrichment(db: Session = Depends(get_db)):
+async def trigger_enrichment(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Manually trigger a full enrichment run (tracks + artists) immediately.
     Fetches per-song and per-artist Last.fm data: listener counts, tags, similar artists.
@@ -303,14 +304,36 @@ async def trigger_enrichment(db: Session = Depends(get_db)):
     return {"ok": True, "message": "Enrichment started in background — poll /trigger/enrichment/status"}
 
 
+def _sanitize_state(state: dict, user: UserContext) -> dict:
+    """
+    Strip the internal 'error' field from job-state dicts before returning
+    them to non-admin users.
+
+    The error field is populated with raw str(e) from Python exceptions, which
+    can contain internal hostnames, file paths, database schema details, or
+    other information that should not be disclosed to ordinary users.  Admin
+    users see the full error string so they can diagnose problems in the UI
+    without needing to read server logs.
+    """
+    out = dict(state)
+    if not user.is_admin:
+        # Replace exception detail with a generic signal.
+        # The boolean 'had_error' lets the frontend show a generic error badge
+        # without leaking the underlying message to non-admin users.
+        had_error = bool(out.get("error"))
+        out["error"] = None
+        out["had_error"] = had_error
+    return out
+
+
 @router.get("/trigger/enrichment/status")
-def enrichment_trigger_status():
+def enrichment_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the enrichment run."""
-    return dict(_enrichment_state)
+    return _sanitize_state(_enrichment_state, user)
 
 
 @router.post("/trigger/popularity-cache")
-async def trigger_popularity_cache(db: Session = Depends(get_db)):
+async def trigger_popularity_cache(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Trigger a full library popularity cache refresh.
     Runs in a background task — returns immediately, dashboard stays responsive.
@@ -338,45 +361,45 @@ async def trigger_popularity_cache(db: Session = Depends(get_db)):
 
 
 @router.get("/trigger/popularity-cache/status")
-def cache_refresh_status():
+def cache_refresh_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the cache refresh."""
     from services.indexer import get_cache_refresh_state
     state = get_cache_refresh_state()
     done = state.get("done", 0)
     total = state.get("total", 0)
     pct = round(100 * done / total) if total > 0 else 0
-    return {**state, "progress_pct": pct}
+    return {**_sanitize_state(state, user), "progress_pct": pct}
 
 
 @router.get("/trigger/discovery/status")
-def discovery_trigger_status():
+def discovery_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the discovery refresh."""
     state = dict(_discovery_state)
     done = state.get("users_done", 0)
     total = state.get("users_total", 0)
     pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
-    return {**state, "progress_pct": pct}
+    return {**_sanitize_state(state, user), "progress_pct": pct}
 
 
 @router.get("/trigger/auto-download/status")
-def download_trigger_status():
+def download_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the auto-download run."""
     state = dict(_download_state)
     sent = state.get("sent", 0)
     total = state.get("total", 0)
     pct = round(100 * sent / total) if total > 0 else (50 if state.get("running") else 0)
-    return {**state, "progress_pct": pct}
+    return {**_sanitize_state(state, user), "progress_pct": pct}
 
 
 @router.post("/trigger/discovery")
-async def trigger_discovery(db: Session = Depends(get_db)):
+async def trigger_discovery(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Manually trigger a discovery queue refresh for all enabled users."""
     asyncio.create_task(_run_discovery_refresh())
     return {"ok": True, "message": "Discovery refresh started in background"}
 
 
 @router.post("/trigger/auto-download")
-async def trigger_auto_download(db: Session = Depends(get_db)):
+async def trigger_auto_download(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Manually trigger an auto-download run — bypasses cooldown and schedule.
 
     The manual Run Now button always fires regardless of enabled state,
@@ -394,7 +417,7 @@ async def trigger_auto_download(db: Session = Depends(get_db)):
 
 
 @router.get("/auto-download-preview")
-def auto_download_preview(db: Session = Depends(get_db)):
+def auto_download_preview(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Show what the auto-downloader would pick for each user right now,
     without actually sending anything. Useful for debugging pin behaviour.
@@ -759,7 +782,7 @@ async def _run_popularity_cache_refresh():
 # ── Auto-download history ──────────────────────────────────────────────────────
 
 @router.get("/auto-download/history")
-def get_auto_download_history(limit: int = 200, db: Session = Depends(get_db)):
+def get_auto_download_history(limit: int = 200, _: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Return the most recent auto-download events from the SystemEvent log,
     newest first. Used by Settings > Auto-Download (last requested display)
@@ -788,6 +811,7 @@ def get_auto_download_history(limit: int = 200, db: Session = Depends(get_db)):
 def get_activity(
     limit: int = 50,
     event_type: Optional[str] = None,
+    _: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -811,7 +835,7 @@ def get_activity(
 
 
 @router.get("/scheduler-status")
-def scheduler_status(db: Session = Depends(get_db)):
+def scheduler_status(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return next-run times for all jobs plus current settings."""
     from scheduler import get_job_status
     jobs = get_job_status()
@@ -824,3 +848,4 @@ def scheduler_status(db: Session = Depends(get_db)):
             "discovery_refresh_interval_hours": s.discovery_refresh_interval_hours,
         }
     }
+

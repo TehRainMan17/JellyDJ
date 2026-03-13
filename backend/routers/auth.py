@@ -30,6 +30,16 @@ Setup Mode
   is_admin=True and a synthetic user_id of "jellydj-setup".
 - Refresh tokens are NOT issued for setup sessions — the setup user must
   re-authenticate each time, preventing long-lived setup credentials.
+
+Rate limiting
+─────────────
+- IP resolution prefers X-Forwarded-For (set by nginx/Traefik/Caddy in front
+  of the container) over request.client.host, which is always the proxy's
+  internal address in a docker-compose deployment.
+- Controlled by TRUSTED_PROXY_DEPTH (default 1): the number of upstream
+  proxies whose X-Forwarded-For entries to trust. Set to 0 to ignore the
+  header entirely (direct-bind deployments). Set to 2+ for multi-hop proxy
+  chains. Never trust a depth larger than your actual proxy chain.
 """
 
 from __future__ import annotations
@@ -41,10 +51,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-
+from collections import defaultdict
 from auth import (
     UserContext,
     create_access_token,
@@ -59,6 +69,76 @@ from models import ConnectionSettings, ManagedUser, RefreshToken
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# ── Simple in-process rate limiter (no external dependencies) ─────────────────
+# Tracks login attempts per IP: {ip: [timestamp, ...]}.
+# Max 10 attempts per 60-second window. Automatically clears old entries.
+_login_attempts: dict = defaultdict(list)
+_RATE_LIMIT_MAX = 10
+_RATE_LIMIT_WINDOW = 60  # seconds
+
+# How many proxy hops to trust in X-Forwarded-For.
+# In a standard docker-compose deployment there is exactly one nginx proxy
+# between the internet and the backend container, so the default of 1 is
+# correct. Override with TRUSTED_PROXY_DEPTH=0 for direct-bind deployments
+# (no reverse proxy in front) or a higher value for multi-hop chains.
+_TRUSTED_PROXY_DEPTH = int(os.getenv("TRUSTED_PROXY_DEPTH", "1"))
+
+
+def _real_ip(request: Request) -> str:
+    """
+    Return the best-guess real client IP for rate-limiting purposes.
+
+    When running behind a reverse proxy (nginx, Caddy, Traefik) the
+    direct TCP peer is always the proxy's internal docker-network address.
+    Reading request.client.host in that configuration means every client
+    shares the same "IP", collapsing the rate-limit bucket to a single
+    global counter that either allows everything or locks everyone out.
+
+    X-Forwarded-For is a comma-separated list built left-to-right as the
+    request travels through proxies:
+        X-Forwarded-For: <client>, <proxy1>, <proxy2>
+
+    With TRUSTED_PROXY_DEPTH=1 (one trusted nginx in front) we read the
+    rightmost entry minus one hop, which is the address the outermost
+    trusted proxy saw as its client. An attacker cannot spoof this entry
+    by injecting their own X-Forwarded-For header because our trusted
+    proxy appends its own observed IP to the right of whatever the client
+    sent — the injected value ends up further left and is ignored.
+
+    If the header is absent or malformed, fall back to the transport-layer
+    peer address (correct for direct-bind deployments with depth=0).
+    """
+    if _TRUSTED_PROXY_DEPTH > 0:
+        forwarded_for = request.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            # Split and strip whitespace from each hop address.
+            hops = [h.strip() for h in forwarded_for.split(",")]
+            # The genuine client IP is at index -(TRUSTED_PROXY_DEPTH).
+            # Example with depth=1 and chain "client, nginx":
+            #   hops[-1] = "nginx" (the proxy we trust appended this)
+            #   hops[-2] = "client" (what nginx saw — the real client)
+            idx = -(min(_TRUSTED_PROXY_DEPTH, len(hops)))
+            candidate = hops[idx]
+            if candidate:
+                return candidate
+
+    # Fallback: transport-layer peer (correct when no proxy is in front)
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(request: Request) -> None:
+    import time
+    ip = _real_ip(request)
+    now = time.time()
+    # Purge attempts outside the window
+    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < _RATE_LIMIT_WINDOW]
+    if len(_login_attempts[ip]) >= _RATE_LIMIT_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Please wait a minute and try again.",
+        )
+    _login_attempts[ip].append(now)
 
 # ── Jellyfin header ───────────────────────────────────────────────────────────
 
@@ -250,7 +330,7 @@ def setup_status(db: Session = Depends(get_db)):
 
 
 @router.post("/setup-login", response_model=SetupLoginResponse)
-def setup_login(body: SetupLoginRequest, db: Session = Depends(get_db)):
+def setup_login(request: Request, body: SetupLoginRequest, db: Session = Depends(get_db)):
     """
     First-time setup login using SETUP_USERNAME / SETUP_PASSWORD env vars.
 
@@ -263,6 +343,7 @@ def setup_login(body: SetupLoginRequest, db: Session = Depends(get_db)):
       SETUP_ALLOW_AFTER_CONFIGURE=true, which is not recommended for
       internet-facing instances).
     """
+    _check_rate_limit(request)
     creds = _setup_credentials()
     if creds is None:
         raise HTTPException(
@@ -303,7 +384,7 @@ def setup_login(body: SetupLoginRequest, db: Session = Depends(get_db)):
     )
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest, db: Session = Depends(get_db)):
+async def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
     """
     Authenticate against Jellyfin and issue access + refresh tokens.
 
@@ -314,6 +395,7 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
       4. Persist RefreshToken (hashed) with encrypted Jellyfin token
       5. Return access JWT + opaque refresh token
     """
+    _check_rate_limit(request)
     base_url = _jellyfin_url(db)
 
     try:

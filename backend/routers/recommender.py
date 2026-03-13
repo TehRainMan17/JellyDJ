@@ -1,7 +1,9 @@
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional
 
+from auth import get_current_user, UserContext
 from database import get_db
 from services.recommender import (
     recommend_library_tracks,
@@ -14,7 +16,7 @@ router = APIRouter(prefix="/api/recommender", tags=["recommender"])
 
 
 @router.get("/presets")
-def list_presets():
+def list_presets(_: UserContext = Depends(get_current_user)):
     """Return all available playlist weight presets."""
     return get_weight_presets()
 
@@ -24,12 +26,16 @@ def preview_library_recommendations(
     user_id: str,
     playlist_type: str = Query(default="for_you"),
     limit: int = Query(default=30, ge=5, le=100),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Preview the top scored library tracks for a user.
     Useful for testing the engine before Module 7 writes playlists to Jellyfin.
     """
+    if not current_user.is_admin and user_id != current_user.user_id:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(403, "You can only view your own data.")
     if playlist_type not in WEIGHT_PRESETS:
         raise HTTPException(400, f"Unknown playlist_type '{playlist_type}'. Valid: {list(WEIGHT_PRESETS.keys())}")
 
@@ -63,12 +69,16 @@ def preview_library_recommendations(
 def preview_new_albums(
     user_id: str,
     limit: int = Query(default=20, ge=5, le=100),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Preview new album recommendations for a user.
     These feed the Discovery Queue in Module 6.
     """
+    if not current_user.is_admin and user_id != current_user.user_id:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(403, "You can only view your own data.")
     albums = recommend_new_albums(user_id, limit, db)
     if not albums:
         raise HTTPException(
@@ -97,7 +107,7 @@ def preview_new_albums(
 
 
 @router.get("/users")
-def list_recommendable_users(db: Session = Depends(get_db)):
+def list_recommendable_users(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return all enabled users that have indexed data — for UI dropdowns."""
     from models import ManagedUser, UserSyncStatus
     users = (
@@ -122,6 +132,7 @@ def list_recommendable_users(db: Session = Depends(get_db)):
 def preview_new_albums_by_username(
     username: str,
     limit: int = Query(default=20, ge=5, le=100),
+    _: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -143,6 +154,7 @@ def preview_library_by_username(
     username: str,
     playlist_type: str = Query(default="for_you"),
     limit: int = Query(default=30, ge=5, le=100),
+    _: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Convenience endpoint — look up by username instead of UUID."""

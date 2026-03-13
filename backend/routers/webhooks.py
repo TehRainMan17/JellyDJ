@@ -1,3 +1,4 @@
+
 """
 JellyDJ Webhook receiver — v2.1
 
@@ -66,6 +67,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import secrets
 import time
 from datetime import datetime
 from typing import Optional
@@ -73,11 +76,73 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Request, HTTPException
 from sqlalchemy.orm import Session
 
+from auth import require_admin, UserContext
 from database import get_db
 from models import PlaybackEvent, SkipPenalty, ManagedUser
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+
+
+def _verify_webhook_secret(request: Request) -> None:
+    """
+    Enforce the WEBHOOK_SECRET shared secret on every inbound webhook request.
+
+    Default behaviour — WEBHOOK_SECRET is not set:
+      Requests are REJECTED with HTTP 401.  An unauthenticated webhook endpoint
+      allows any internet host to inject playback events, corrupt listening
+      history, and manipulate skip counts and cooldowns.
+
+    To configure authentication (recommended for all deployments):
+      1. Generate a secret:
+           python -c "import secrets; print(secrets.token_urlsafe(32))"
+      2. Add to .env:
+           WEBHOOK_SECRET=<value>
+      3. In Jellyfin → Webhook plugin → add a header:
+           X-Jellyfin-Token: <same value>
+
+    To opt out for a fully private LAN deployment where you have decided no
+    secret is needed, set this in .env:
+      WEBHOOK_SECRET_REQUIRED=false
+
+    Token lookup (for compatibility across Jellyfin plugin versions):
+      1. X-Jellyfin-Token request header  (preferred)
+      2. ?token= query parameter           (fallback for older plugin versions)
+    """
+    expected = os.getenv("WEBHOOK_SECRET", "").strip()
+
+    if not expected:
+        # No secret set — block unless the operator has explicitly opted out.
+        required_env = os.getenv("WEBHOOK_SECRET_REQUIRED", "true").strip().lower()
+        if required_env not in ("false", "0", "no"):
+            log.warning(
+                "Webhook request blocked: WEBHOOK_SECRET is not configured. "
+                "Set WEBHOOK_SECRET in .env, or set WEBHOOK_SECRET_REQUIRED=false "
+                "to allow unauthenticated webhooks on a private LAN."
+            )
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Webhook authentication is not configured. "
+                    "Set WEBHOOK_SECRET in your .env, then add the same value "
+                    "as the X-Jellyfin-Token header in the Jellyfin Webhook plugin. "
+                    "For private LAN installs without a secret, set "
+                    "WEBHOOK_SECRET_REQUIRED=false."
+                ),
+            )
+        log.debug("Webhook received; secret check skipped (WEBHOOK_SECRET_REQUIRED=false)")
+        return
+
+    provided = (
+        request.headers.get("X-Jellyfin-Token", "")
+        or request.query_params.get("token", "")
+    )
+    if not secrets.compare_digest(provided.encode(), expected.encode()):
+        log.warning(
+            "Webhook rejected — bad or missing secret from %s",
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 # ── Skip detection thresholds ────────────────────────────────────────────────
 
@@ -571,6 +636,7 @@ def handle_stop(body: dict, db: Session):
 
 @router.post("/jellyfin")
 async def jellyfin_webhook(request: Request, db: Session = Depends(get_db)):
+    _verify_webhook_secret(request)
     try:
         body = json.loads(await request.body())
     except Exception:
@@ -606,7 +672,7 @@ async def jellyfin_webhook(request: Request, db: Session = Depends(get_db)):
 _debug_captures: list = []
 
 @router.post("/jellyfin/debug")
-async def debug_capture(request: Request):
+async def debug_capture(request: Request, _: UserContext = Depends(require_admin)):
     raw  = await request.body()
     body = {}
     try:
@@ -645,12 +711,12 @@ async def debug_capture(request: Request):
 
 
 @router.get("/jellyfin/debug")
-async def get_debug():
+async def get_debug(_: UserContext = Depends(require_admin)):
     return {"count": len(_debug_captures), "captures": _debug_captures}
 
 
 @router.get("/pending-starts")
-def pending_starts():
+def pending_starts(_: UserContext = Depends(require_admin)):
     now = time.time()
     return {
         k: {
@@ -663,7 +729,7 @@ def pending_starts():
 
 
 @router.get("/pending-skips")
-def pending_skips_diagnostic():
+def pending_skips_diagnostic(_: UserContext = Depends(require_admin)):
     now = time.time()
     return {
         uid: {
@@ -678,7 +744,7 @@ def pending_skips_diagnostic():
 
 
 @router.get("/managed-users")
-def managed_users_diagnostic(db: Session = Depends(get_db)):
+def managed_users_diagnostic(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     from models import PlaybackEvent, SkipPenalty
     from sqlalchemy import desc
 
@@ -746,7 +812,7 @@ def managed_users_diagnostic(db: Session = Depends(get_db)):
 
 
 @router.get("/cooldowns/{user_id}")
-def get_cooldowns(user_id: str, db: Session = Depends(get_db)):
+def get_cooldowns(user_id: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     from models import TrackCooldown
     rows = (
         db.query(TrackCooldown)
@@ -773,11 +839,31 @@ def get_cooldowns(user_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/setup-guide")
-def setup_guide(request: Request):
+def setup_guide(request: Request, _: UserContext = Depends(require_admin)):
+    """
+    Return webhook configuration instructions for the admin setup UI.
+    Requires admin auth — the webhook URL and secret status are internal details.
+    """
     host = request.headers.get("host", "localhost:7879")
     url  = f"http://{host}/api/webhooks/jellyfin"
+    secret_configured = bool(os.getenv("WEBHOOK_SECRET", "").strip())
+    secret_required   = os.getenv("WEBHOOK_SECRET_REQUIRED", "true").strip().lower()                         not in ("false", "0", "no")
+    step7 = (
+        "7. Add a header — Name: X-Jellyfin-Token  Value: <your WEBHOOK_SECRET>"
+        if secret_configured
+        else (
+            "7. WARNING: WEBHOOK_SECRET is not set — webhooks are currently BLOCKED. "
+            "Set WEBHOOK_SECRET in .env and add it as the X-Jellyfin-Token header."
+            if secret_required
+            else
+            "7. No secret configured (WEBHOOK_SECRET_REQUIRED=false) — "
+            "webhooks accepted from any source. Recommended for private LAN only."
+        )
+    )
     return {
         "webhook_url": url,
+        "secret_configured": secret_configured,
+        "secret_required": secret_required,
         "instructions": [
             "1. Jellyfin → Dashboard → Plugins → Webhook",
             "2. Click 'Add Generic Destination'",
@@ -785,7 +871,7 @@ def setup_guide(request: Request):
             "4. Request Type: POST",
             "5. Notification Types: enable 'Playback Start', 'Playback Progress', AND 'Playback Stop'",
             "6. Item Type: Songs",
-            "7. Send all fields — Save",
+            step7,
         ],
         "skip_threshold":           f"{SKIP_THRESHOLD:.0%}",
         "skip_confirm_window_secs": SKIP_CONFIRM_SECS,
@@ -794,7 +880,7 @@ def setup_guide(request: Request):
 
 
 @router.get("/stats/{user_id}")
-def skip_stats(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
+def skip_stats(user_id: str, limit: int = 50, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     rows = (
         db.query(SkipPenalty)
         .filter_by(user_id=user_id)
@@ -824,7 +910,7 @@ def skip_stats(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
 
 
 @router.get("/recent/{user_id}")
-def recent_events(user_id: str, limit: int = 20, db: Session = Depends(get_db)):
+def recent_events(user_id: str, limit: int = 20, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     rows = (
         db.query(PlaybackEvent)
         .filter_by(user_id=user_id)
@@ -846,7 +932,7 @@ def recent_events(user_id: str, limit: int = 20, db: Session = Depends(get_db)):
 
 
 @router.delete("/penalties/{user_id}")
-def clear_penalties(user_id: str, db: Session = Depends(get_db)):
+def clear_penalties(user_id: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     pc = db.query(SkipPenalty).filter_by(user_id=user_id).delete()
     ec = db.query(PlaybackEvent).filter_by(user_id=user_id).delete()
     db.commit()

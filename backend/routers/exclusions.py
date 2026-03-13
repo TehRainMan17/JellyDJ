@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Album Exclusions router
 
@@ -21,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from auth import require_admin, UserContext
 from crypto import decrypt
 from database import get_db
 from models import ConnectionSettings, ExcludedAlbum
@@ -64,7 +66,7 @@ class AddExclusionRequest(BaseModel):
 # ── List ──────────────────────────────────────────────────────────────────────
 
 @router.get("/albums")
-def list_exclusions(db: Session = Depends(get_db)):
+def list_exclusions(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(ExcludedAlbum).order_by(ExcludedAlbum.excluded_at.desc()).all()
     return [
         {
@@ -84,7 +86,7 @@ def list_exclusions(db: Session = Depends(get_db)):
 # ── Add ───────────────────────────────────────────────────────────────────────
 
 @router.post("/albums")
-def add_exclusion(req: AddExclusionRequest, db: Session = Depends(get_db)):
+def add_exclusion(req: AddExclusionRequest, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     existing = db.query(ExcludedAlbum).filter_by(
         jellyfin_album_id=req.jellyfin_album_id
     ).first()
@@ -117,7 +119,7 @@ def add_exclusion(req: AddExclusionRequest, db: Session = Depends(get_db)):
 # ── Remove ────────────────────────────────────────────────────────────────────
 
 @router.delete("/albums/{exclusion_id}")
-def remove_exclusion(exclusion_id: int, db: Session = Depends(get_db)):
+def remove_exclusion(exclusion_id: int, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     row = db.query(ExcludedAlbum).filter_by(id=exclusion_id).first()
     if not row:
         raise HTTPException(404, "Exclusion not found")
@@ -133,6 +135,7 @@ def remove_exclusion(exclusion_id: int, db: Session = Depends(get_db)):
 @router.get("/search")
 async def search_albums(
     q: str = Query(..., min_length=1),
+    _: UserContext = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Search your Jellyfin library for albums by name or artist."""

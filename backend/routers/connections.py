@@ -6,6 +6,10 @@ Includes a 60-second in-memory cache for GET /jellyfin and GET /lidarr so that
 navigating back to the Dashboard doesn't fire live HTTP checks every time.
 The cache is invalidated when credentials are saved or a /test endpoint is called.
 """
+import ipaddress
+import socket
+import urllib.parse
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -14,6 +18,7 @@ from typing import Optional
 import httpx
 import time
 
+from auth import require_admin, get_current_user, UserContext
 from database import get_db
 from models import ConnectionSettings, ManagedUser
 from crypto import encrypt, decrypt
@@ -78,10 +83,104 @@ def _safe_url(url: str) -> str:
     return url.rstrip("/")
 
 
+# ── SSRF protection ────────────────────────────────────────────────────────────
+# IP networks that must never be the target of a server-side HTTP request.
+# Covers loopback, RFC-1918 private ranges, link-local (IMDS on all major
+# cloud providers lives at 169.254.169.254), and unspecified addresses.
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),    # IPv4 loopback
+    ipaddress.ip_network("::1/128"),         # IPv6 loopback
+    ipaddress.ip_network("10.0.0.0/8"),      # RFC-1918
+    ipaddress.ip_network("172.16.0.0/12"),   # RFC-1918
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC-1918
+    ipaddress.ip_network("fc00::/7"),        # IPv6 unique-local
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-local / cloud IMDS
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+    ipaddress.ip_network("0.0.0.0/8"),       # Unspecified
+    ipaddress.ip_network("::/128"),          # IPv6 unspecified
+]
+
+
+def _ip_is_blocked(addr: str) -> bool:
+    """Return True if addr falls in any blocked network."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return True  # unparseable → block
+    return any(ip in net for net in _BLOCKED_NETWORKS)
+
+
+def _validate_service_url(url: str, field_name: str = "URL") -> str:
+    """
+    Validate a user-supplied service base URL for SSRF safety.
+
+    Raises HTTP 422 if:
+      - The URL is empty or has no scheme
+      - The scheme is not http or https
+      - The hostname resolves to any blocked IP range (loopback, RFC-1918,
+        link-local, cloud metadata endpoint at 169.254.169.254, etc.)
+      - The hostname cannot be resolved at all
+
+    Returns the URL with trailing slash stripped, ready to store.
+
+    The test endpoints (POST /jellyfin/test, POST /lidarr/test) read the URL
+    from the database, so they are automatically covered — only a URL that
+    passed this check on save can ever be used in an outbound request.
+
+    DNS rebinding note: resolution happens at save time under admin auth.
+    This stops the common case (typing a private IP directly) and raises the
+    bar for an attacker who would need to control the DNS server for the
+    target hostname to bypass the check. Defence-in-depth, not a complete
+    guarantee against a targeted DNS rebinding attack.
+    """
+    url = url.strip().rstrip("/")
+    if not url:
+        raise HTTPException(422, f"{field_name} must not be empty.")
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        raise HTTPException(422, f"{field_name} is not a valid URL.")
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            422,
+            f"{field_name} must start with http:// or https:// "
+            f"(received scheme: {scheme!r}).",
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(422, f"{field_name} is missing a hostname.")
+
+    # Resolve hostname — getaddrinfo gives both A and AAAA records and handles
+    # bracket-wrapped IPv6 literals correctly.
+    try:
+        results = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise HTTPException(
+            422,
+            f"{field_name} hostname {hostname!r} could not be resolved ({exc}). "
+            "Check that the address is correct and reachable from this server.",
+        )
+
+    for r in results:
+        ip = r[4][0]
+        if _ip_is_blocked(ip):
+            raise HTTPException(
+                422,
+                f"{field_name} resolves to a private or reserved address ({ip}). "
+                "Only publicly routable addresses are allowed here.",
+            )
+
+    return url
+
+
 # ── Jellyfin endpoints ────────────────────────────────────────────────────────
 
 @router.get("/jellyfin", response_model=ConnectionResponse)
-def get_jellyfin(db: Session = Depends(get_db)):
+def get_jellyfin(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "jellyfin")
 
     # Return cached status if fresh
@@ -99,9 +198,9 @@ def get_jellyfin(db: Session = Depends(get_db)):
 
 
 @router.post("/jellyfin")
-def save_jellyfin(payload: ConnectionPayload, db: Session = Depends(get_db)):
+def save_jellyfin(payload: ConnectionPayload, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "jellyfin")
-    obj.base_url = _safe_url(payload.base_url)
+    obj.base_url = _validate_service_url(payload.base_url, "Jellyfin URL")
     obj.api_key_encrypted = encrypt(payload.api_key)
     obj.is_connected = False  # reset until next test
     obj.updated_at = datetime.utcnow()
@@ -111,7 +210,7 @@ def save_jellyfin(payload: ConnectionPayload, db: Session = Depends(get_db)):
 
 
 @router.post("/jellyfin/test")
-async def test_jellyfin(db: Session = Depends(get_db)):
+async def test_jellyfin(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "jellyfin")
     if not obj.base_url or not obj.api_key_encrypted:
         raise HTTPException(400, "Jellyfin URL and API key must be saved first.")
@@ -138,7 +237,7 @@ async def test_jellyfin(db: Session = Depends(get_db)):
 
 
 @router.get("/jellyfin/users/tracked")
-def get_tracked_users(db: Session = Depends(get_db)):
+def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Return all users who have activated JellyDJ (pushed at least one playlist).
     Used by the admin Connections page to show who has data and offer a delete option.
@@ -156,7 +255,7 @@ def get_tracked_users(db: Session = Depends(get_db)):
 
 
 @router.delete("/jellyfin/users/{jellyfin_user_id}")
-def delete_user_data(jellyfin_user_id: str, db: Session = Depends(get_db)):
+def delete_user_data(jellyfin_user_id: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Wipe all JellyDJ data for a user and de-activate them.
 
@@ -229,7 +328,7 @@ def delete_user_data(jellyfin_user_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/jellyfin/users/sync")
-async def sync_managed_user_names(db: Session = Depends(get_db)):
+async def sync_managed_user_names(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Pull fresh usernames from Jellyfin and update local records."""
     obj = _get_or_create(db, "jellyfin")
     if not obj.base_url or not obj.api_key_encrypted:
@@ -257,7 +356,7 @@ async def sync_managed_user_names(db: Session = Depends(get_db)):
 # ── Lidarr endpoints ──────────────────────────────────────────────────────────
 
 @router.get("/lidarr", response_model=ConnectionResponse)
-def get_lidarr(db: Session = Depends(get_db)):
+def get_lidarr(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "lidarr")
 
     # Return cached status if fresh
@@ -275,9 +374,9 @@ def get_lidarr(db: Session = Depends(get_db)):
 
 
 @router.post("/lidarr")
-def save_lidarr(payload: ConnectionPayload, db: Session = Depends(get_db)):
+def save_lidarr(payload: ConnectionPayload, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "lidarr")
-    obj.base_url = _safe_url(payload.base_url)
+    obj.base_url = _validate_service_url(payload.base_url, "Lidarr URL")
     obj.api_key_encrypted = encrypt(payload.api_key)
     obj.is_connected = False
     obj.updated_at = datetime.utcnow()
@@ -287,7 +386,7 @@ def save_lidarr(payload: ConnectionPayload, db: Session = Depends(get_db)):
 
 
 @router.post("/lidarr/test")
-async def test_lidarr(db: Session = Depends(get_db)):
+async def test_lidarr(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "lidarr")
     if not obj.base_url or not obj.api_key_encrypted:
         raise HTTPException(400, "Lidarr URL and API key must be saved first.")

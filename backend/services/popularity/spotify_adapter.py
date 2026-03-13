@@ -1,3 +1,4 @@
+
 """
 Spotify adapter — uses spotipy (Client Credentials flow, no user auth needed).
 """

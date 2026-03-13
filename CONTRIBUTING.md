@@ -1,3 +1,4 @@
+
 # Contributing to JellyDJ
 
 Thanks for your interest in contributing! This document covers how the project is structured, how to run it locally for development, and the conventions used throughout.

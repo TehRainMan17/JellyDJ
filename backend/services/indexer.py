@@ -1,3 +1,4 @@
+
 """
 Jellyfin play history indexer.
 

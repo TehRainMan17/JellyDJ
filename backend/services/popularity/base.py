@@ -1,3 +1,4 @@
+
 """
 Base interface for all external popularity/metadata adapters.
 Every adapter must implement these four methods.

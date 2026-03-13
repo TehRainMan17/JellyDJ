@@ -1151,6 +1151,3 @@ def run_enrichment(db: Session, force: bool = False) -> dict:
         "tracks":  track_result,
         "artists": artist_result,
     }
-
-
-

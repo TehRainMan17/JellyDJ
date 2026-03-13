@@ -1,9 +1,11 @@
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
 
+from auth import require_admin, UserContext
 from database import get_db
 from models import ExternalApiSettings
 from crypto import encrypt, decrypt
@@ -59,7 +61,7 @@ class LastFmCredentials(BaseModel):
 # ── Status endpoint ───────────────────────────────────────────────────────────
 
 @router.get("/status")
-def get_status(db: Session = Depends(get_db)):
+def get_status(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Return configuration status for all external services."""
     aggregator = get_aggregator(db)
     statuses = aggregator.adapter_status()
@@ -90,14 +92,14 @@ def get_status(db: Session = Depends(get_db)):
 # ── Spotify ───────────────────────────────────────────────────────────────────
 
 @router.post("/spotify")
-def save_spotify(creds: SpotifyCredentials, db: Session = Depends(get_db)):
+def save_spotify(creds: SpotifyCredentials, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     _set_key(db, "spotify_client_id", creds.client_id)
     _set_key(db, "spotify_client_secret", creds.client_secret)
     return {"ok": True}
 
 
 @router.post("/spotify/test")
-def test_spotify(db: Session = Depends(get_db)):
+def test_spotify(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     client_id = _get_key(db, "spotify_client_id")
     client_secret = _get_key(db, "spotify_client_secret")
     if not client_id or not client_secret:
@@ -121,14 +123,14 @@ def test_spotify(db: Session = Depends(get_db)):
 # ── Last.fm ───────────────────────────────────────────────────────────────────
 
 @router.post("/lastfm")
-def save_lastfm(creds: LastFmCredentials, db: Session = Depends(get_db)):
+def save_lastfm(creds: LastFmCredentials, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     _set_key(db, "lastfm_api_key", creds.api_key)
     _set_key(db, "lastfm_api_secret", creds.api_secret)
     return {"ok": True}
 
 
 @router.post("/lastfm/test")
-def test_lastfm(db: Session = Depends(get_db)):
+def test_lastfm(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     api_key = _get_key(db, "lastfm_api_key")
     if not api_key:
         raise HTTPException(400, "Last.fm API key not saved.")
@@ -145,7 +147,7 @@ def test_lastfm(db: Session = Depends(get_db)):
 # ── MusicBrainz (no key) ──────────────────────────────────────────────────────
 
 @router.post("/musicbrainz/test")
-def test_musicbrainz():
+def test_musicbrainz(_: UserContext = Depends(require_admin)):
     try:
         import musicbrainzngs
         musicbrainzngs.set_useragent("JellyDJ", "0.1", "https://github.com/jellydj")
@@ -158,7 +160,7 @@ def test_musicbrainz():
 # ── Billboard (no key) ────────────────────────────────────────────────────────
 
 @router.post("/billboard/test")
-def test_billboard():
+def test_billboard(_: UserContext = Depends(require_admin)):
     try:
         import billboard
         chart = billboard.ChartData("hot-100")
@@ -172,7 +174,7 @@ def test_billboard():
 # ── Cache management ──────────────────────────────────────────────────────────
 
 @router.delete("/cache")
-def clear_cache(db: Session = Depends(get_db)):
+def clear_cache(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     from models import PopularityCache
     count = db.query(PopularityCache).delete()
     db.commit()
@@ -180,7 +182,7 @@ def clear_cache(db: Session = Depends(get_db)):
 
 
 @router.get("/cache/stats")
-def cache_stats(db: Session = Depends(get_db)):
+def cache_stats(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     from models import PopularityCache
     from datetime import datetime
     total = db.query(PopularityCache).count()

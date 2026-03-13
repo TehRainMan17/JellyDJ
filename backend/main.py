@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -13,7 +14,8 @@ The CORS middleware allows all origins so the React frontend (served by
 a separate Nginx container) can communicate with the backend on any port.
 """
 
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from database import engine, Base, SessionLocal
@@ -286,6 +288,31 @@ async def lifespan(app: FastAPI):
         name="Refresh token expiry cleanup",
     )
 
+    # ── Startup security warnings ─────────────────────────────────────────────
+    # Log loud warnings for unsafe configurations so they surface in docker logs
+    # from the very first boot and are hard to overlook.
+    import logging as _slog
+    _log = _slog.getLogger("jellydj.startup")
+
+    _wh_secret   = os.getenv("WEBHOOK_SECRET", "").strip()
+    _wh_required = os.getenv("WEBHOOK_SECRET_REQUIRED", "true").strip().lower()                    not in ("false", "0", "no")
+
+    if not _wh_secret and _wh_required:
+        _log.warning(
+            "SECURITY: WEBHOOK_SECRET is not set. "
+            "All webhook requests will be rejected (HTTP 401) until a secret is "
+            "configured. Set WEBHOOK_SECRET in .env and add the same value as the "
+            "X-Jellyfin-Token header in the Jellyfin Webhook plugin. "
+            "For private LAN installs, set WEBHOOK_SECRET_REQUIRED=false to allow "
+            "unauthenticated webhooks."
+        )
+    elif not _wh_secret and not _wh_required:
+        _log.warning(
+            "SECURITY: WEBHOOK_SECRET is not set and WEBHOOK_SECRET_REQUIRED=false. "
+            "The webhook endpoint accepts unauthenticated requests from any source. "
+            "Do not expose this instance directly to the internet without a secret."
+        )
+
     yield  # application handles requests here
 
     # Graceful shutdown: stop the scheduler without blocking on running jobs
@@ -301,13 +328,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Open CORS policy — the React frontend is served by a separate Nginx container
-# and may run on a different port. For self-hosted deployments this is safe.
-# If you expose JellyDJ to the internet, restrict allow_origins to your domain.
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# JellyDJ uses Authorization: Bearer tokens, not cookies — allow_credentials
+# must be False when allow_origins=["*"].  Combining credentials=True with a
+# wildcard origin is a known exploit that lets any website make credentialed
+# cross-origin requests as the logged-in user.
+#
+# To restrict to specific origins (recommended for internet-facing installs):
+#   CORS_ORIGINS=https://jellydj.yourdomain.com   (comma-separated for multiple)
+_raw = os.getenv("CORS_ORIGINS", "")
+_origins = [o.strip() for o in _raw.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_origins,
+    allow_credentials=False,   # safe: we use Bearer tokens, not cookies
     allow_methods=["*"],
     allow_headers=["*"],
 )

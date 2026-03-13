@@ -1,3 +1,4 @@
+
 """
 JellyDJ Playlist Writer
 
@@ -191,5 +192,3 @@ async def _get_admin_user_id(base_url: str, api_key: str) -> Optional[str]:
         # Prefer admin users, fall back to first user
         admin = next((u for u in users if u.get("Policy", {}).get("IsAdministrator")), None)
         return (admin or users[0])["Id"] if users else None
-
-

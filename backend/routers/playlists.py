@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from auth import get_current_user, UserContext
 from database import get_db
 from models import PlaylistRun, PlaylistRunItem, ManagedUser, UserSyncStatus
 
@@ -17,7 +18,7 @@ router = APIRouter(prefix="/api/playlists", tags=["playlists"])
 # ── Run History ───────────────────────────────────────────────────────────────
 
 @router.get("/runs")
-def list_runs(limit: int = Query(default=20, le=100), db: Session = Depends(get_db)):
+def list_runs(limit: int = Query(default=20, le=100), _: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return recent playlist push runs."""
     runs = (
         db.query(PlaylistRun)
@@ -44,7 +45,7 @@ def list_runs(limit: int = Query(default=20, le=100), db: Session = Depends(get_
 
 
 @router.get("/runs/{run_id}")
-def get_run_detail(run_id: int, db: Session = Depends(get_db)):
+def get_run_detail(run_id: int, _: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return full detail for a single run including per-playlist results."""
     run = db.query(PlaylistRun).filter_by(id=run_id).first()
     if not run:
@@ -80,7 +81,7 @@ def get_run_detail(run_id: int, db: Session = Depends(get_db)):
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 @router.get("/users")
-def get_users_for_generation(db: Session = Depends(get_db)):
+def get_users_for_generation(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Return all enabled managed users with readiness status.
     New users (never indexed) appear with ready=False instead of being hidden.

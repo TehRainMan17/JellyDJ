@@ -1,3 +1,4 @@
+
 """
 Billboard adapter — uses billboard.py. No API key required.
 Scrapes Billboard chart data.

@@ -1,3 +1,4 @@
+
 """
 JellyDJ Insights router — v3
 
@@ -18,7 +19,7 @@ from sqlalchemy import desc, asc, func
 from typing import Optional
 from datetime import datetime
 
-from auth import UserContext, get_current_user
+from auth import UserContext, get_current_user, require_admin
 from database import get_db
 from models import TrackScore, ArtistProfile, GenreProfile, ManagedUser, Play, SkipPenalty
 
@@ -443,9 +444,11 @@ def get_artists(
 def get_genres(
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
     rows = db.query(GenreProfile).filter_by(user_id=uid)\
              .order_by(desc(GenreProfile.affinity_score)).all()
     return [
@@ -466,12 +469,14 @@ def get_cooldowns(
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     status: str = Query("all", description="all|active|expired|permanent"),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Browse all cooldowns for a user — active, historical, and permanent dislikes."""
     from models import TrackCooldown
 
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
     now = datetime.utcnow()
 
     q = db.query(TrackCooldown).filter_by(user_id=uid)
@@ -511,12 +516,14 @@ def get_replay_signals(
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     limit: int = Query(50, ge=10, le=200),
+    current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Show recent voluntary replay signals — the high-value preference indicators."""
     from models import UserReplaySignal
 
     uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
     rows = (
         db.query(UserReplaySignal)
         .filter_by(user_id=uid)
@@ -539,7 +546,7 @@ def get_replay_signals(
 
 
 @router.get("/enrichment/status")
-def get_enrichment_status(db: Session = Depends(get_db)):
+def get_enrichment_status(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Library-wide enrichment progress."""
     from models import LibraryTrack, TrackEnrichment, ArtistEnrichment, ArtistRelation
     from datetime import datetime
@@ -719,7 +726,7 @@ def get_summary(
 
 
 @router.get("/holiday")
-def get_holiday_summary(db: Session = Depends(get_db)):
+def get_holiday_summary(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     from models import LibraryTrack
     from services.holiday import is_in_season, HOLIDAY_RULES
     from datetime import date
@@ -771,6 +778,7 @@ def holiday_debug(
     sample_artist: Optional[str] = Query(None, description="Artist name to check, e.g. 'Mariah Carey'"),
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
+    _: UserContext = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     from models import LibraryTrack
@@ -926,6 +934,7 @@ def holiday_debug(
 @router.get("/debug/jellyfin-track")
 async def debug_jellyfin_track(
     track_name: str,
+    _: UserContext = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """

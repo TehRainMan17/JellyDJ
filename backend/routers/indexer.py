@@ -1,8 +1,10 @@
+
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime
 
+from auth import get_current_user, require_admin, UserContext
 from database import get_db
 from models import IndexerSettings, UserSyncStatus, Play, UserTasteProfile
 
@@ -28,7 +30,7 @@ def _get_or_create_settings(db: Session) -> IndexerSettings:
 
 
 @router.get("/settings")
-def get_settings(db: Session = Depends(get_db)):
+def get_settings(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     row = _get_or_create_settings(db)
     return {
         "index_interval_hours": row.index_interval_hours,
@@ -37,7 +39,7 @@ def get_settings(db: Session = Depends(get_db)):
 
 
 @router.post("/settings")
-def update_settings(payload: IndexerSettingsUpdate, db: Session = Depends(get_db)):
+def update_settings(payload: IndexerSettingsUpdate, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     if not (1 <= payload.index_interval_hours <= 168):
         raise HTTPException(400, "Interval must be between 1 and 168 hours.")
     row = _get_or_create_settings(db)
@@ -55,7 +57,7 @@ def update_settings(payload: IndexerSettingsUpdate, db: Session = Depends(get_db
 # ── Manual trigger ────────────────────────────────────────────────────────────
 
 @router.post("/run-now")
-async def run_now(background_tasks: BackgroundTasks):
+async def run_now(background_tasks: BackgroundTasks, _: UserContext = Depends(require_admin)):
     """Trigger a full index run immediately (non-blocking)."""
     from scheduler import trigger_index_now
     background_tasks.add_task(trigger_index_now)
@@ -65,7 +67,7 @@ async def run_now(background_tasks: BackgroundTasks):
 # ── Status / dashboard data ───────────────────────────────────────────────────
 
 @router.get("/status")
-def get_status(db: Session = Depends(get_db)):
+def get_status(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Return per-user sync status for the dashboard widget.
     Always returns ALL enabled managed users — new users show as 'never'
@@ -93,7 +95,7 @@ def get_status(db: Session = Depends(get_db)):
 
 
 @router.get("/job-status")
-def job_status():
+def job_status(_: UserContext = Depends(get_current_user)):
     """
     Lightweight polling endpoint for the frontend.
     Returns current indexer run state: phase, detail, percent complete.
@@ -104,7 +106,7 @@ def job_status():
 
 
 @router.get("/scheduler")
-def get_scheduler_status():
+def get_scheduler_status(_: UserContext = Depends(get_current_user)):
     """Return next-run times for all scheduled jobs."""
     try:
         from scheduler import get_job_status
@@ -116,7 +118,7 @@ def get_scheduler_status():
 # ── Taste profile inspection (useful for debugging Module 5) ──────────────────
 
 @router.get("/taste-profile/{user_id}")
-def get_taste_profile(user_id: str, limit: int = 50, db: Session = Depends(get_db)):
+def get_taste_profile(user_id: str, limit: int = 50, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Return the top affinity scores for a user — artists and genres separately."""
     rows = db.query(UserTasteProfile).filter_by(user_id=user_id).all()
 
@@ -151,7 +153,7 @@ def get_taste_profile(user_id: str, limit: int = 50, db: Session = Depends(get_d
 # ── Module 8a: Library scan + scoring endpoints ───────────────────────────────
 
 @router.post("/library-scan")
-async def trigger_library_scan(db: Session = Depends(get_db)):
+async def trigger_library_scan(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Trigger a full library scan (all Jellyfin audio, played or not)."""
     from services.library_scanner import run_library_scan
     result = await run_library_scan(db)
@@ -161,14 +163,14 @@ async def trigger_library_scan(db: Session = Depends(get_db)):
 
 
 @router.get("/library-stats")
-def library_stats(db: Session = Depends(get_db)):
+def library_stats(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return library size stats for the dashboard."""
     from services.library_scanner import get_library_stats
     return get_library_stats(db)
 
 
 @router.post("/full-scan")
-async def trigger_full_scan(db: Session = Depends(get_db)):
+async def trigger_full_scan(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Trigger a complete rescan: library scan + play history + scoring rebuild.
     Runs in a daemon thread so the ASGI event loop is never blocked and the
@@ -192,7 +194,7 @@ async def trigger_full_scan(db: Session = Depends(get_db)):
 
 
 @router.get("/score-distribution/{user_id}")
-def score_distribution(user_id: str, db: Session = Depends(get_db)):
+def score_distribution(user_id: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Return score distribution stats for a user — useful for tuning/debugging."""
     from services.scoring_engine import get_score_distribution
     dist = get_score_distribution(db, user_id)
@@ -202,7 +204,7 @@ def score_distribution(user_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/score-distribution/by-username/{username}")
-def score_distribution_by_username(username: str, db: Session = Depends(get_db)):
+def score_distribution_by_username(username: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Score distribution by username for convenience."""
     from models import ManagedUser
     from services.scoring_engine import get_score_distribution
@@ -219,7 +221,7 @@ def score_distribution_by_username(username: str, db: Session = Depends(get_db))
 # ── Billboard Hot 100 endpoints ───────────────────────────────────────────────
 
 @router.get("/billboard")
-def get_billboard(limit: int = 5, db: Session = Depends(get_db)):
+def get_billboard(limit: int = 5, _: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Return the top N Billboard Hot 100 entries with album art and trend data.
 
@@ -359,7 +361,7 @@ def get_billboard(limit: int = 5, db: Session = Depends(get_db)):
 
 
 @router.get("/billboard/status")
-def get_billboard_status(db: Session = Depends(get_db)):
+def get_billboard_status(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return chart metadata and when it was last refreshed."""
     from models import BillboardChartEntry, AutomationSettings
     count = db.query(BillboardChartEntry).count()
@@ -379,7 +381,7 @@ def get_billboard_status(db: Session = Depends(get_db)):
 
 
 @router.post("/billboard/refresh")
-async def refresh_billboard(db: Session = Depends(get_db)):
+async def refresh_billboard(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """Manually trigger a Billboard chart refresh."""
     import threading, asyncio
     from services.indexer import sync_billboard_chart
@@ -404,7 +406,7 @@ class BillboardDownloadRequest(BaseModel):
 
 
 @router.post("/billboard/download")
-async def billboard_download(payload: BillboardDownloadRequest, db: Session = Depends(get_db)):
+async def billboard_download(payload: BillboardDownloadRequest, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
     """
     Send a Billboard chart track directly to Lidarr without needing a
     discovery queue item. Creates a temporary queue entry, sends it, then
