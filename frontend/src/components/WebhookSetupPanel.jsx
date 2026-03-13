@@ -1,5 +1,6 @@
 
 import { useState, useEffect } from 'react'
+import { apiFetch } from '../lib/api'
 import { Zap, Copy, CheckCircle2, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react'
 
 export default function WebhookSetupPanel() {
@@ -8,7 +9,7 @@ export default function WebhookSetupPanel() {
   const [copied, setCopied] = useState(false)
 
   useEffect(() => {
-    fetch('/api/webhooks/setup-guide')
+    apiFetch('/api/webhooks/setup-guide')
       .then(r => r.json())
       .then(setGuide)
       .catch(() => {})

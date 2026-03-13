@@ -1,5 +1,6 @@
 
 import { useState, useEffect } from 'react'
+import { apiFetch } from '../lib/api'
 import { Clock, RefreshCw, Loader2, Save } from 'lucide-react'
 
 export default function IndexerSettingsPanel() {
@@ -15,7 +16,7 @@ export default function IndexerSettingsPanel() {
   }
 
   useEffect(() => {
-    fetch('/api/indexer/settings')
+    apiFetch('/api/indexer/settings')
       .then(r => r.json())
       .then(data => {
         setHours(data.index_interval_hours ?? 6)
@@ -27,7 +28,7 @@ export default function IndexerSettingsPanel() {
   const handleSave = async () => {
     setSaving(true)
     try {
-      const r = await fetch('/api/indexer/settings', {
+      const r = await apiFetch('/api/indexer/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ index_interval_hours: hours }),
@@ -41,7 +42,7 @@ export default function IndexerSettingsPanel() {
   const handleRunNow = async () => {
     setRunning(true)
     try {
-      const r = await fetch('/api/indexer/run-now', { method: 'POST' })
+      const r = await apiFetch('/api/indexer/run-now', { method: 'POST' })
       const data = await r.json()
       showMsg(data.message || 'Index started in background.', true)
     } catch {

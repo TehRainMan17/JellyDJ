@@ -87,14 +87,23 @@ def _safe_url(url: str) -> str:
 # IP networks that must never be the target of a server-side HTTP request.
 # Covers loopback, RFC-1918 private ranges, link-local (IMDS on all major
 # cloud providers lives at 169.254.169.254), and unspecified addresses.
+# IP ranges that are never legitimate targets for outbound service connections.
+#
+# RFC-1918 private ranges (10.x, 172.16-31.x, 192.168.x) are intentionally
+# NOT blocked here — Jellyfin and Lidarr are almost always self-hosted on a
+# private LAN or Docker network, both of which use RFC-1918 addresses.
+# Blocking them would prevent the core use case of this application.
+#
+# What IS blocked:
+#   Loopback   — the backend should not be calling its own localhost services
+#   Link-local — 169.254.169.254 is the cloud IMDS endpoint on AWS/GCP/Azure;
+#                reaching it from a compromised admin account could leak cloud
+#                IAM credentials with account-wide blast radius
+#   Unspecified — 0.0.0.0 / :: have no valid use as service endpoints
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),    # IPv4 loopback
     ipaddress.ip_network("::1/128"),         # IPv6 loopback
-    ipaddress.ip_network("10.0.0.0/8"),      # RFC-1918
-    ipaddress.ip_network("172.16.0.0/12"),   # RFC-1918
-    ipaddress.ip_network("192.168.0.0/16"),  # RFC-1918
-    ipaddress.ip_network("fc00::/7"),        # IPv6 unique-local
-    ipaddress.ip_network("169.254.0.0/16"),  # Link-local / cloud IMDS
+    ipaddress.ip_network("169.254.0.0/16"), # Link-local / cloud IMDS (highest SSRF risk)
     ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
     ipaddress.ip_network("0.0.0.0/8"),       # Unspecified
     ipaddress.ip_network("::/128"),          # IPv6 unspecified
@@ -117,9 +126,14 @@ def _validate_service_url(url: str, field_name: str = "URL") -> str:
     Raises HTTP 422 if:
       - The URL is empty or has no scheme
       - The scheme is not http or https
-      - The hostname resolves to any blocked IP range (loopback, RFC-1918,
-        link-local, cloud metadata endpoint at 169.254.169.254, etc.)
+      - The hostname resolves to a blocked range: loopback (127.x, ::1) or
+        link-local (169.254.x.x / fe80::) which covers the cloud metadata
+        endpoint at 169.254.169.254 used by AWS, GCP, and Azure
       - The hostname cannot be resolved at all
+
+    RFC-1918 private ranges (10.x, 172.16-31.x, 192.168.x) and Docker bridge
+    networks are explicitly allowed — self-hosted Jellyfin and Lidarr instances
+    almost always live on these addresses.
 
     Returns the URL with trailing slash stripped, ready to store.
 
@@ -215,7 +229,14 @@ async def test_jellyfin(_: UserContext = Depends(require_admin), db: Session = D
     if not obj.base_url or not obj.api_key_encrypted:
         raise HTTPException(400, "Jellyfin URL and API key must be saved first.")
 
-    api_key = decrypt(obj.api_key_encrypted)
+    try:
+        api_key = decrypt(obj.api_key_encrypted)
+    except Exception:
+        raise HTTPException(
+            400,
+            "Stored Jellyfin API key could not be decrypted — SECRET_KEY changed. "
+            "Re-enter your API key on the Connections page.",
+        )
     url = f"{obj.base_url}/Users"
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -228,7 +249,6 @@ async def test_jellyfin(_: UserContext = Depends(require_admin), db: Session = D
     obj.last_tested = datetime.utcnow()
     db.commit()
 
-    # Update cache with fresh result
     _cache_put("jellyfin", ok, obj.last_tested)
 
     if not ok:
@@ -391,7 +411,14 @@ async def test_lidarr(_: UserContext = Depends(require_admin), db: Session = Dep
     if not obj.base_url or not obj.api_key_encrypted:
         raise HTTPException(400, "Lidarr URL and API key must be saved first.")
 
-    api_key = decrypt(obj.api_key_encrypted)
+    try:
+        api_key = decrypt(obj.api_key_encrypted)
+    except Exception:
+        raise HTTPException(
+            400,
+            "Stored Lidarr API key could not be decrypted — SECRET_KEY changed. "
+            "Re-enter your API key on the Connections page.",
+        )
     url = f"{obj.base_url}/api/v1/system/status"
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -404,7 +431,6 @@ async def test_lidarr(_: UserContext = Depends(require_admin), db: Session = Dep
     obj.last_tested = datetime.utcnow()
     db.commit()
 
-    # Update cache with fresh result
     _cache_put("lidarr", ok, obj.last_tested)
 
     if not ok:

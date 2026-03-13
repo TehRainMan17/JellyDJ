@@ -16,6 +16,7 @@
  *   - onComplete fires once when the INDEX job transitions running → false.
  */
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { apiFetch } from '../lib/api'
 
 const URLS = {
   index:    '/api/indexer/job-status',
@@ -45,7 +46,7 @@ export function useJobStatus(onComplete) {
   const poll = useCallback(async () => {
     try {
       const results = await Promise.allSettled(
-        Object.values(URLS).map(url => fetch(url).then(r => r.ok ? r.json() : null))
+        Object.values(URLS).map(url => apiFetch(url).then(r => r.ok ? r.json() : null))
       )
       const [ir, cr, er, dr, dlr] = results.map(r =>
         r.status === 'fulfilled' ? r.value : null

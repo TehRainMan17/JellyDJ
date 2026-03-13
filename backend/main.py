@@ -237,6 +237,72 @@ def _cleanup_expired_refresh_tokens():
         db.close()
 
 
+def _warn_if_setup_backdoor_active():
+    """
+    Emit a WARNING at startup if SETUP_ALLOW_AFTER_CONFIGURE=true is set
+    while Jellyfin is already configured in the database.
+
+    In that state, the setup credentials act as a permanent admin backdoor
+    with no expiry and no per-user DB row.  Operators often set this flag
+    during initial setup and forget to remove it.  The warning appears in
+    `docker logs` on every restart so it cannot be silently forgotten.
+
+    This is advisory only — the app still starts normally.  Forcing a hard
+    exit here would lock operators out of a running instance if they forget
+    to clean up the flag, which is worse than the risk being warned about.
+    """
+    import logging as _sl
+    _log = _sl.getLogger("jellydj.setup")
+
+    allow_after = os.getenv("SETUP_ALLOW_AFTER_CONFIGURE", "").lower() in ("1", "true", "yes")
+    if not allow_after:
+        return
+
+    setup_user = os.getenv("SETUP_USERNAME", "").strip()
+    setup_pass = os.getenv("SETUP_PASSWORD", "").strip()
+    if not (setup_user and setup_pass):
+        return  # flag is set but creds are absent — endpoint will reject anyway
+
+    # Check whether Jellyfin is configured without pulling in the router module
+    db = SessionLocal()
+    try:
+        from models import ConnectionSettings
+        row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+        jellyfin_configured = bool(row and row.base_url)
+    except Exception:
+        jellyfin_configured = False
+    finally:
+        db.close()
+
+    if jellyfin_configured:
+        sep = "=" * 70
+        _log.warning(
+            "\n%s\n"
+            "  SECURITY WARNING: setup backdoor is active post-configure\n"
+            "\n"
+            "  SETUP_ALLOW_AFTER_CONFIGURE=true is set and Jellyfin is already\n"
+            "  configured. The setup credentials (SETUP_USERNAME / SETUP_PASSWORD)\n"
+            "  can still be used to obtain an admin token at any time.\n"
+            "\n"
+            "  Recommended action:\n"
+            "    1. Remove SETUP_ALLOW_AFTER_CONFIGURE from your .env\n"
+            "    2. Remove SETUP_USERNAME and SETUP_PASSWORD from your .env\n"
+            "    3. Restart the stack\n"
+            "\n"
+            "  Every use of the setup login while this flag is active is recorded\n"
+            "  in the system_events table (event_type='setup_login').\n"
+            "%s",
+            sep, sep,
+        )
+    else:
+        # Flag is set but Jellyfin isn't configured yet — normal bootstrap state.
+        # Log at INFO only so first-time setup isn't noisy.
+        _log.info(
+            "Setup mode active (SETUP_ALLOW_AFTER_CONFIGURE=true, Jellyfin not yet "
+            "configured). Remember to remove this flag once setup is complete."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -288,30 +354,9 @@ async def lifespan(app: FastAPI):
         name="Refresh token expiry cleanup",
     )
 
-    # ── Startup security warnings ─────────────────────────────────────────────
-    # Log loud warnings for unsafe configurations so they surface in docker logs
-    # from the very first boot and are hard to overlook.
-    import logging as _slog
-    _log = _slog.getLogger("jellydj.startup")
-
-    _wh_secret   = os.getenv("WEBHOOK_SECRET", "").strip()
-    _wh_required = os.getenv("WEBHOOK_SECRET_REQUIRED", "true").strip().lower()                    not in ("false", "0", "no")
-
-    if not _wh_secret and _wh_required:
-        _log.warning(
-            "SECURITY: WEBHOOK_SECRET is not set. "
-            "All webhook requests will be rejected (HTTP 401) until a secret is "
-            "configured. Set WEBHOOK_SECRET in .env and add the same value as the "
-            "X-Jellyfin-Token header in the Jellyfin Webhook plugin. "
-            "For private LAN installs, set WEBHOOK_SECRET_REQUIRED=false to allow "
-            "unauthenticated webhooks."
-        )
-    elif not _wh_secret and not _wh_required:
-        _log.warning(
-            "SECURITY: WEBHOOK_SECRET is not set and WEBHOOK_SECRET_REQUIRED=false. "
-            "The webhook endpoint accepts unauthenticated requests from any source. "
-            "Do not expose this instance directly to the internet without a secret."
-        )
+    # Warn if the setup backdoor flag is active post-configure.
+    # This runs after create_all + migrations so the DB is guaranteed to exist.
+    _warn_if_setup_backdoor_active()
 
     yield  # application handles requests here
 

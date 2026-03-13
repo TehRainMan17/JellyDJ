@@ -71,3 +71,30 @@ export const api = {
   put:    (path, body)         => request('PUT',    path, body),
   delete: (path)               => request('DELETE', path),
 }
+
+// ── apiFetch / setApiToken — aliases for components that call fetch directly ──
+//
+// Some components (useJobStatus, AutomationPanel, IndexerSettingsPanel,
+// WebhookSetupPanel) use apiFetch() instead of the api.get/post helpers.
+// These are thin wrappers over the same token store so both patterns stay
+// in sync — no separate state.
+//
+// setApiToken() is not needed when _wireAuth() is used (App.jsx path), but
+// is exported for components that call it directly (e.g. tests, Storybook).
+export function setApiToken(token) {
+  // No-op: token is managed via _wireAuth / _getToken closure above.
+  // Exported for interface compatibility only.
+}
+
+/**
+ * Drop-in fetch replacement that injects Authorization: Bearer.
+ * Use for raw fetch calls that need auth but don't use the api.get/post helpers.
+ */
+export async function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {})
+  const token = _getToken()
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+  return fetch(url, { ...options, headers })
+}

@@ -587,6 +587,35 @@ class UserPlaylist(Base):
     updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class LoginRateLimit(Base):
+    """
+    Persistent login rate-limit state, keyed by client IP.
+
+    Replaces the in-memory defaultdict in routers/auth.py, which reset on
+    every restart and was not shared across uvicorn workers.
+
+    Schema
+    ──────
+    ip            — client IP address (primary key)
+    window_start  — UTC timestamp when the current counting window opened
+    attempt_count — number of attempts recorded in the current window
+
+    Logic (in _check_rate_limit):
+      - If no row exists for this IP, create one with attempt_count=1.
+      - If a row exists and now - window_start >= WINDOW seconds, reset it
+        (new window, attempt_count=1).
+      - If a row exists within the window and attempt_count >= MAX, reject 429.
+      - Otherwise increment attempt_count.
+
+    The table is tiny (one row per distinct IP that has ever tried to log in)
+    and rows are cheap to upsert. SQLite handles this comfortably.
+    """
+    __tablename__ = "login_rate_limits"
+    ip            = Column(Text, primary_key=True)
+    window_start  = Column(DateTime, nullable=False, default=datetime.utcnow)
+    attempt_count = Column(Integer,  nullable=False, default=1)
+
+
 class DefaultPlaylistConfig(Base):
     """
     Admin-configured default playlists provisioned to every user automatically:

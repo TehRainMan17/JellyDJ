@@ -1,5 +1,6 @@
 
 import { useState, useEffect } from 'react'
+import { apiFetch } from '../lib/api'
 import { Clock, RefreshCw, Loader2, Save, Play, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp, Trash2 } from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
@@ -132,7 +133,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [trigBillboard, setTrigBillboard] = useState(false)
 
   useEffect(() => {
-    fetch('/api/automation/settings').then(r=>r.json()).then(d => {
+    apiFetch('/api/automation/settings').then(r=>r.json()).then(d => {
       setSettings(d)
       setIndexInterval(d.index_interval_hours ?? 6)
       setDiscEnabled(!!d.discovery_refresh_enabled)
@@ -145,21 +146,21 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       setBbEnabled(d.billboard_refresh_enabled !== false)
       setBbInterval(d.billboard_refresh_interval_hours ?? 168)
     }).catch(() => {})
-    fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
-    fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
-    fetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
+    apiFetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
+    apiFetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
+    apiFetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
   }, [])
 
   const fetchLastDownload = () =>
-    fetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
+    apiFetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
 
   const fetchCacheStats = () =>
-    fetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
+    apiFetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
 
   const handleClearCache = async () => {
     setClearingCache(true)
     try {
-      await fetch('/api/external-apis/cache', { method: 'DELETE' })
+      await apiFetch('/api/external-apis/cache', { method: 'DELETE' })
       await fetchCacheStats()
     } finally {
       setClearingCache(false)
@@ -169,7 +170,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const save = async () => {
     setSaving(true); setSaveMsg('')
     try {
-      const r = await fetch('/api/automation/settings', {
+      const r = await apiFetch('/api/automation/settings', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           index_interval_hours: indexInterval,
@@ -190,7 +191,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       setSaving(false)
       setTimeout(() => setSaveMsg(''), 4000)
       // Re-fetch scheduler state so next-run times reflect the new intervals
-      fetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
+      apiFetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
     }
   }
 
@@ -201,14 +202,14 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       onTrigger?.()
     } finally {
       setLoading(false)
-      setTimeout(() => fetch('/api/automation/settings').then(r=>r.json()).then(setSettings).catch(()=>{}), 2000)
+      setTimeout(() => apiFetch('/api/automation/settings').then(r=>r.json()).then(setSettings).catch(()=>{}), 2000)
     }
   }
 
   const triggerEnrichment = async () => {
     setTrigEnrich(true)
     try {
-      await fetch('/api/automation/trigger/enrichment', { method: 'POST' })
+      await apiFetch('/api/automation/trigger/enrichment', { method: 'POST' })
       onTrigger?.()
     } finally {
       setTrigEnrich(false)

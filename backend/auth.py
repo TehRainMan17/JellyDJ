@@ -40,12 +40,38 @@ REFRESH_TOKEN_EXPIRE_HOURS = int(os.getenv("REFRESH_TOKEN_EXPIRE_HOURS", "8"))
 _bearer = HTTPBearer(auto_error=True)
 
 
+# Known-insecure placeholder values that must never be used for JWT signing.
+_JWT_INSECURE_DEFAULTS = frozenset({
+    "dev-insecure-secret-change-me",
+    "change-me-generate-a-real-secret",
+    "",
+})
+
+
 def _secret_key() -> str:
-    """Return the JWT signing key.  Prefers JWT_SECRET_KEY; falls back to SECRET_KEY."""
-    return (
-        os.getenv("JWT_SECRET_KEY")
-        or os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
+    """
+    Return the JWT signing key.  Prefers JWT_SECRET_KEY; falls back to SECRET_KEY.
+
+    Raises RuntimeError if neither variable is set or both match a known
+    insecure default.  A default JWT signing key means any party who has
+    read the source code can forge valid JWT tokens for any user, including
+    admin accounts.
+    """
+    key = (
+        os.getenv("JWT_SECRET_KEY", "").strip()
+        or os.getenv("SECRET_KEY", "").strip()
     )
+    if not key or key in _JWT_INSECURE_DEFAULTS:
+        raise RuntimeError(
+            "JWT_SECRET_KEY (or SECRET_KEY) is not set or uses an insecure default. "
+            "A default signing key allows anyone who has read the source code to "
+            "forge JWT tokens and authenticate as any user, including admins. "
+            "Generate a strong key and set it in .env:\n"
+            "  python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            "Then set: JWT_SECRET_KEY=<generated value>  (or SECRET_KEY if you "
+            "prefer a single key for both JWT signing and credential encryption)"
+        )
+    return key
 
 
 # ── Token dataclass ───────────────────────────────────────────────────────────
