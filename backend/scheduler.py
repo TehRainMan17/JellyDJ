@@ -1,3 +1,4 @@
+
 """
 JellyDJ — Central background job scheduler.
 
@@ -224,11 +225,36 @@ async def _run_user_playlist_autopush():
 
         from models import ManagedUser, PlaylistRunItem
 
+        # Build a set of active user IDs once for the whole run so we can
+        # cheaply skip orphaned playlists without a per-row DB query.
+        active_user_ids: set[str] = {
+            row.jellyfin_user_id
+            for row in db.query(ManagedUser).filter_by(has_activated=True).all()
+        }
+
         pushed = 0
         skipped = 0
 
         for playlist in due_playlists:
             try:
+                # ── Ghost-user guard ───────────────────────────────────────
+                # A playlist whose owner is no longer an active managed user
+                # (deleted via the admin panel, or de-activated) must never
+                # be pushed.  Without this check, de-activated users get
+                # empty playlists created in Jellyfin on every autopush tick.
+                if playlist.owner_user_id not in active_user_ids:
+                    log.warning(
+                        "UserPlaylist id=%d belongs to inactive/deleted user %s "
+                        "— skipping autopush and disabling schedule",
+                        playlist.id, playlist.owner_user_id,
+                    )
+                    # Disable the schedule so this warning only fires once
+                    # rather than every 15 minutes until someone cleans up.
+                    playlist.schedule_enabled = False
+                    db.commit()
+                    skipped += 1
+                    continue
+
                 interval = timedelta(hours=playlist.schedule_interval_h or 24)
 
                 # Determine the base time for computing next_due
