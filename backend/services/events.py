@@ -1,4 +1,3 @@
-
 """
 JellyDJ event logger — writes structured events to the system_events table.
 Used by all services so the Dashboard activity feed has real data.

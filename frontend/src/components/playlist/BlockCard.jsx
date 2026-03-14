@@ -1,4 +1,3 @@
-
 /**
  * BlockCard.jsx — Single block display/edit card for the Block Editor.
  * All numeric ranges have both a drag slider AND a type-in number input.

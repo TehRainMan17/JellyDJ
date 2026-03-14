@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src=".github/images/banner.png" alt="JellyDJ" width="100%" />
 </p>

@@ -1,4 +1,3 @@
-
 """
 JellyDJ Automation router — settings and manual triggers for all scheduled tasks,
 plus the activity feed endpoint.
@@ -848,4 +847,3 @@ def scheduler_status(_: UserContext = Depends(get_current_user), db: Session = D
             "discovery_refresh_interval_hours": s.discovery_refresh_interval_hours,
         }
     }
-

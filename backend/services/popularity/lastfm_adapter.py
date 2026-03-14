@@ -1,4 +1,3 @@
-
 """
 Last.fm adapter — uses pylast.
 """

@@ -1,4 +1,3 @@
-
 """
 JellyDJ — Shared authentication utilities.
 
@@ -34,7 +33,7 @@ log = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 ALGORITHM = "HS256"
-JWT_ACCESS_MINUTES = int(os.getenv("JWT_ACCESS_MINUTES", "15"))
+JWT_ACCESS_MINUTES = int(os.getenv("JWT_ACCESS_MINUTES", "60"))   # was 15 — increased to reduce /refresh frequency
 REFRESH_TOKEN_EXPIRE_HOURS = int(os.getenv("REFRESH_TOKEN_EXPIRE_HOURS", "8"))
 
 _bearer = HTTPBearer(auto_error=True)

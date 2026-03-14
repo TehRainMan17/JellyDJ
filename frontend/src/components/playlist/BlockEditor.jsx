@@ -1,4 +1,3 @@
-
 /**
  * BlockEditor.jsx — Full-screen playlist template editor.
  *

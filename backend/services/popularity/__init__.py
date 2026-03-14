@@ -1,4 +1,3 @@
-
 """
 Module-level aggregator singleton.
 Call get_aggregator(db) to get an instance loaded with current DB credentials.

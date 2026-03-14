@@ -1,4 +1,3 @@
-
 """
 Module-level aggregator singleton with credential-keyed caching.
 

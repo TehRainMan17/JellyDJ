@@ -1,4 +1,3 @@
-
 import { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react'
 
 const AuthContext = createContext(null)

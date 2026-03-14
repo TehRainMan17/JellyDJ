@@ -1,4 +1,3 @@
-
 import { useEffect } from 'react'
 import AutomationPanel from '../components/AutomationPanel.jsx'
 import JobProgress from '../components/JobProgress.jsx'

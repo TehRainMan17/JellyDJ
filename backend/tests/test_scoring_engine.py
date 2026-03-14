@@ -1,4 +1,3 @@
-
 """
 Tests for Module 8a: Library Scanner + Scoring Engine
 

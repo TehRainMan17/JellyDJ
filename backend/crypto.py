@@ -1,4 +1,3 @@
-
 """
 JellyDJ — Credential encryption helpers.
 

@@ -1,4 +1,3 @@
-
 """
 MusicBrainz adapter — uses musicbrainzngs. No API key required.
 Rate-limited to 1 req/sec by the library automatically.

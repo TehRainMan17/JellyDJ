@@ -1,4 +1,3 @@
-
 /**
  * TemplateCard.jsx — Template gallery card component.
  *

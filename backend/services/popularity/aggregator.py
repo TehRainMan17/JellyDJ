@@ -1,4 +1,3 @@
-
 """
 PopularityAggregator — unified interface over all adapters.
 Results are cached in SQLite for 24 hours to avoid hammering external APIs.

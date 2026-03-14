@@ -1,4 +1,3 @@
-
 """
 JellyDJ Library Scanner — Module 8a
 
@@ -15,6 +14,7 @@ Key differences from the play history indexer:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -29,6 +29,12 @@ from crypto import decrypt
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
+
+# Brief pause between Jellyfin page requests to avoid saturating it while
+# playback is happening.  At 500 items/page a 10,000-track library takes
+# ~20 pages; 0.25 s/page adds only ~5 seconds total but gives Jellyfin's
+# HTTP thread pool time to breathe between bursts.
+_PAGE_SLEEP_SECS = 0.25
 
 
 def _get_jellyfin_creds(db: Session) -> tuple[str, str]:
@@ -80,6 +86,10 @@ async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
 
             if start_index >= total or not items:
                 break
+
+            # Yield to Jellyfin between pages so playback requests aren't
+            # starved.  Small libraries (≤1 page) never hit this.
+            await asyncio.sleep(_PAGE_SLEEP_SECS)
 
     return all_items
 

@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback } from 'react'
 import {
   Activity, Music2, Telescope, CheckCircle2, XCircle, Loader2,

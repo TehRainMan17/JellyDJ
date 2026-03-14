@@ -1,4 +1,3 @@
-
 """
 JellyDJ — SQLAlchemy database setup.
 

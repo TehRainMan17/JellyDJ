@@ -1,4 +1,3 @@
-
 """
 JellyDJ — SQLAlchemy models (cumulative v1 + v2 + v3 + Auth Phase 1 + Phase 3).
 

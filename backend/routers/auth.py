@@ -1,4 +1,3 @@
-
 """
 JellyDJ — Authentication router.
 
@@ -488,46 +487,26 @@ async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
         db.commit()
         raise invalid_exc
 
-    # Re-validate the stored Jellyfin session token
+    # Decrypt the stored Jellyfin token (needed to re-issue it with the new
+    # refresh token row).  We do NOT re-ping Jellyfin on every refresh — that
+    # would fire a live HTTP call to Jellyfin every 13 minutes per open tab,
+    # competing with active playback.  The refresh token itself is the proof
+    # of identity: it is a cryptographically random 64-byte opaque value stored
+    # only as a SHA-256 hash, with its own server-side expiry.  Rotating it is
+    # sufficient; a round-trip to Jellyfin adds latency and load without
+    # meaningfully improving security (a stolen refresh token could be used
+    # before any re-validation could detect it anyway).
     try:
         jellyfin_token = decrypt(rt.jellyfin_token)
     except Exception:
         log.error("Failed to decrypt stored Jellyfin token for user %s", rt.user_id)
         raise invalid_exc
 
-    base_url = _jellyfin_url(db)
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{base_url}/Users/{rt.user_id}",
-                headers={
-                    "X-Emby-Authorization": _EMBY_AUTH,
-                    "X-MediaBrowser-Token": jellyfin_token,
-                },
-            )
-    except httpx.RequestError as exc:
-        log.error("Jellyfin re-validation request failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not reach Jellyfin server",
-        )
-
-    if resp.status_code == 401:
-        # Jellyfin rejected our token — password changed or session revoked
-        db.delete(rt)
-        db.commit()
-        raise invalid_exc
-
-    if resp.status_code != 200:
-        log.error("Jellyfin /Users/%s returned %s", rt.user_id, resp.status_code)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Jellyfin returned unexpected status {resp.status_code}",
-        )
-
-    user_data = resp.json()
-    username: str = user_data.get("Name", "")
-    is_admin: bool = bool(user_data.get("Policy", {}).get("IsAdministrator", False))
+    # Pull username/is_admin from the ManagedUser row — already kept up-to-date
+    # by the indexer's username-sync step and by each fresh login.
+    managed = db.query(ManagedUser).filter_by(jellyfin_user_id=rt.user_id).first()
+    username: str = managed.username if managed else ""
+    is_admin: bool = bool(managed.is_admin) if managed else False
 
     # Update last_used_at before deleting
     rt.last_used_at = now

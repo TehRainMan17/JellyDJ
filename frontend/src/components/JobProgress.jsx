@@ -1,4 +1,3 @@
-
 /**
  * JobProgress — universal progress panel for all background jobs.
  *
