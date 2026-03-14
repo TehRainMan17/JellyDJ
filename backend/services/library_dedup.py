@@ -1,3 +1,4 @@
+
 """
 JellyDJ Library Dedup — Module 8b
 
@@ -44,21 +45,63 @@ log = logging.getLogger(__name__)
 
 # Tokens to strip before comparing (articles, common suffixes)
 _STRIP_WORDS = {"the", "a", "an"}
-_STRIP_SUFFIXES = re.compile(
-    r"\s*[\(\[](remastered|deluxe|expanded|bonus|anniversary|edition"
-    r"|explicit|clean|acoustic|live|radio edit|single version|album version"
-    r"|feat\.?.*|ft\.?.*|\d{4})[\)\]]",
+
+# Phase 1: strip entire parenthetical/bracketed blocks that contain edition noise.
+# Catches: (2015 Remaster), [Super Deluxe Edition], (20th Anniversary Edition),
+#          (Explicit), [Bonus Track], (feat. X), (Live at Wembley), etc.
+# The key insight: we strip the WHOLE bracket group if it contains any noise word,
+# rather than trying to match exact patterns — this handles arbitrary combinations
+# like "(2015 Super Deluxe Remastered Anniversary Edition)".
+_STRIP_BRACKET_NOISE = re.compile(
+    r"\s*[\(\[][^\)\]]*\b("
+    r"remaster(?:ed)?|deluxe|expanded|bonus|anniversary|edition|explicit|clean"
+    r"|acoustic|live|radio\s*edit|single\s*version|album\s*version|re-?issue"
+    r"|collector|limited|special|super|feat\.?|ft\.?|with\s"
+    r").*?[\)\]]",
+    re.IGNORECASE,
+)
+
+# Phase 2: strip bare suffixes that appear without brackets at end of string.
+# Catches: "Nevermind - Remastered", "Abbey Road (2019 Mix)" already handled above,
+# but also "Something Remastered 2011" with no brackets.
+_STRIP_BARE_SUFFIX = re.compile(
+    r"\s*[-–]\s*(?:\d{4}\s+)?(?:remaster(?:ed)?|deluxe|re-?issue|re-?master)(?:\s+\d{4})?$",
+    re.IGNORECASE,
+)
+
+# Phase 3: after all bracket/suffix stripping, remove any orphaned 4-digit years
+# and common noise words that the above passes might leave behind.
+_STRIP_ORPHAN_YEAR = re.compile(r"\b(19|20)\d{2}\b")
+_STRIP_NOISE_WORDS = re.compile(
+    r"\b(remaster(?:ed)?|deluxe|expanded|bonus|anniversary|edition|explicit"
+    r"|super|special|collector|limited|version|reissue|re-?issue)\b",
     re.IGNORECASE,
 )
 
 
 def _normalise(s: str) -> str:
-    """Lowercase, strip edition tags, remove punctuation, sort tokens."""
+    """
+    Lowercase, strip all edition/remaster/year noise, remove punctuation, sort tokens.
+
+    Three-phase approach:
+      1. Strip whole bracket groups containing noise keywords
+         → removes (2015 Remaster), [Super Deluxe Edition], (feat. X), etc.
+      2. Strip bare end-of-string remaster suffixes without brackets
+         → removes "- Remastered 2011", "- Deluxe"
+      3. Strip orphaned years and leftover noise words
+         → removes stray "2015", "Remastered" tokens left after phase 1/2
+
+    This makes "Jagged Little Pill (2015 Remaster)" normalise to the same
+    token-sorted string as "Jagged Little Pill".
+    """
     if not s:
         return ""
     s = s.lower()
-    s = _STRIP_SUFFIXES.sub("", s)
-    # remove punctuation except spaces
+    s = _STRIP_BRACKET_NOISE.sub("", s)
+    s = _STRIP_BARE_SUFFIX.sub("", s)
+    s = _STRIP_ORPHAN_YEAR.sub("", s)
+    s = _STRIP_NOISE_WORDS.sub("", s)
+    # Remove punctuation except spaces
     s = re.sub(r"[^\w\s]", " ", s)
     tokens = [t for t in s.split() if t not in _STRIP_WORDS]
     return " ".join(sorted(tokens))

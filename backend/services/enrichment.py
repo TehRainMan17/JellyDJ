@@ -1,3 +1,4 @@
+
 """
 JellyDJ Enrichment Service — v2
 
@@ -522,8 +523,13 @@ def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[in
                 "rank":      int((t.get("@attr") or {}).get("rank", i + 1)),
                 "album":     None,
             }
-            # Resolve album for top 3 tracks via track.getInfo
-            if i < 3:
+            # Resolve album for top 5 tracks via track.getInfo.
+            # Album attribution is the core input for the top-songs→album
+            # discovery logic: we need to know which album each hit belongs to
+            # so we can score albums by the positional weight of their songs.
+            # Top 5 (up from 3) gives enough signal to handle split cases
+            # where the #1 hit is on a different album than #2+#3.
+            if i < 5:
                 time.sleep(LASTFM_DELAY)
                 ti = _lastfm_get("track.getInfo", {
                     "artist": artist_name,
@@ -534,6 +540,20 @@ def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[in
                 album_title = (track_data.get("album") or {}).get("title")
                 if album_title:
                     track_entry["album"] = album_title
+                elif not album_title:
+                    # Last.fm sometimes returns blank album on first call —
+                    # retry once with the cleaned track name before giving up.
+                    cleaned = _clean_track_name(t["name"])
+                    if cleaned and cleaned != t["name"]:
+                        time.sleep(LASTFM_DELAY)
+                        ti2 = _lastfm_get("track.getInfo", {
+                            "artist": artist_name,
+                            "track":  cleaned,
+                            "autocorrect": 1,
+                        })
+                        album_title2 = (ti2.get("track", {}).get("album") or {}).get("title")
+                        if album_title2:
+                            track_entry["album"] = album_title2
             enriched_tracks.append(track_entry)
         result["top_tracks"] = json.dumps(enriched_tracks)
     except Exception as e:

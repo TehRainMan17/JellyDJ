@@ -1,3 +1,4 @@
+
 """
 JellyDJ Recommendation Engine — Module 5
 
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
@@ -378,46 +380,135 @@ def recommend_library_tracks(
     return combined[:limit]
 
 
+def _score_album_from_top_tracks(top_tracks: list[dict]) -> dict[str, float]:
+    """
+    Given an artist's top-tracks list (each entry has name, listeners, rank, album),
+    score each album by the positional-weighted sum of its songs that appear in the list.
+
+    Positional weights (rank 1 is worth the most):
+      rank 1 → 5 pts, rank 2 → 4 pts, rank 3 → 3 pts, rank 4 → 2 pts, rank 5+ → 1 pt
+
+    Each pt is then multiplied by a listener-count factor so a massive hit at #2
+    can still beat a moderate track at #1 if the listener gap is large.
+
+    Returns dict of {album_name: weighted_score}, sorted descending.
+    Albums with no attributed tracks are not included.
+
+    Tie-breaking: when two albums share the same rounded score, the one containing
+    the single highest-ranked song wins (lowest rank number = earlier = better).
+    """
+    POSITIONAL_WEIGHTS = {1: 5, 2: 4, 3: 3, 4: 2}
+    DEFAULT_WEIGHT = 1
+
+    # Normalise listener counts across the track list so they act as a multiplier
+    # rather than completely dominating the positional signal.
+    max_listeners = max((t.get("listeners", 1) or 1) for t in top_tracks) or 1
+
+    album_scores: dict[str, float] = {}
+    # Track the best (lowest) rank for each album for tie-breaking
+    album_best_rank: dict[str, int] = {}
+
+    # Normalise album names for comparison (strip "Deluxe", "Remastered", etc.)
+    _ALBUM_NOISE = re.compile(
+        r'\s*[\(\[](deluxe|expanded|remaster(?:ed)?|anniversary|special'
+        r'|edition|version|bonus|explicit)[^\)\]]*[\)\]]',
+        re.IGNORECASE,
+    )
+
+    def _norm_album(name: str) -> str:
+        return _ALBUM_NOISE.sub("", name).strip().lower()
+
+    # Build a canonical → display-name map so we return the original name
+    canonical_to_display: dict[str, str] = {}
+
+    for i, track in enumerate(top_tracks):
+        album = (track.get("album") or "").strip()
+        if not album:
+            continue  # no album attribution — skip, don't guess
+        canonical = _norm_album(album)
+        canonical_to_display.setdefault(canonical, album)
+
+        rank = track.get("rank") or (i + 1)
+        pos_weight = POSITIONAL_WEIGHTS.get(rank, DEFAULT_WEIGHT)
+        listeners = track.get("listeners") or 0
+        listener_factor = 1.0 + (listeners / max_listeners)  # 1.0–2.0
+        score = pos_weight * listener_factor
+
+        album_scores[canonical] = album_scores.get(canonical, 0.0) + score
+        # Keep track of the best (lowest-numbered) rank for this album
+        if canonical not in album_best_rank or rank < album_best_rank[canonical]:
+            album_best_rank[canonical] = rank
+
+    # Re-key back to display names, sort by (score desc, best_rank asc)
+    result = {}
+    for canonical, score in album_scores.items():
+        display = canonical_to_display.get(canonical, canonical)
+        result[display] = score
+
+    return dict(
+        sorted(
+            result.items(),
+            key=lambda kv: (-kv[1], album_best_rank.get(_norm_album(kv[0]), 99))
+        )
+    )
+
+
 def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int], Optional[str]]:
     """
-    Return the album most worth recommending for a given artist.
+    Return the album most worth recommending for a given artist, chosen by
+    scoring each album against the artist's top-5 songs on Last.fm.
 
-    Priority order:
-      1. Album containing the artist's most-listened-to track (from ArtistEnrichment.top_tracks).
-         This is "the album with their biggest hit" — the most accurate signal for
-         which album a new listener should start with.
-      2. PopularityCache "top_album" key (artist.getTopAlbums #1 non-compilation).
-         This is "album with most total plays" — still good, just less precise.
-      3. Empty — caller handles gracefully.
+    Algorithm:
+      1. Load ArtistEnrichment.top_tracks (pre-fetched by enrichment service,
+         already includes album attribution for top-5 tracks via track.getInfo).
+      2. Score albums using positional-weighted song counts (_score_album_from_top_tracks).
+         Weighted sum: rank-1 song = 5pts, rank-2 = 4pts, … rank-5+ = 1pt,
+         each multiplied by a listener-count factor so monster hits carry extra weight.
+         Tie-break: album containing the single highest-ranked song wins.
+      3. Skip obvious compilations from the winner.
+      4. Fall back to PopularityCache top_album only if no track→album data exists.
 
     Returns (album_name, release_year, image_url).
     """
     import json
     from models import ArtistEnrichment, PopularityCache
 
-    # ── Priority 1: album of the most-listened track ──────────────────────────
+    _COMPILATION_WORDS = [
+        "greatest hits", "best of", "collection", "essential", "platinum",
+        "gold", "anthology", "singles", "ultimate", "the very best",
+        "definitive", "complete collection",
+    ]
+
+    # ── Step 1+2: top songs → scored album map ────────────────────────────────
     ae = db.query(ArtistEnrichment).filter_by(
         artist_name_lower=artist_name.lower()
     ).first()
+
     if ae and ae.top_tracks:
         try:
-            tracks = json.loads(ae.top_tracks)
-            # Find the track with an album resolved AND the highest listener count
-            tracks_with_album = [t for t in tracks if t.get("album")]
-            if tracks_with_album:
-                best = max(tracks_with_album, key=lambda t: t.get("listeners", 0))
-                album_name = best["album"]
-                # Skip obvious compilations
-                skip = ["greatest hits", "best of", "collection", "essential",
-                        "platinum", "gold", "anthology", "singles", "ultimate"]
-                if not any(w in album_name.lower() for w in skip):
-                    # Try to get image from PopularityCache discography
-                    image_url = _get_album_image(artist_name, album_name, db)
-                    return album_name, None, image_url
-        except Exception:
-            pass
+            top_tracks = json.loads(ae.top_tracks)
+            scored = _score_album_from_top_tracks(top_tracks)
 
-    # ── Priority 2: top_album from popularity cache ───────────────────────────
+            # Walk the ranked list, skip compilations
+            for album_name, _score in scored.items():
+                if any(w in album_name.lower() for w in _COMPILATION_WORDS):
+                    log.debug(
+                        "  Album picker: skipping '%s' for '%s' (compilation)",
+                        album_name, artist_name,
+                    )
+                    continue
+                image_url = _get_album_image(artist_name, album_name, db)
+                log.debug(
+                    "  Album picker: chose '%s' for '%s' (score=%.1f, ranked albums=%s)",
+                    album_name, artist_name, _score,
+                    {k: round(v, 1) for k, v in list(scored.items())[:4]},
+                )
+                return album_name, None, image_url
+
+        except Exception as exc:
+            log.debug("  Album picker: top_tracks parse failed for '%s': %s", artist_name, exc)
+
+    # ── Fallback: top_album from popularity cache ─────────────────────────────
     key = f"top_album:{artist_name.lower()}"
     row = db.query(PopularityCache).filter_by(cache_key=key).first()
     if row:
@@ -445,7 +536,6 @@ def _get_album_image(artist_name: str, album_name: str, db) -> Optional[str]:
                     return alb.get("image_url")
     except Exception:
         pass
-    # Fall back to artist image from ArtistEnrichment
     from models import ArtistEnrichment
     ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist_name.lower()).first()
     return ae.image_url if ae else None
@@ -462,30 +552,64 @@ def recommend_new_albums(
     db,
 ) -> list[AlbumResult]:
     """
-    Album-first recommendation engine with smart variety.
+    Album-first discovery engine — song-quality driven, taste-aware.
 
-    Two recommendation paths:
+    Core philosophy:
+      Albums are suggested because (a) the artist is globally popular and new
+      to your library, OR (b) an existing artist has a highly popular album you
+      don't own.  In BOTH cases, the album is chosen by finding the artist's
+      most globally popular songs on Last.fm and picking the album that
+      contains the highest-scoring cluster of those songs.
 
-    PATH A — Missing albums from known artists (complete their collection)
-    PATH B — New artists via similarity (expand their world)
+    Scoring formula (inside _add_candidate):
+      blended = (lastfm_listeners * 0.50) + (pop_score * 0.25) + (genre_affinity * 0.25)
 
-    Variety mechanisms:
-    - Seed artists are sampled from top 30 (weighted by affinity) rather than
-      always using the same top 5 — different artists seed each run
-    - Recent repeat suppression: artists queued in last 45 days are skipped
-    - Wildcard genre injection: ~20% of PATH B recs come from genres
-      adjacent to the user's favorites (one genre step out)
-    - "New but popular" boost: unknown artists with high listener counts
-      get a bonus — surfaces rising/popular artists you haven't found yet
-    - Never-heard-artist preference: artists with zero library presence
-      are weighted higher than artists you partly know
+      genre_affinity is computed per-candidate from tag overlap with the user's
+      top genres — it replaces the old hardcoded source_affinity tiebreaker so
+      taste is a genuine 25% signal rather than a footnote.
+
+    Genre filtering (PATH D — medium strictness):
+      - Artists with ≥1 tag overlapping user's top genres: allowed + genre affinity bonus
+      - Artists with no tag overlap: allowed only if listeners_score >= 90 (global phenomena)
+      - Artists with no tags at all: treated as neutral, full score
+      - Genre cap is taste-aware: user's own genres cap at 5, others at 2
+
+    Diversity controls:
+      - Per-seed-artist cap: floor(limit * 0.20), min 1.
+      - Taste-aware genre cap: liked genres 5, neutral genres 2.
+      - Seed artist selection: structured tiered sampling.
+      - 90-day artist suppression + 180-day rejection suppression.
+
+    Three recommendation paths:
+      PATH A — Missing albums from known artists (complete their collection).
+                Capped at 25% of limit. Uses top-songs→album logic.
+      PATH B — New artists via similarity chains from sampled seed artists.
+                Capped per seed artist at floor(limit * 0.20).
+      PATH D — Globally popular artists (≥1M listeners) not in library.
+                Targets 40% of output. Genre-filtered (medium strictness).
     """
     import random
     import json
     import math
+    import re as _re
     from models import UserTasteProfile, Play, PopularityCache, DiscoveryQueueItem
 
-    # ── Load taste profile — use top 30 as the candidate seed pool ───────────
+    # ── Per-seed-artist diversity cap ────────────────────────────────────────
+    # 20% of the run limit, floored at 1.  Prevents any single seed artist
+    # (e.g. Adele) from dominating the candidate pool via their similarity chain.
+    per_seed_cap = max(1, int(limit * 0.20))
+
+    # ── Taste-aware genre caps ────────────────────────────────────────────────
+    # Genres the user actively listens to get more headroom than unknown genres.
+    # This lets familiar genres produce more recs while still blocking any single
+    # genre from completely dominating the run.
+    #   User's liked genres  → cap 5  (room to go deep on what you love)
+    #   Everything else      → cap 2  (sample, don't saturate)
+    GENRE_CAP_LIKED   = 5
+    GENRE_CAP_NEUTRAL = 2
+    genre_counts: dict[str, int] = {}
+
+    # ── Load taste profile ───────────────────────────────────────────────────
     top_artists_rows = (
         db.query(UserTasteProfile)
         .filter_by(user_id=user_id)
@@ -499,22 +623,15 @@ def recommend_new_albums(
         log.warning(f"No taste profile for user {user_id} — run indexer first")
         return []
 
-    # Normalise affinity scores to 0–100
     max_affinity = max(float(r.affinity_score) for r in top_artists_rows) or 1.0
     affinity_map = {
         r.artist_name: min(100.0, float(r.affinity_score) / max_affinity * 100)
         for r in top_artists_rows
     }
 
-    # ── Structured seed selection — break top-artist dominance ───────────────
-    # Pure affinity-weighted sampling always picks Adele/Cher as seeds, which
-    # means PATH B candidates are always "similar to Adele/Cher". Instead,
-    # divide seeds into three tiers with guaranteed minimum slots per tier.
-    #
-    #   Tier 1 (rank 1-5):   max 4 seeds  — your absolute favorites, always present
-    #   Tier 2 (rank 6-15):  min 6 seeds  — mid-range artists, generate variety
-    #   Tier 3 (rank 16-30): min 4 seeds  — long-tail artists, unexpected finds
-    #
+    # ── Structured seed selection ────────────────────────────────────────────
+    # Divide top-30 into three tiers and sample from each to avoid the same
+    # mega-artists seeding every run.
     tier1 = top_artists_rows[:5]
     tier2 = top_artists_rows[5:15]
     tier3 = top_artists_rows[15:30]
@@ -533,8 +650,7 @@ def recommend_new_albums(
         _weighted_sample(tier2, min(6, len(tier2))) +
         _weighted_sample(tier3, min(4, len(tier3)))
     )
-    # Deduplicate (weighted_sample per tier, no overlap possible, but guard anyway)
-    seen_seeds = set()
+    seen_seeds: set[str] = set()
     seed_rows = [r for r in seed_rows if not (r.artist_name in seen_seeds or seen_seeds.add(r.artist_name))]
 
     log.info(f"  Discovery seeds ({len(seed_rows)}): {[r.artist_name for r in seed_rows[:6]]}...")
@@ -574,10 +690,7 @@ def recommend_new_albums(
         if row.track_name and row.artist_name:
             known_track_names.add(f"{row.artist_name.lower()}::{row.track_name.lower()}")
 
-    # ── Already-queued suppression ────────────────────────────────────────────
-    # Albums: deduplicated for all time (never re-recommend the same album)
-    # Artists: suppressed for 90 days after any queue appearance
-    # Rejected artists: suppressed for 180 days — user explicitly said no
+    # ── Already-queued suppression ───────────────────────────────────────────
     from datetime import timedelta
     cutoff_90d  = datetime.utcnow() - timedelta(days=90)
     cutoff_180d = datetime.utcnow() - timedelta(days=180)
@@ -599,78 +712,156 @@ def recommend_new_albums(
         elif row.added_at and row.added_at >= cutoff_90d:
             recently_queued_artists.add(row.artist_name.lower())
 
-    # ── Collect user's top genres for wildcard adjacency ─────────────────────
+    # ── Top genres for taste-aware filtering and scoring ─────────────────────
     from models import GenreProfile
     top_genre_rows = (
         db.query(GenreProfile)
         .filter_by(user_id=user_id)
         .order_by(GenreProfile.affinity_score.desc())
-        .limit(8)
+        .limit(15)   # wider window so niche genres aren't missed
         .all()
     )
+    # Set for fast membership tests
     user_top_genres = {r.genre.lower() for r in top_genre_rows if r.genre}
+    # Normalised affinity scores 0–100 for scoring (tag → score)
+    _max_genre_aff = max((float(r.affinity_score) for r in top_genre_rows), default=1.0) or 1.0
+    user_genre_affinity: dict[str, float] = {
+        r.genre.lower(): min(100.0, float(r.affinity_score) / _max_genre_aff * 100)
+        for r in top_genre_rows if r.genre
+    }
 
     seen: set[str] = set()
     candidates: list[AlbumResult] = []
 
+    # Track how many recs each seed artist has produced (for diversity cap)
+    seed_artist_counts: dict[str, int] = {}
+
+    def _build_why_text(
+        artist: str,
+        album_name: str,
+        pop_score: float,
+        source_context: str,
+        top_tracks: list[dict],
+        genre_hint: str = "",
+    ) -> str:
+        """
+        Build a human-readable 'why recommended' string that highlights
+        the specific popular songs that led to this album being chosen.
+        """
+        # Find which of the top tracks are on this album
+        _ALBUM_NOISE = re.compile(
+            r'\s*[\(\[](deluxe|expanded|remaster(?:ed)?|anniversary|special'
+            r'|edition|version|bonus|explicit)[^\)\]]*[\)\]]',
+            re.IGNORECASE,
+        )
+        def _norm(s): return _ALBUM_NOISE.sub("", s).strip().lower()
+
+        album_tracks = [
+            t for t in top_tracks
+            if t.get("album") and _norm(t["album"]) == _norm(album_name)
+        ]
+        # Fall back to top 3 tracks if album attribution is incomplete
+        if not album_tracks:
+            album_tracks = top_tracks[:3]
+
+        hit_names = [t["name"] for t in album_tracks[:3] if t.get("name")]
+        hits_str = ""
+        if hit_names:
+            if len(hit_names) == 1:
+                hits_str = f" Features their hit '{hit_names[0]}'."
+            else:
+                hits_str = f" Features hits: {', '.join(repr(h) for h in hit_names)}."
+
+        return (
+            f"{source_context}{genre_hint}.{hits_str} "
+            f"{'Recommended album: ' + album_name + '. ' if album_name else ''}"
+            f"Popularity: {pop_score:.0f}/100."
+        )
+
+    def _genre_affinity_score(tags: list[str]) -> float:
+        """
+        Compute a 0–100 genre affinity score for an artist based on tag overlap
+        with the user's genre profile.
+
+        - No tags at all → 50.0 (neutral, not penalised per spec)
+        - Tags present but none overlap → 0.0
+        - Tags overlap → average affinity of matching tags, weighted by overlap count
+
+        This replaces the old hardcoded source_affinity=0.0 for PATH D so
+        taste is a real 25% signal in the blended score.
+        """
+        if not tags:
+            return 50.0  # neutral — no data, don't penalise
+        tag_lowers = [t.lower() for t in tags[:5]]
+        matched_scores = [
+            user_genre_affinity[tl]
+            for tl in tag_lowers
+            if tl in user_genre_affinity
+        ]
+        if not matched_scores:
+            return 0.0
+        # Weight by how many tags matched — more overlap = stronger signal
+        overlap_bonus = min(20.0, (len(matched_scores) - 1) * 10.0)
+        return min(100.0, (sum(matched_scores) / len(matched_scores)) + overlap_bonus)
+
     def _add_candidate(
-        artist: str, album: str, release_year, pop_score: float,
-        image_url, source_artist: str, source_affinity: float,
-        why: str, rec_type: str,
+        artist: str,
+        album: str,
+        release_year,
+        pop_score: float,
+        image_url,
+        source_artist: str,
+        source_affinity: float,
+        why: str,
+        rec_type: str,
         lastfm_listeners: float = 0.0,
+        tags: list = None,
         is_wildcard: bool = False,
     ):
         dedup = f"{artist.lower()}::{album.lower()}"
         if dedup in seen or dedup in queued:
             return
 
-        # Suppress artists queued recently (90-day window) or rejected (180-day)
         if artist.lower() in rejected_artists:
-            log.debug(f"  Suppressing '{artist}' — rejected within last 180 days")
             return
         if artist.lower() in recently_queued_artists:
-            log.debug(f"  Suppressing '{artist}' — queued within last 90 days")
             return
 
         if album:
             exact_key = f"{artist.lower()}::{album.lower()}"
             if exact_key in known_albums:
-                log.debug(f"  Dedup (exact): '{album}' by '{artist}'")
                 return
             if album_in_library(artist, album, db):
                 log.info(f"  Dedup (fuzzy album): '{album}' by '{artist}' — already in library")
                 return
-            track_key = f"{artist.lower()}::{album.lower()}"
-            if track_key in known_track_names:
-                log.info(f"  Dedup (single/EP): '{album}' by '{artist}' — title matches owned track")
+            if f"{artist.lower()}::{album.lower()}" in known_track_names:
                 return
 
         seen.add(dedup)
 
+        # ── Genre affinity signal ─────────────────────────────────────────────
+        # Compute from artist tags rather than source chain so PATH D candidates
+        # get a real taste score instead of a hardcoded 0.
+        # PATH A/B pass source_affinity explicitly; we take the max so seed-chain
+        # affinity still counts when it's stronger than the genre signal.
+        genre_aff = _genre_affinity_score(tags or [])
+        effective_affinity = max(source_affinity, genre_aff)
+
         # ── Scoring ───────────────────────────────────────────────────────────
-        # For discovery, POPULARITY leads — we want to surface music the world
-        # loves, not just music adjacent to what you already love.
-        #
-        #   50% lastfm_listeners  — global reach / how many people actually listen
-        #   30% pop_score         — album/artist-level popularity signal
-        #   20% source_affinity   — tiebreaker: prefer recs from artists you love
-        #
-        # Previously this was 40/25/35 (affinity-led), which caused familiar
-        # artist similarities to always outrank genuinely popular new artists.
+        # 50% global listener reach (was 60% — reduced to make room for taste)
+        # 25% artist/album popularity signal
+        # 25% taste affinity (was 15% — now a genuine signal, not a tiebreaker)
         blended = (
-            (lastfm_listeners * 0.60) +  # global reach dominates discovery
-            (pop_score        * 0.25) +  # album/artist-level signal
-            (source_affinity  * 0.15)    # tiebreaker only
+            (lastfm_listeners    * 0.50) +
+            (pop_score           * 0.25) +
+            (effective_affinity  * 0.25)
         )
 
-        # "New but popular" boost: artist not in library at all + high listeners.
-        # Boosted by 15pts (was 8) so genuinely popular unknowns can compete with
-        # mid-tier similarity results.
+        # "New but popular" boost: artist not in library + strong listener score
         never_heard = artist.lower() not in known_artists
         if never_heard and lastfm_listeners >= 60:
-            blended = min(100.0, blended + 20.0)
+            blended = min(100.0, blended + 15.0)
 
-        # Wildcard bonus: pure popularity ranking, no affinity component
         if is_wildcard:
             blended = min(100.0, blended + 5.0)
 
@@ -682,23 +873,46 @@ def recommend_new_albums(
             image_url=image_url,
             why=why,
             source_artist=source_artist,
-            source_affinity=round(source_affinity, 1),
+            source_affinity=round(effective_affinity, 1),
             lastfm_listeners=round(lastfm_listeners, 1),
             rec_type=rec_type,
         ))
 
+    # ── Taste-aware genre cap helpers ─────────────────────────────────────────
+    def _genre_cap_for(tag: str) -> int:
+        """Return the cap for a given tag: higher for genres the user likes."""
+        return GENRE_CAP_LIKED if tag.lower() in user_top_genres else GENRE_CAP_NEUTRAL
+
+    def _genre_ok(tags: list[str]) -> bool:
+        """
+        Return True if this artist's top tags still have headroom.
+        A tag is exhausted when its count reaches its cap.
+        An artist with no tags is always OK (neutral, not penalised).
+        """
+        if not tags:
+            return True
+        for tag in tags[:3]:
+            tl = tag.lower()
+            if genre_counts.get(tl, 0) >= _genre_cap_for(tl):
+                return False
+        return True
+
+    def _charge_genre(tags: list[str]):
+        """Increment genre counters after a candidate is accepted."""
+        for tag in tags[:3]:
+            tl = tag.lower()
+            genre_counts[tl] = genre_counts.get(tl, 0) + 1
+
     # ── PATH A: Missing albums from known artists ─────────────────────────────
-    # Capped at 25% of the total limit — this keeps "complete your collection"
-    # suggestions from drowning out genuine new-artist discovery.
-    # PATH A recs get a familiarity penalty so they score BELOW new artists
-    # of comparable popularity. The user already knows these artists; the point
-    # of the discovery queue is to find artists they DON'T know.
+    # Uses top-songs→album logic, same as PATH B/D — no special-casing for
+    # known artists. Capped at 25% of limit.
     path_a_cap = max(2, limit // 4)
     path_a_count = 0
+
     for artist_name, aff_score in affinity_map.items():
         if path_a_count >= path_a_cap:
             break
-        # Look for cached discography  
+
         disco_key = f"discography:{artist_name.lower()}"
         disco_row = db.query(PopularityCache).filter_by(cache_key=disco_key).first()
         if not disco_row:
@@ -708,47 +922,90 @@ def recommend_new_albums(
         except Exception:
             continue
 
-        for alb in albums_data:
-            alb_name = alb.get("name", "")
-            if not alb_name:
-                continue
-            lib_key = f"{artist_name.lower()}::{alb_name.lower()}"
-            if lib_key in known_albums:
-                log.debug(f"  Path A skip (exact): {artist_name} / {alb_name}")
-                continue   # already have it
-            # Fuzzy check — catches "Greatest Hits 2003" vs "Greatest Hits: Platinum Collection"
-            if album_in_library(artist_name, alb_name, db):
-                log.debug(f"  Path A skip (fuzzy): {artist_name} / {alb_name}")
+        # Get artist-level listener score for blending
+        pop_key = f"artist:{artist_name.lower()}"
+        pop_row = db.query(PopularityCache).filter_by(cache_key=pop_key).first()
+        artist_listeners_score = 0.0
+        artist_tags: list[str] = []
+        if pop_row:
+            try:
+                pd = json.loads(pop_row.payload)
+                raw_l = float(pd.get("listener_count", 0))
+                if raw_l > 0:
+                    artist_listeners_score = min(100.0, (math.log1p(raw_l) / math.log1p(10_000_000)) * 100)
+                artist_tags = pd.get("tags", [])
+            except Exception:
+                pass
+
+        # Choose the best missing album using top-songs logic
+        best_album, best_year, best_image = _get_best_album_for_artist(artist_name, db)
+
+        if not best_album:
+            continue
+        lib_key = f"{artist_name.lower()}::{best_album.lower()}"
+        if lib_key in known_albums or album_in_library(artist_name, best_album, db):
+            # Top album already owned — try the next best from discography
+            best_album = ""
+            for alb in albums_data:
+                alb_name = alb.get("name", "")
+                if not alb_name:
+                    continue
+                if f"{artist_name.lower()}::{alb_name.lower()}" in known_albums:
+                    continue
+                if album_in_library(artist_name, alb_name, db):
+                    continue
+                best_album = alb_name
+                best_year = alb.get("release_year")
+                best_image = alb.get("image_url")
+                break
+            if not best_album:
                 continue
 
-            pop_score = float(alb.get("popularity_score", 40))
-            # For known artists: use their own affinity as the listener proxy
-            # (we already know user loves them, so fame matters less here)
-            before_len = len(candidates)
-            # Familiarity penalty: known artists score 15pts lower than new ones
-            # so genuine discovery always wins ties with "get more Adele" recs
-            _add_candidate(
-                artist=artist_name,
-                album=alb_name,
-                release_year=alb.get("release_year"),
-                pop_score=max(0.0, pop_score - 15.0),
-                image_url=alb.get("image_url"),
-                source_artist=artist_name,
-                source_affinity=aff_score,
-                lastfm_listeners=aff_score,
-                why=(
-                    f"You listen to {artist_name} a lot but don't have "
-                    f"'{alb_name}' (popularity {pop_score:.0f}/100)."
-                ),
-                rec_type="missing_album",
-            )
-            if len(candidates) > before_len:
-                path_a_count += 1
+        if not _genre_ok(artist_tags):
+            continue
 
-    # ── PATH B: New artists via similarity (from sampled seed artists) ─────────
+        # Get top tracks for why-text
+        from models import ArtistEnrichment
+        ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist_name.lower()).first()
+        top_tracks_list: list[dict] = []
+        if ae and ae.top_tracks:
+            try:
+                top_tracks_list = json.loads(ae.top_tracks)
+            except Exception:
+                pass
+
+        why = _build_why_text(
+            artist_name, best_album, artist_listeners_score,
+            f"You love {artist_name} but don't have this album",
+            top_tracks_list,
+        )
+
+        before = len(candidates)
+        _add_candidate(
+            artist=artist_name,
+            album=best_album,
+            release_year=best_year,
+            pop_score=max(0.0, artist_listeners_score - 15.0),  # familiarity penalty
+            image_url=best_image,
+            source_artist=artist_name,
+            source_affinity=aff_score,
+            lastfm_listeners=aff_score,  # use affinity as listener proxy for known artists
+            why=why,
+            rec_type="missing_album",
+            tags=artist_tags,
+        )
+        if len(candidates) > before:
+            _charge_genre(artist_tags)
+            path_a_count += 1
+
+    # ── PATH B: New artists via similarity ────────────────────────────────────
     for seed_row in seed_rows:
         seed_name = seed_row.artist_name
         source_affinity = affinity_map.get(seed_name, 50.0)
+
+        # Enforce per-seed-artist diversity cap
+        if seed_artist_counts.get(seed_name, 0) >= per_seed_cap:
+            continue
 
         similar_key = f"similar:{seed_name.lower()}"
         sim_row = db.query(PopularityCache).filter_by(cache_key=similar_key).first()
@@ -759,11 +1016,12 @@ def recommend_new_albums(
         except Exception:
             continue
 
-        # Shuffle similar artists so we don't always recommend the same #1 similar
         similar_shuffled = list(similar_artists)
         random.shuffle(similar_shuffled)
 
         for similar in similar_shuffled:
+            if seed_artist_counts.get(seed_name, 0) >= per_seed_cap:
+                break
             if similar.lower() in known_artists:
                 continue
 
@@ -772,7 +1030,7 @@ def recommend_new_albums(
             pop_score = 40.0
             lastfm_listeners_score = 40.0
             image_url = None
-            tags = []
+            tags: list[str] = []
 
             if pop_row:
                 try:
@@ -788,54 +1046,31 @@ def recommend_new_albums(
                 except Exception:
                     pass
 
-            album_name, release_year, album_image = _get_top_album_from_cache(similar, db)
+            if not _genre_ok(tags):
+                continue
+
+            # ── Core change: pick album via top-songs logic ───────────────────
+            album_name, release_year, album_image = _get_best_album_for_artist(similar, db)
             use_image = album_image or image_url
 
+            # Load top tracks for why-text
+            from models import ArtistEnrichment
+            ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=similar.lower()).first()
+            top_tracks_list: list[dict] = []
+            if ae and ae.top_tracks:
+                try:
+                    top_tracks_list = json.loads(ae.top_tracks)
+                except Exception:
+                    pass
+
             genre_hint = f" ({', '.join(tags[:2])})" if tags else ""
-
-            # Pull top tracks from ArtistEnrichment for the "why" text —
-            # this tells the user what the best-known songs by this artist are
-            # so they know what they're getting before they download the album.
-            top_track_names = []
-            try:
-                from models import ArtistEnrichment
-                ae = db.query(ArtistEnrichment).filter_by(
-                    artist_name_lower=similar.lower()
-                ).first()
-                if ae and ae.top_tracks:
-                    import json as _json
-                    tt = _json.loads(ae.top_tracks)
-                    top_track_names = [t["name"] for t in tt[:3] if t.get("name")]
-            except Exception:
-                pass
-
-            # Find the specific hit track that this album was chosen for
-            top_hit = ""
-            try:
-                if ae and ae.top_tracks:
-                    import json as _json2
-                    tt2 = _json2.loads(ae.top_tracks)
-                    # If album_name is set, find the track from that album
-                    if album_name:
-                        for t in tt2:
-                            if t.get("album", "").lower() == album_name.lower():
-                                top_hit = t["name"]
-                                break
-                    # Fallback: just the overall #1 track
-                    if not top_hit and tt2:
-                        top_hit = tt2[0].get("name", "")
-            except Exception:
-                pass
-
-            known_for = (f" Known for: {', '.join(top_track_names)}." if top_track_names else "")
-            hit_note  = (f" Start with '{top_hit}'." if top_hit else "")
-            why = (
-                f"Similar to {seed_name}{genre_hint}, an artist you love.{known_for}"
-                f"{hit_note} "
-                f"{'Recommended album: ' + album_name + '. ' if album_name else ''}"
-                f"Popularity: {pop_score:.0f}/100."
+            why = _build_why_text(
+                similar, album_name, pop_score,
+                f"Similar to {seed_name}{genre_hint}, an artist you love",
+                top_tracks_list,
             )
 
+            before = len(candidates)
             _add_candidate(
                 artist=similar,
                 album=album_name,
@@ -847,33 +1082,29 @@ def recommend_new_albums(
                 lastfm_listeners=lastfm_listeners_score,
                 why=why,
                 rec_type="new_artist",
+                tags=tags,
             )
+            if len(candidates) > before:
+                seed_artist_counts[seed_name] = seed_artist_counts.get(seed_name, 0) + 1
+                _charge_genre(tags)
 
-    # ── PATH D: Globally popular — no seed required ───────────────────────────
-    # Pull the most-listened-to artists from the full popularity cache regardless
-    # of similarity to any seed. This is the "what's huge right now that I haven't
-    # heard" path. It breaks the similarity-chain feedback loop entirely.
-    # Target: 25% of the final output comes from this path.
+    # ── PATH D: Globally popular (≥1M listeners), not in library ─────────────
     path_d_target = max(4, int(limit * 0.40))
     path_d_added = 0
-    # PATH D: pull genuinely popular artists not in library
-    # 1M listener floor keeps this tier high-quality
 
     try:
         from models import PopularityCache as PC
-        # Fetch all artist cache entries, sort by listener_count descending
         all_artist_cache = (
             db.query(PC)
             .filter(PC.cache_key.like("artist:%"))
             .all()
         )
-        # Parse and sort by raw listener count
         scored_global = []
         for row in all_artist_cache:
             try:
                 pd = json.loads(row.payload)
                 raw_listeners = float(pd.get("listener_count", 0))
-                if raw_listeners < 1_000_000:  # floor: only artists with genuine global reach
+                if raw_listeners < 1_000_000:
                     continue
                 artist_name_g = pd.get("name") or row.cache_key.replace("artist:", "")
                 if not artist_name_g:
@@ -896,47 +1127,46 @@ def recommend_new_albums(
             if path_d_added >= path_d_target:
                 break
 
-            tags = pd.get("tags", [])
+            tags_g = pd.get("tags", [])
+
+            # ── Medium-strictness genre gate ──────────────────────────────────
+            # Require at least 1 tag overlap with user's top genres unless the
+            # artist is a genuine global phenomenon (listeners_score >= 90).
+            # Artists with no tags at all are treated as neutral and pass through.
+            if tags_g and listeners_score < 90.0:
+                tag_lowers_g = [t.lower() for t in tags_g[:5]]
+                has_genre_overlap = any(t in user_top_genres for t in tag_lowers_g)
+                if not has_genre_overlap:
+                    log.debug(
+                        "  PATH D skip (genre mismatch): '%s' tags=%s — not in user genres",
+                        artist_name_g, tags_g[:3],
+                    )
+                    continue
+
+            if not _genre_ok(tags_g):
+                continue
+
             image_url_g = pd.get("image_url")
-            album_name_g, release_year_g, album_image_g = _get_top_album_from_cache(artist_name_g, db)
+            # Top-songs → album logic for globally popular artists
+            album_name_g, release_year_g, album_image_g = _get_best_album_for_artist(artist_name_g, db)
             use_image_g = album_image_g or image_url_g
-            genre_hint_g = f" ({', '.join(tags[:2])})" if tags else ""
+            genre_hint_g = f" ({', '.join(tags_g[:2])})" if tags_g else ""
 
-            top_track_names_g = []
-            try:
-                from models import ArtistEnrichment
-                ae_g = db.query(ArtistEnrichment).filter_by(
-                    artist_name_lower=artist_name_g.lower()
-                ).first()
-                if ae_g and ae_g.top_tracks:
-                    import json as _json
-                    tt_g = _json.loads(ae_g.top_tracks)
-                    top_track_names_g = [t["name"] for t in tt_g[:3] if t.get("name")]
-            except Exception:
-                pass
+            from models import ArtistEnrichment
+            ae_g = db.query(ArtistEnrichment).filter_by(
+                artist_name_lower=artist_name_g.lower()
+            ).first()
+            top_tracks_g: list[dict] = []
+            if ae_g and ae_g.top_tracks:
+                try:
+                    top_tracks_g = json.loads(ae_g.top_tracks)
+                except Exception:
+                    pass
 
-            top_hit_g = ""
-            try:
-                if ae_g and ae_g.top_tracks:
-                    import json as _json3
-                    tt3 = _json3.loads(ae_g.top_tracks)
-                    if album_name_g:
-                        for t in tt3:
-                            if t.get("album", "").lower() == album_name_g.lower():
-                                top_hit_g = t["name"]
-                                break
-                    if not top_hit_g and tt3:
-                        top_hit_g = tt3[0].get("name", "")
-            except Exception:
-                pass
-
-            known_for_g = (f" Known for: {', '.join(top_track_names_g)}." if top_track_names_g else "")
-            hit_note_g  = (f" Start with '{top_hit_g}'." if top_hit_g else "")
-            why_g = (
-                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score."
-                f"{known_for_g}{hit_note_g} "
-                f"{'Recommended album: ' + album_name_g + '. ' if album_name_g else ''}"
-                f"Not yet in your library."
+            why_g = _build_why_text(
+                artist_name_g, album_name_g, listeners_score,
+                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score — not yet in your library",
+                top_tracks_g,
             )
 
             before = len(candidates)
@@ -947,104 +1177,22 @@ def recommend_new_albums(
                 pop_score=pop_score_g,
                 image_url=use_image_g,
                 source_artist="global_popular",
-                source_affinity=0.0,    # no affinity component — pure popularity
+                source_affinity=0.0,   # genre_affinity_score computed inside _add_candidate from tags
                 lastfm_listeners=listeners_score,
                 why=why_g,
                 rec_type="new_artist",
+                tags=tags_g,
             )
             if len(candidates) > before:
                 path_d_added += 1
+                _charge_genre(tags_g)
 
     except Exception as e:
         log.warning(f"  PATH D (global popular) failed: {e}")
 
     log.info(f"  PATH D: {path_d_added} globally popular artists added")
-    # Find artists that share tags with your top genres but aren't similar to
-    # any of your known artists. This is the "one genre step out" expansion.
-    # We scan the popularity cache for artists tagged with adjacent genres.
-    wildcard_target = max(3, limit // 5)
-    wildcard_added = 0
 
-    if user_top_genres:
-        # Sample from ALL cached artist entries looking for genre-adjacent tags
-        from models import PopularityCache as PC
-        # Fetch a sample of artist cache entries to scan for genre adjacency
-        artist_cache_rows = (
-            db.query(PC)
-            .filter(PC.cache_key.like("artist:%"))
-            .limit(500)
-            .all()
-        )
-        # Shuffle so we don't always look at the same 500
-        random.shuffle(artist_cache_rows)
-
-        for cache_row in artist_cache_rows:
-            if wildcard_added >= wildcard_target:
-                break
-            try:
-                pd = json.loads(cache_row.payload)
-                tags = [t.lower() for t in pd.get("tags", [])]
-                if not tags:
-                    continue
-
-                # Adjacent: shares at least one tag with user's genres
-                # but that tag is NOT the user's #1 genre (truly adjacent, not core)
-                shared = set(tags) & user_top_genres
-                if not shared:
-                    continue
-
-                artist_name = pd.get("name") or cache_row.cache_key.replace("artist:", "")
-                if not artist_name or artist_name.lower() in known_artists:
-                    continue
-                if artist_name.lower() in recently_queued_artists:
-                    continue
-
-                pop_score = float(pd.get("popularity_score", 40))
-                raw_listeners = float(pd.get("listener_count", 0))
-                if raw_listeners > 0:
-                    listeners_score = min(100.0, (math.log1p(raw_listeners) / math.log1p(10_000_000)) * 100)
-                else:
-                    listeners_score = pop_score
-
-                # Only surface reasonably popular wildcard artists
-                if listeners_score < 35:
-                    continue
-
-                album_name, release_year, album_image = _get_top_album_from_cache(artist_name, db)
-                image_url = album_image or pd.get("image_url")
-                genre_label = ", ".join(list(shared)[:2])
-
-                why = (
-                    f"Genre discovery: {artist_name} matches your taste in {genre_label}. "
-                    f"{'Album: ' + album_name + '. ' if album_name else ''}"
-                    f"Popularity: {pop_score:.0f}/100."
-                )
-
-                before = len(candidates)
-                _add_candidate(
-                    artist=artist_name,
-                    album=album_name,
-                    release_year=release_year,
-                    pop_score=pop_score,
-                    image_url=image_url,
-                    source_artist=f"genre:{genre_label}",
-                    source_affinity=50.0,   # neutral — not from a known artist
-                    lastfm_listeners=listeners_score,
-                    why=why,
-                    rec_type="new_artist",
-                    is_wildcard=True,
-                )
-                if len(candidates) > before:
-                    wildcard_added += 1
-
-            except Exception:
-                continue
-
-    log.info(f"  Discovery: {len(candidates)} candidates ({wildcard_added} wildcards)")
-
-    # ── Final sort with light randomness ─────────────────────────────────────
-    # Jitter scores slightly so the exact same ranking doesn't repeat every run.
-    # Top candidates (score >= 70) stay near the top; lower ones shuffle more.
+    # ── Final sort with light jitter ─────────────────────────────────────────
     for c in candidates:
         jitter_range = 3.0 if c.popularity_score >= 70 else 8.0
         c.popularity_score = round(
@@ -1053,6 +1201,10 @@ def recommend_new_albums(
         )
 
     candidates.sort(key=lambda a: a.popularity_score, reverse=True)
+    log.info(
+        f"  Discovery: {len(candidates)} candidates total "
+        f"(seed cap={per_seed_cap}/artist, genre caps: liked={GENRE_CAP_LIKED} neutral={GENRE_CAP_NEUTRAL})"
+    )
     return candidates[:limit]
 
 

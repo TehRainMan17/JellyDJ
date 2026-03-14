@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../lib/api.js'
 import { useAuth } from '../contexts/AuthContext.jsx'
@@ -76,11 +77,10 @@ function QueueCard({ item, onAction, onSendToLidarr, onDelete, onPin, activeTab,
   const handleSend = async () => {
     setSending(true); setMsg('')
     try {
-      const r = await api.post(`/api/discovery/${item.id}/send-to-lidarr`)
-      const d = await r.json()
+      const d = await api.post(`/api/discovery/${item.id}/send-to-lidarr`)
       setMsg(d.ok ? '✓ Sent' : `✗ ${d.message || 'Failed'}`)
       if (d.ok) onSendToLidarr(item.id)
-    } catch { setMsg('✗ Network error') }
+    } catch (err) { setMsg(`✗ ${err?.message || 'Network error'}`) }
     finally { setSending(false); setTimeout(() => setMsg(''), 5000) }
   }
   const handleDelete = async () => {
@@ -332,14 +332,13 @@ export default function DiscoveryQueue() {
   const handlePopulate = async () => {
     setPopulating(true); setPopMsg('Generating recommendations…'); setPopResult(null)
     try {
-      const r = await api.post('/api/discovery/populate')
-      const d = await r.json()
+      const d = await api.post('/api/discovery/populate')
       setPopMsg('')
       setPopResult(d.ok
         ? { ok:true,  text:`Added ${d.added} new recommendation${d.added!==1?'s':''}` }
         : { ok:false, text: d.detail || 'Populate failed' })
       fetchItems(activeTab); fetchCounts()
-    } catch { setPopMsg(''); setPopResult({ ok:false, text:'Network error' }) }
+    } catch (err) { setPopMsg(''); setPopResult({ ok:false, text: err?.message || 'Network error' }) }
     finally { setPopulating(false); setTimeout(() => setPopResult(null), 10000) }
   }
 
