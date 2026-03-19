@@ -23,6 +23,7 @@ from routers import (
     connections, external_apis, indexer, recommender,
     webhooks, discovery, playlists, insights, automation, exclusions,
 )
+from routers.graph import router as graph_router
 from routers.auth import router as auth_router
 from routers.playlist_templates import router as playlist_templates_router
 from routers.user_playlists import router as user_playlists_router
@@ -400,6 +401,7 @@ app.include_router(webhooks.router)       # /api/webhooks       — Jellyfin pla
 app.include_router(discovery.router)      # /api/discovery      — new album recommendation queue
 app.include_router(playlists.router)      # /api/playlists      — playlist generation + history
 app.include_router(insights.router)       # /api/insights       — listening stats + charts
+app.include_router(graph_router)          # /api/graph          — artist/genre network map
 app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
 app.include_router(exclusions.router)     # /api/exclusions     — manual album exclusions
 app.include_router(auth_router)           # /api/auth           — Jellyfin login + JWT tokens

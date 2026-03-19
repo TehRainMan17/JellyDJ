@@ -14,7 +14,7 @@
 
 <p align="center">
   <strong>A self-hosted music recommendation engine that turns your static Jellyfin library into a living, breathing music ecosystem.</strong><br/>
-  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Lidarr integration
+  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration
 </p>
 
 <br/>
@@ -153,6 +153,7 @@ This is early days on this project and, as such, large portions are unfinished, 
 | 🔥 | **Billboard Hot 100** | Weekly chart data cross-referenced with your library so you never miss a trending track |
 | 📡 | **Webhook Scoring** | Jellyfin playback events update taste profiles in real time — skips count against bad recs |
 | 📊 | **Insights** | Full score breakdowns, genre affinities, top artists, skip analysis, and listening stats per user |
+| 🌌 | **Music Universe Map** | Interactive zoom-driven graph of your taste — genres, artists, connections, skip signals, drift, and track orbits |
 | 🎸 | **Multi-Source Enrichment** | Spotify, Last.fm, MusicBrainz, Billboard — layered signals, no single point of failure |
 | 🏠 | **Truly Self-Hosted** | No cloud, no accounts, no tracking. Your data stays on your hardware |
 
@@ -174,6 +175,13 @@ This is early days on this project and, as such, large portions are unfinished, 
   <img src=".github/images/shot-discovery-insights.png" alt="Discovery Queue and Insights" width="100%" />
 </p>
 
+### Music Universe Map
+*Your entire music taste visualised as an interactive galaxy — zoom from genre clusters down to individual tracks*
+
+<p align="center">
+  <img src=".github/images/screenshot-musicUniverse.PNG" alt="Music Universe Map" width="100%" />
+</p>
+
 ### Playlist Customization
 *Build any playlist you can imagine — chain scoring blocks with AND/OR logic, tune sliders, and let it rip*
 
@@ -187,6 +195,45 @@ This is early days on this project and, as such, large portions are unfinished, 
 <p align="center">
   <img src=".github/images/shot-settings.png" alt="Settings" width="50%" />
 </p>
+
+---
+
+## 🌌 Music Universe Map
+
+The Universe Map is an interactive force-directed graph of your personal music taste, accessible from **Insights → Universe**. It visualises everything JellyDJ knows about your listening in a single zoomable canvas.
+
+### Three zoom levels
+
+| Zoom | View | What you see |
+|---|---|---|
+| Zoomed out | **Galaxy** | Genre bubbles sized and colored by your affinity — brighter = more listened |
+| Mid | **Solar** | Artists emerge inside their genre cluster, sized by plays + affinity |
+| Zoomed in | **Star** | Click any artist to see their top tracks orbiting as moons |
+
+### What the visuals mean
+
+| Signal | Visual |
+|---|---|
+| **Node color** | Affinity heat: grey-blue (low) → teal → purple → gold (high). Stale artists (180+ days unplayed) cool toward grey. Fresh + trending artists glow warmer. |
+| **Node size** | Blends affinity score and raw play count |
+| **↑ / ↓ arrow** | Artist trending up or down on Last.fm (requires enrichment) |
+| **Red arc** | Skip rate — sweeps around the node, longer = higher skip percentage |
+| **Dashed white ring** | Cross-genre bridge — this artist has similarity connections into another genre |
+| **Purple ring** | Replay boost active — you've been deliberately returning to this artist |
+| **★** | You have a favourite track by this artist |
+
+### Interactions
+
+- **Click an artist** — highlights direct connections in gold, second-degree connections in silver, dims everything else. The artist node shrinks to an anchor dot; top tracks orbit around it as moons.
+- **Click a track moon** — opens a track detail card showing play count, recommendation score, skip penalty, and cooldown status.
+- **Hover an artist** — previews connections at lower intensity without committing to a selection.
+- **Search box** — highlights matching artists across the whole graph.
+- **Sliders** — filter by minimum affinity or cap artist count without resetting your zoom position.
+- **⛶ Full** — expands to a true fullscreen overlay. **Esc** or **✕ Exit** to return.
+
+### Track moons (zoomed in, artist selected)
+
+Each moon represents one of the artist's top tracks. A red arc around the moon indicates skip penalty for that specific track. A `↺` sparkle means replay boost is active. Favourite tracks glow gold.
 
 ---
 

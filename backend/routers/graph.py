@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user, UserContext
 from database import get_db
-from models import ManagedUser, ArtistProfile, ArtistEnrichment, ArtistRelation, GenreProfile
+from models import ManagedUser, ArtistProfile, ArtistEnrichment, ArtistRelation, GenreProfile, TrackScore
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/graph", tags=["graph"])
@@ -171,6 +171,29 @@ def get_network_graph(
         .all()
     }
 
+    # Load last-played recency per artist (most recent track play date)
+    from sqlalchemy import func as sqlfunc
+    recency_rows = (
+        db.query(
+            TrackScore.artist_name,
+            sqlfunc.max(TrackScore.last_played).label('last_played'),
+        )
+        .filter(
+            TrackScore.user_id == uid,
+            TrackScore.artist_name.in_(artist_names_in_graph),
+            TrackScore.is_played == True,
+        )
+        .group_by(TrackScore.artist_name)
+        .all()
+    )
+    from datetime import datetime as _dt
+    _now = _dt.utcnow()
+    recency_map: dict[str, float] = {}   # artist_name → days_since_last_play
+    for row in recency_rows:
+        if row.last_played:
+            recency_map[row.artist_name] = max(0.0, (_now - row.last_played).days)
+
+    # Load per-artist skip rate from ArtistProfile (already on ap)
     # Load genre profiles for genre nodes
     genre_profiles = (
         db.query(GenreProfile)
@@ -223,6 +246,11 @@ def get_network_graph(
             "size": _popularity_to_size(affinity, ap.total_plays),
             "has_favorite": ap.has_favorite,
             "replay_boost": round(ap.replay_boost or 0.0, 1),
+            # New fields for visualisation
+            "skip_rate": round(float(ap.skip_rate), 3),
+            "total_skips": ap.total_skips,
+            "days_since_played": recency_map.get(ap.artist_name),
+            "total_tracks_played": ap.total_tracks_played,
         })
 
     for gp in genre_profiles:
@@ -379,6 +407,10 @@ def get_artist_detail(
                 "final_score": float(t.final_score),
                 "is_favorite": t.is_favorite,
                 "cooldown_until": t.cooldown_until.isoformat() if t.cooldown_until else None,
+                "skip_penalty": float(t.skip_penalty) if t.skip_penalty else 0.0,
+                "last_played": t.last_played.isoformat() if t.last_played else None,
+                "recency_score": float(t.recency_score) if t.recency_score else 0.0,
+                "replay_boost": float(t.replay_boost) if t.replay_boost else 0.0,
             }
             for t in top_tracks
         ],

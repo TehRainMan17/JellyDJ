@@ -7,6 +7,7 @@ import {
   AlertCircle, Play, SkipForward, Heart, Snowflake, Zap,
   Clock, Globe, RefreshCw, ThumbsDown, Info, Flame, Activity
 } from 'lucide-react'
+import MusicUniverseMap from '../components/MusicUniverseMap.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1512,9 +1513,10 @@ export default function Insights() {
 
           <div className="flex gap-1 bg-[var(--bg-surface)] rounded-lg p-1 w-fit border border-[var(--bg-overlay)]">
             {[
-              { key: 'tracks',  label: 'Tracks',  icon: Music2 },
-              { key: 'artists', label: 'Artists', icon: Mic2 },
-              { key: 'holiday', label: 'Holiday', icon: Snowflake },
+              { key: 'tracks',   label: 'Tracks',   icon: Music2 },
+              { key: 'artists',  label: 'Artists',  icon: Mic2 },
+              { key: 'holiday',  label: 'Holiday',  icon: Snowflake },
+              { key: 'universe', label: 'Universe', icon: Globe },
             ].map(({ key, label, icon: Icon }) => (
               <button key={key} onClick={() => setTab(key)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all
@@ -1527,9 +1529,14 @@ export default function Insights() {
             ))}
           </div>
 
-          {tab === 'tracks'  && <TrackTable userId={selectedUser} key={selectedUser} />}
-          {tab === 'artists' && <ArtistTable userId={selectedUser} key={selectedUser} />}
-          {tab === 'holiday' && <HolidayTable />}
+          {tab === 'tracks'   && <TrackTable userId={selectedUser} key={selectedUser} />}
+          {tab === 'artists'  && <ArtistTable userId={selectedUser} key={selectedUser} />}
+          {tab === 'holiday'  && <HolidayTable />}
+          {tab === 'universe' && (
+            <div className="card" style={{ height: 680, padding: 0, overflow: 'hidden', borderRadius: '0.75rem' }}>
+              <MusicUniverseMap userId={selectedUser} key={selectedUser} />
+            </div>
+          )}
         </>
       )}
     </div>

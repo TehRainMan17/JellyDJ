@@ -197,7 +197,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const trigger = async (path, setLoading) => {
     setLoading(true)
     try {
-      await fetch(path, { method: 'POST' })
+      await apiFetch(path, { method: 'POST' })
       onTrigger?.()
     } finally {
       setLoading(false)
