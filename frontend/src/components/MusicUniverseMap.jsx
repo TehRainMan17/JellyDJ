@@ -202,7 +202,7 @@ function ArtistPanel({ detail, onClose }) {
           {detail.replay_boost > 0 && (
             <span className="text-[10px] px-1.5 py-0.5 rounded-full"
                   style={{background:'rgba(167,139,250,0.15)',color:'#a78bfa'}}>
-              ↺ Replay boost +{detail.replay_boost.toFixed(1)}
+              ⚡ Replay boost +{detail.replay_boost.toFixed(1)}
             </span>
           )}
         </div>
@@ -247,7 +247,7 @@ function ArtistPanel({ detail, onClose }) {
                       <span className="text-[9px] text-red-400 opacity-70" title="High skip rate">⚡</span>
                     )}
                     {(t.replay_boost||0) > 0 && (
-                      <span className="text-[9px] text-purple-400 opacity-70" title="Replay boost">↺</span>
+                      <span className="text-[9px] text-purple-400 opacity-70" title="Replay boost: you've been actively returning to this artist recently">⚡</span>
                     )}
                   </div>
                 </div>
@@ -1022,28 +1022,23 @@ export default function MusicUniverseMap({ userId }) {
           .attr('fill-opacity', Math.min(0.85, 0.3 + skipPen*0.7))
           .attr('pointer-events','none')
       }
-      // Replay boost sparkle dot
+      // Replay boost marker — ⚡ means this artist has an active replay boost
+      // (you voluntarily returned to listen to them within the last 7 days)
       if ((track.replay_boost||0) > 0)
         tg.append('text').attr('x',6).attr('y',-5)
           .attr('font-size',7).attr('fill','#a78bfa').attr('fill-opacity',0.85)
-          .attr('pointer-events','none').text('↺')
+          .attr('pointer-events','none').text('⚡')
 
-      // Label — positioned radially outward from center so adjacent labels don't collide
-      // The label base sits just past the moon, pointing away from cx/cy
+      // Label — always above the moon (negative y = up in SVG)
       const nm = track.track_name||''
       const label = nm.length > maxChars ? nm.slice(0, maxChars-1)+'…' : nm
-      // Radial direction unit vector (outward from center)
-      const ux = Math.cos(angle), uy = Math.sin(angle)
-      // Label anchor point: moon edge + small gap, in radial direction
-      const lDist  = 12   // px past moon edge
-      const lx     = ux * lDist
-      const ly     = uy * lDist
-      // Estimated half-width of label text
       const lHalfW = label.length * labelFont * 0.32 + 4
       const lH     = labelFont + 4
+      const moonEdge = 6    // moon radius
+      const gap      = 3    // gap between moon top and label bottom
 
       const labelG = tg.append('g')
-        .attr('transform', `translate(${lx},${ly})`)
+        .attr('transform', `translate(0, ${-(moonEdge + gap + lH/2)})`)
         .attr('pointer-events','none')
       labelG.append('rect')
         .attr('x', -lHalfW).attr('y', -lH/2)
@@ -1056,11 +1051,13 @@ export default function MusicUniverseMap({ userId }) {
         .attr('fill', cd?'#4b5563':fav?'#f59e0b':'#b0b8c8')
         .text(label)
       if (track.play_count>0) {
-        const playY = lH/2 + labelFont * 0.9
-        labelG.append('text')
-          .attr('text-anchor','middle').attr('y', playY)
+        // Play count sits below the moon (opposite side from the label)
+        tg.append('text')
+          .attr('text-anchor','middle')
+          .attr('y', moonEdge + gap + labelFont * 0.85)
           .attr('font-size', Math.max(5.5, labelFont * 0.75))
           .attr('fill','#64748b')
+          .attr('pointer-events','none')
           .text(`×${track.play_count}`)
       }
 
@@ -1265,7 +1262,7 @@ export default function MusicUniverseMap({ userId }) {
           </div>
           <div className="flex items-center gap-2">
             <span style={{color:'#4ade80',fontSize:11,lineHeight:1,fontWeight:'bold'}}>↑</span>
-            <span className="text-[10px] text-slate-500">Trending up on Last.fm</span>
+            <span className="text-[10px] text-slate-500">Trending on Last.fm*</span>
           </div>
           <div className="flex items-center gap-2">
             <span style={{color:'#ef4444',fontSize:9,lineHeight:1}}>▬</span>
@@ -1279,9 +1276,16 @@ export default function MusicUniverseMap({ userId }) {
             <div className="h-px w-4 shrink-0" style={{background:'#94a3b8',opacity:0.6}}/>
             <span className="text-[10px] text-slate-500">2nd-degree connection</span>
           </div>
+          <div className="text-[9px] text-slate-600 mt-0.5 leading-tight">
+            * needs 2 enrichment runs
+          </div>
           <div className="flex items-center gap-2">
             <div className="w-3 h-3 rounded-full shrink-0 border" style={{borderColor:'#a78bfa'}}/>
-            <span className="text-[10px] text-slate-500">Replay boost active</span>
+            <span className="text-[10px] text-slate-500">Replay boost (returned within 7d)</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span style={{color:'#a78bfa',fontSize:9,lineHeight:1}}>⚡</span>
+            <span className="text-[10px] text-slate-500">Track: artist replay boost</span>
           </div>
         </div>
       </div>
