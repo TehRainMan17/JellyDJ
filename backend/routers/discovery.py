@@ -302,7 +302,7 @@ async def _populate_queue_for_user(
     # Raw SQL WHERE clause avoids this entirely.
     db.execute(satext(
         "DELETE FROM discovery_queue "
-        "WHERE user_id = :uid AND status = 'pending' AND auto_queued = 0"
+        "WHERE user_id = :uid AND status = 'pending'"
     ), {"uid": user_id})
 
     # Also clean up already-sent approved items (downloaded, no longer needed).
@@ -318,6 +318,10 @@ async def _populate_queue_for_user(
     # Only include rejected/snoozed/approved items (user decisions) and
     # pinned items. Do NOT include the items we just deleted — they're gone
     # and should be fair game for fresh recs.
+    # Build exclusion set from KEPT items only — rejected/snoozed/approved
+    # (user decisions that should be respected across refreshes).
+    # Pending items were all wiped above so they must NOT be excluded or
+    # they'd block themselves from being re-added with fresh recommendations.
     excluded: set[str] = set()
     kept_rows = db.query(DiscoveryQueueItem.artist_name, DiscoveryQueueItem.album_name
                          ).filter(
@@ -325,11 +329,6 @@ async def _populate_queue_for_user(
         DiscoveryQueueItem.status.in_(["approved", "rejected", "snoozed"]),
     ).all()
     for row in kept_rows:
-        excluded.add(f"{row.artist_name.lower()}::{(row.album_name or '').lower()}")
-
-    # Also exclude pinned items (auto_queued=True) so they aren't duplicated
-    for row in db.query(DiscoveryQueueItem.artist_name, DiscoveryQueueItem.album_name
-                        ).filter_by(user_id=user_id, auto_queued=True).all():
         excluded.add(f"{row.artist_name.lower()}::{(row.album_name or '').lower()}")
 
     log.info(f"  Exclusion set: {len(excluded)} kept/actioned items")

@@ -719,6 +719,56 @@ def _get_top_album_from_cache(artist_name: str, db) -> tuple[str, Optional[int],
     return _get_best_album_for_artist(artist_name, db)
 
 
+# ── Holiday keyword filter (module-level so all paths can use it) ─────────────
+
+def _build_holiday_re():
+    """
+    Build a compiled regex matching holiday/seasonal keywords from HOLIDAY_RULES
+    plus common Last.fm holiday tags. Called once at import time.
+    """
+    import re as _re
+    keywords: set[str] = set()
+    try:
+        from services.holiday import HOLIDAY_RULES
+        for _slug, _keywords, _start, _end in HOLIDAY_RULES:
+            for _kw in _keywords:
+                keywords.add(_kw.lower())
+    except Exception:
+        pass
+    keywords.update({
+        "christmas music", "holiday", "holiday music", "seasonal",
+        "winter holiday", "christmas songs", "christmas carols",
+        "halloween", "thanksgiving", "christmas", "xmas",
+    })
+    return _re.compile(
+        r'\b(' + '|'.join(_re.escape(kw) for kw in sorted(keywords)) + r')\b',
+        _re.IGNORECASE,
+    )
+
+_HOLIDAY_RE = _build_holiday_re()
+
+
+def _is_holiday_artist(name_lower: str, tags: list[str]) -> bool:
+    """
+    Return True if this artist is primarily a holiday act.
+    - Artist name contains a holiday keyword → exclude
+    - >= 50% of their Last.fm tags are holiday keywords → exclude
+    - A single holiday tag among many real-genre tags → keep (handled by hard block in paths)
+    """
+    if _HOLIDAY_RE.search(name_lower):
+        return True
+    if tags:
+        holiday_count = sum(1 for t in tags if _HOLIDAY_RE.search(t.lower()))
+        if holiday_count >= len(tags) / 2:
+            return True
+    return False
+
+
+def _has_holiday_tag(tags: list[str]) -> bool:
+    """Return True if ANY tag is a holiday keyword. Used as a hard block in all paths."""
+    return any(_HOLIDAY_RE.search(t.lower()) for t in tags)
+
+
 def recommend_new_albums(
     user_id: str,
     limit: int,
@@ -1360,7 +1410,7 @@ def recommend_new_albums(
 
             # Hard holiday block — skip any artist with a holiday tag regardless
             # of whether a non-holiday tag passed the genre gate above
-            if any(_holiday_re.search(t.lower()) for t in tags):
+            if any(_HOLIDAY_RE.search(t.lower()) for t in tags):
                 log.debug("  PATH B: skipping '%s' — has holiday tag in %s", similar, tags[:3])
                 continue
 
@@ -1476,7 +1526,7 @@ def recommend_new_albums(
                 continue
 
             # Hard holiday block
-            if any(_holiday_re.search(t.lower()) for t in tags_g):
+            if any(_HOLIDAY_RE.search(t.lower()) for t in tags_g):
                 log.debug("  PATH D: skipping '%s' — has holiday tag in %s", artist_name_g, tags_g[:3])
                 continue
 
@@ -1565,60 +1615,7 @@ def recommend_new_albums(
         from services.holiday import HOLIDAY_RULES
 
         # Build a flat set of all holiday keywords for fast tag/name matching
-        _holiday_keywords: set[str] = set()
-        for _slug, _keywords, _start, _end in HOLIDAY_RULES:
-            for _kw in _keywords:
-                _holiday_keywords.add(_kw.lower())
-        # Add common genre-level holiday terms that may appear as Last.fm tags
-        _holiday_keywords.update({
-            "christmas music", "holiday", "holiday music", "seasonal",
-            "winter holiday", "christmas songs", "christmas carols",
-            "halloween", "thanksgiving",
-        })
-
-        # ── Pre-compile holiday regex ------------------------------------─────
-        # Must be defined before graph-build so _is_holiday_artist can use it.
-        import re as _re
-        _holiday_re = _re.compile(
-            r'\b(' + '|'.join(_re.escape(kw) for kw in _holiday_keywords) + r')\b',
-            _re.IGNORECASE,
-        )
-
-        # ── Build lowercase→payload map from PopularityCache ------------------
-        # Must be defined before graph-build so holiday_artist_names loop works.
-        pop_cache_map: dict[str, tuple[str, dict]] = {}  # lower_name → (display, payload)
-        for pc_row in db.query(PC2).filter(PC2.cache_key.like("artist:%")).all():
-            raw_name = pc_row.cache_key[len("artist:"):]
-            try:
-                payload = _json.loads(pc_row.payload)
-                pop_cache_map[raw_name.lower()] = (raw_name, payload)
-            except Exception:
-                continue
-
-        def _is_holiday_artist(name_lower: str, tags: list[str]) -> bool:
-            """
-            Return True only if this artist is *primarily* a holiday act.
-            An artist with one Christmas single should not be excluded —
-            only acts whose identity is holiday music (e.g. "Christmas Hits",
-            "Holiday Classics") should be filtered.
-
-            Rules:
-              - If the artist NAME itself contains a holiday keyword → exclude
-                (e.g. "Christmas Jazz Orchestra", "Holiday Hits")
-              - If the majority (>50%) of their Last.fm tags are holiday tags → exclude
-              - A single holiday tag among many real-genre tags → keep
-            """
-            # Artist name is a strong signal — "Christmas Choir" etc.
-            if _holiday_re and _holiday_re.search(name_lower):
-                return True
-            # Tag majority check — only exclude if holiday tags dominate
-            if tags:
-                holiday_tag_count = sum(
-                    1 for tag in tags if _holiday_re and _holiday_re.search(tag.lower())
-                )
-                if holiday_tag_count >= len(tags) / 2:  # >= so 1/2 tags = 50% still triggers
-                    return True
-            return False
+        # _holiday_re and _is_holiday_artist are now module-level (defined below recommend_new_albums)
 
         # ── Step 1: build the graph ------------------------------------───────
         # We want all relations where artist_a is known (enriched or in library).
@@ -1637,8 +1634,8 @@ def recommend_new_albums(
             holiday_artist_names: set[str] = set()
             for name_l, (_disp, _pd) in pop_cache_map.items():
                 _tags = _pd.get("tags", [])
-                _hcount = sum(1 for t in _tags if _holiday_re.search(t.lower()))
-                if _holiday_re.search(name_l) or (_tags and _hcount >= len(_tags) / 2):
+                _hcount = sum(1 for t in _tags if _HOLIDAY_RE.search(t.lower()))
+                if _HOLIDAY_RE.search(name_l) or (_tags and _hcount >= len(_tags) / 2):
                     holiday_artist_names.add(name_l)
             log.info(f"  PATH E: pruning {len(holiday_artist_names)} holiday-primary artists from graph")
 
@@ -1738,7 +1735,7 @@ def recommend_new_albums(
                     # This runs before the genre gate so that an artist with tags
                     # like ['novelty', 'christmas'] cannot slip through because
                     # 'novelty' happens to overlap the user's genre profile.
-                    if any(_holiday_re.search(t.lower()) for t in tags_e):
+                    if any(_HOLIDAY_RE.search(t.lower()) for t in tags_e):
                         log.debug(
                             "  PATH E: '%s' skipped — has holiday tag in %s",
                             artist_display, tags_e[:3],
