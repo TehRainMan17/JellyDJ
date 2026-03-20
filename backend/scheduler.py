@@ -127,17 +127,27 @@ def _job_billboard_refresh():
 
 
 def _job_enrichment():
-    """Periodic job: fetch per-song and per-artist Last.fm data (listeners, tags, similar)."""
-    from database import SessionLocal
-    from services.enrichment import run_enrichment
-    db = SessionLocal()
-    try:
-        result = run_enrichment(db)
-        log.info(f"Enrichment job complete: {result}")
-    except Exception as e:
-        log.error(f"Enrichment job failed: {e}")
-    finally:
-        db.close()
+    """
+    Periodic job: fetch per-song and per-artist Last.fm data (listeners, tags, similar).
+    Runs in a daemon thread so the scheduler thread is never blocked — enrichment
+    makes hundreds of sequential HTTP calls and holds the DB for the full run,
+    which was causing 499s on every other request while it ran.
+    """
+    import threading
+
+    def _run():
+        from database import SessionLocal
+        from services.enrichment import run_enrichment
+        db = SessionLocal()
+        try:
+            result = run_enrichment(db)
+            log.info(f"Enrichment job complete: {result}")
+        except Exception as e:
+            log.error(f"Enrichment job failed: {e}", exc_info=True)
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, daemon=True, name="scheduled-enrichment").start()
 
 
 def _job_popularity_cache_refresh():

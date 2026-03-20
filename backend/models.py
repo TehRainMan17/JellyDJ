@@ -634,3 +634,20 @@ class DefaultPlaylistConfig(Base):
     position            = Column(Integer, default=0,     nullable=False)
     created_at          = Column(DateTime, default=datetime.utcnow)
     updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class JobState(Base):
+    """
+    Shared job state for background tasks — readable by all uvicorn workers.
+    Replaces the per-process in-memory dicts that broke with multiple workers.
+    One row per job_id (e.g. "enrichment", "discovery").
+    """
+    __tablename__ = "job_state"
+    id         = Column(Integer, primary_key=True, index=True)
+    job_id     = Column(String, unique=True, nullable=False, index=True)
+    running    = Column(Boolean, default=False, nullable=False)
+    phase      = Column(String, nullable=True)
+    payload    = Column(Text, nullable=True)   # JSON: progress counters etc.
+    started_at = Column(DateTime, nullable=True)
+    finished_at= Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

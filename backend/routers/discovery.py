@@ -259,7 +259,7 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
 
 # ── Queue population ──────────────────────────────────────────────────────────
 
-async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20, path_e_global_seen: set = None):
+async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
     """
     Run the recommender and add new items to the discovery queue.
 
@@ -371,7 +371,7 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20, p
             log.warning(f"  Could not fetch Lidarr monitored albums: {e}")
 
     # ── Step 4: Get recommendations ──────────────────────────────────────────
-    recs = recommend_new_albums(user_id, effective_limit * 4, db, path_e_global_seen=path_e_global_seen)
+    recs = recommend_new_albums(user_id, effective_limit * 4, db)
 
     # ── Step 5: Enforce discovery bias — 75% new artists, 25% known ──────────
     # Split recs by type, then build an oversized ordered pool before the
@@ -605,9 +605,8 @@ async def populate_queue(
 ):
     """
     Populate queue for all enabled users.
-    Returns immediately and runs the heavy work in a background task so the
-    event loop stays free for auth refreshes and other requests during the run.
-    Limit is always read from AutomationSettings.
+    Returns immediately and runs work in a background task so the event loop
+    stays free. Limit is always read from AutomationSettings.
     """
     from models import AutomationSettings
     users = db.query(ManagedUser).filter_by(has_activated=True).all()
@@ -626,9 +625,9 @@ async def populate_queue(
 async def _populate_all_users(users, limit: int = 0):
     """
     Background task: populate discovery queue for all users.
-    Opens a fresh DB session per user and closes it immediately after so the
-    SQLite write lock is only held in short bursts, keeping auth and other
-    requests responsive throughout the run.
+    Each user's populate run is pushed to a thread via asyncio.to_thread so
+    the synchronous SQLAlchemy DB calls and blocking recommender work never
+    run on the async event loop — keeping the app responsive during the run.
     The limit parameter is ignored — it exists only for backwards compatibility.
     """
     import asyncio
@@ -645,28 +644,34 @@ async def _populate_all_users(users, limit: int = 0):
 
     log.info(f"Discovery populate: effective_limit={effective_limit} (from AutomationSettings)")
 
-    # Shared set of PATH E (genre cornerstone) artists already queued this run.
-    # Prevents the same hub artist appearing in every user's queue when they
-    # share similar taste profiles.
+    # Shared PATH E dedup set — prevents identical hub artist recs across users
     path_e_global_seen: set[str] = set()
 
-    for user in users:
-        # Fresh session per user — lock is held only during this user's run,
-        # then released before moving to the next user.
+    def _run_user_sync(user_id: str, username: str):
+        """Synchronous wrapper — runs in a thread via asyncio.to_thread."""
         db = SessionLocal()
         try:
-            added = await _populate_queue_for_user(
-                user.jellyfin_user_id, db, effective_limit,
-                path_e_global_seen=path_e_global_seen,
-            )
-            log.info(f"Discovery queue: +{added} items for {user.username}")
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                added = loop.run_until_complete(
+                    _populate_queue_for_user(
+                        user_id, db, effective_limit,
+                        path_e_global_seen=path_e_global_seen,
+                    )
+                )
+            finally:
+                loop.close()
+            log.info(f"Discovery queue: +{added} items for {username}")
         except Exception as e:
-            log.warning(f"Discovery populate failed for {user.username}: {e}")
+            log.warning(f"Discovery populate failed for {username}: {e}")
         finally:
             db.close()
 
-        # Yield to the event loop between users so auth refreshes and other
-        # requests aren't starved while we work through the user list.
+    for user in users:
+        # Push each user's run to a thread so the event loop is never blocked
+        await asyncio.to_thread(_run_user_sync, user.jellyfin_user_id, user.username)
+        # Yield between users so other requests can be handled
         await asyncio.sleep(0)
 
 

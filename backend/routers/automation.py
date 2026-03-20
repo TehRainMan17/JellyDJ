@@ -14,85 +14,96 @@ from pydantic import BaseModel
 
 from auth import get_current_user, require_admin, UserContext
 from database import get_db, SessionLocal
-from models import AutomationSettings, SystemEvent, ManagedUser
+from models import AutomationSettings, SystemEvent, ManagedUser, JobState
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/automation", tags=["automation"])
 
-# ── Enrichment job state ─────────────────────────────────────────────────────
-_enrichment_state: dict = {
-    "running": False,
-    "phase": "",           # "Fetching song data" | "Fetching artist data" | "Complete" | "Error"
-    "current_item": "",    # name of track/artist currently being fetched
-    # Track phase
-    "tracks_done": 0,
-    "tracks_total": 0,
-    "tracks_enriched": 0,
-    "tracks_failed": 0,
-    # Artist phase
-    "artists_done": 0,
-    "artists_total": 0,
-    "artists_enriched": 0,
-    "artists_failed": 0,
-    # Timing
-    "started_at": None,
-    "finished_at": None,
-    "error": None,
+# ── DB-backed job state — shared across all uvicorn workers ─────────────────
+#
+# Previously these were module-level dicts. With multiple workers each process
+# has its own copy, so status polls would hit a different worker than the one
+# running the job and see empty/stale state.
+#
+# Now state is written to the JobState table so any worker can read it.
+# Writes use their own short-lived session so they don't interfere with the
+# caller's transaction.
+
+import json as _json
+
+_JOB_DEFAULTS = {
+    "enrichment": {
+        "running": False, "phase": "", "current_item": "",
+        "tracks_done": 0, "tracks_total": 0, "tracks_enriched": 0, "tracks_failed": 0,
+        "artists_done": 0, "artists_total": 0, "artists_enriched": 0, "artists_failed": 0,
+        "error": None,
+    },
+    "discovery": {
+        "running": False, "phase": "", "detail": "",
+        "users_done": 0, "users_total": 0, "items_added": 0, "error": None,
+    },
+    "download": {
+        "running": False, "phase": "", "detail": "",
+        "sent": 0, "total": 0, "error": None,
+    },
 }
 
-def _set_enrichment_state(**kwargs):
+def _get_job_state(job_id: str) -> dict:
+    """Read job state from DB. Falls back to defaults if row doesn't exist yet."""
+    try:
+        db = SessionLocal()
+        try:
+            row = db.query(JobState).filter_by(job_id=job_id).first()
+            if not row:
+                return dict(_JOB_DEFAULTS.get(job_id, {}))
+            state = _json.loads(row.payload) if row.payload else {}
+            state["running"]     = bool(row.running)
+            state["phase"]       = row.phase or ""
+            state["started_at"]  = row.started_at.isoformat() if row.started_at else None
+            state["finished_at"] = row.finished_at.isoformat() if row.finished_at else None
+            return state
+        finally:
+            db.close()
+    except Exception as e:
+        log.warning(f"_get_job_state({job_id}) failed: {e}")
+        return dict(_JOB_DEFAULTS.get(job_id, {}))
+
+def _set_job_state(job_id: str, **kwargs):
+    """Write job state to DB. Uses its own session so it's safe from any thread."""
     from datetime import datetime as _dt
-    _enrichment_state.update(kwargs)
-    if kwargs.get("running") and not _enrichment_state.get("started_at"):
-        _enrichment_state["started_at"] = _dt.utcnow().isoformat()
-        _enrichment_state["finished_at"] = None
-    if kwargs.get("running") is False:
-        _enrichment_state["finished_at"] = _dt.utcnow().isoformat()
-        _enrichment_state["started_at"] = None
+    try:
+        db = SessionLocal()
+        try:
+            row = db.query(JobState).filter_by(job_id=job_id).first()
+            if not row:
+                row = JobState(job_id=job_id)
+                db.add(row)
+            # running / phase go on the row directly for fast queries
+            if "running" in kwargs:
+                row.running = bool(kwargs["running"])
+                if kwargs["running"] and not row.started_at:
+                    row.started_at  = _dt.utcnow()
+                    row.finished_at = None
+                if not kwargs["running"]:
+                    row.finished_at = _dt.utcnow()
+                    row.started_at  = None
+            if "phase" in kwargs:
+                row.phase = kwargs["phase"]
+            # everything else goes into payload JSON
+            existing = _json.loads(row.payload) if row.payload else {}
+            existing.update({k: v for k, v in kwargs.items() if k not in ("running", "phase")})
+            row.payload = _json.dumps(existing)
+            row.updated_at = _dt.utcnow()
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        log.warning(f"_set_job_state({job_id}) failed: {e}")
 
-
-# ── In-memory state for discovery, playlists, auto-download ──────────────────
-
-_discovery_state: dict = {
-    "running": False,
-    "phase": "",
-    "detail": "",
-    "users_done": 0,
-    "users_total": 0,
-    "items_added": 0,
-    "started_at": None,
-    "finished_at": None,
-    "error": None,
-}
-
-_download_state: dict = {
-    "running": False,
-    "phase": "",
-    "detail": "",
-    "sent": 0,
-    "total": 0,
-    "started_at": None,
-    "finished_at": None,
-    "error": None,
-}
-
-def _set_discovery_state(**kwargs):
-    from datetime import datetime as _dt
-    _discovery_state.update(kwargs)
-    if kwargs.get("running") and not _discovery_state.get("started_at"):
-        _discovery_state["started_at"] = _dt.utcnow().isoformat()
-        _discovery_state["finished_at"] = None
-    if kwargs.get("running") is False:
-        _discovery_state["finished_at"] = _dt.utcnow().isoformat()
-
-def _set_download_state(**kwargs):
-    from datetime import datetime as _dt
-    _download_state.update(kwargs)
-    if kwargs.get("running") and not _download_state.get("started_at"):
-        _download_state["started_at"] = _dt.utcnow().isoformat()
-        _download_state["finished_at"] = None
-    if kwargs.get("running") is False:
-        _download_state["finished_at"] = _dt.utcnow().isoformat()
+# Convenience wrappers that match the old function signatures
+def _set_enrichment_state(**kwargs): _set_job_state("enrichment", **kwargs)
+def _set_discovery_state(**kwargs):  _set_job_state("discovery",  **kwargs)
+def _set_download_state(**kwargs):   _set_job_state("download",   **kwargs)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -226,11 +237,12 @@ async def trigger_enrichment(_: UserContext = Depends(require_admin), db: Sessio
     Runs in a background thread — poll /trigger/enrichment/status for progress.
     """
     import threading
-    state = _enrichment_state.copy()
+    state = _get_job_state("enrichment")
     if state.get("running"):
         return {"ok": False, "message": "Enrichment already running", "state": state}
 
     def _run():
+        import time as _time
         _set_enrichment_state(
             running=True, phase="Fetching song data",
             current_item="",
@@ -242,8 +254,19 @@ async def trigger_enrichment(_: UserContext = Depends(require_admin), db: Sessio
         try:
             from services.enrichment import enrich_tracks, enrich_artists
 
+            # Throttle DB writes to once every 5 seconds — enrichment fires
+            # the callback after every track (0.22s delay between calls), so
+            # without throttling we'd write ~4-5 times/second and saturate
+            # the SQLite write lock for the entire run.
+            _last_progress_write = [0.0]
+            PROGRESS_WRITE_INTERVAL = 5.0
+
             def track_progress(done, total, track, artist, enriched, failed):
-                _enrichment_state.update(
+                now = _time.monotonic()
+                if now - _last_progress_write[0] < PROGRESS_WRITE_INTERVAL:
+                    return
+                _last_progress_write[0] = now
+                _set_enrichment_state(
                     tracks_done=done,
                     tracks_total=total,
                     tracks_enriched=enriched,
@@ -252,7 +275,11 @@ async def trigger_enrichment(_: UserContext = Depends(require_admin), db: Sessio
                 )
 
             def artist_progress(done, total, artist, enriched, failed):
-                _enrichment_state.update(
+                now = _time.monotonic()
+                if now - _last_progress_write[0] < PROGRESS_WRITE_INTERVAL:
+                    return
+                _last_progress_write[0] = now
+                _set_enrichment_state(
                     artists_done=done,
                     artists_total=total,
                     artists_enriched=enriched,
@@ -328,7 +355,7 @@ def _sanitize_state(state: dict, user: UserContext) -> dict:
 @router.get("/trigger/enrichment/status")
 def enrichment_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the enrichment run."""
-    return _sanitize_state(_enrichment_state, user)
+    return _sanitize_state(_get_job_state("enrichment"), user)
 
 
 @router.post("/trigger/popularity-cache")
@@ -373,7 +400,7 @@ def cache_refresh_status(user: UserContext = Depends(get_current_user)):
 @router.get("/trigger/discovery/status")
 def discovery_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the discovery refresh."""
-    state = dict(_discovery_state)
+    state = _get_job_state("discovery")
     done = state.get("users_done", 0)
     total = state.get("users_total", 0)
     pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
@@ -383,7 +410,7 @@ def discovery_trigger_status(user: UserContext = Depends(get_current_user)):
 @router.get("/trigger/auto-download/status")
 def download_trigger_status(user: UserContext = Depends(get_current_user)):
     """Poll this to get live progress of the auto-download run."""
-    state = dict(_download_state)
+    state = _get_job_state("download")
     sent = state.get("sent", 0)
     total = state.get("total", 0)
     pct = round(100 * sent / total) if total > 0 else (50 if state.get("running") else 0)
@@ -499,41 +526,76 @@ def auto_download_preview(_: UserContext = Depends(require_admin), db: Session =
 
 async def _run_discovery_refresh():
     """Refresh discovery queue for all enabled users. Called by scheduler."""
-    db = SessionLocal()
+    import asyncio
+    from database import SessionLocal as _SL
+
+    # Read settings and user list with a short-lived session
+    db = _SL()
     try:
         from models import ManagedUser
         s = _get_or_create_settings(db)
         users = db.query(ManagedUser).filter_by(has_activated=True).all()
-        if not users:
-            _set_discovery_state(running=False, phase="No enabled users", detail="", users_done=0, users_total=0, items_added=0, error=None)
-            return
+        limit = s.discovery_items_per_run
+    finally:
+        db.close()
 
-        _set_discovery_state(
-            running=True, phase="Starting discovery refresh",
-            detail=f"Found {len(users)} user(s)", users_done=0,
-            users_total=len(users), items_added=0, error=None,
-        )
+    if not users:
+        _set_discovery_state(running=False, phase="No enabled users", detail="",
+                             users_done=0, users_total=0, items_added=0, error=None)
+        return
 
+    _set_discovery_state(
+        running=True, phase="Starting discovery refresh",
+        detail=f"Found {len(users)} user(s)", users_done=0,
+        users_total=len(users), items_added=0, error=None,
+    )
+
+    path_e_global_seen: set[str] = set()
+    total_added = 0
+
+    def _run_user_sync(user_id: str, username: str) -> int:
+        """Runs in a thread — keeps the event loop free."""
+        import asyncio as _aio
         from routers.discovery import _populate_queue_for_user
-        total_added = 0
+        db2 = _SL()
+        try:
+            loop = _aio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    _populate_queue_for_user(
+                        user_id, db2, limit,
+                        path_e_global_seen=path_e_global_seen,
+                    )
+                )
+            finally:
+                loop.close()
+        except Exception as e:
+            log.error(f"  Discovery refresh failed for {username}: {e}")
+            return 0
+        finally:
+            db2.close()
+
+    try:
         for idx, user in enumerate(users):
             _set_discovery_state(
                 phase=f"Refreshing queue for {user.username}",
                 detail=f"User {idx + 1} of {len(users)}",
                 users_done=idx,
             )
-            try:
-                added = await _populate_queue_for_user(
-                    user.jellyfin_user_id, db,
-                    limit=s.discovery_items_per_run
-                )
-                total_added += added
-                log.info(f"  Discovery refresh: +{added} items for {user.username}")
-            except Exception as e:
-                log.error(f"  Discovery refresh failed for {user.username}: {e}")
+            added = await asyncio.to_thread(_run_user_sync, user.jellyfin_user_id, user.username)
+            total_added += added
+            log.info(f"  Discovery refresh: +{added} items for {user.username}")
+            await asyncio.sleep(0)
 
-        s.last_discovery_refresh = datetime.utcnow()
-        db.commit()
+        # Stamp last_discovery_refresh
+        db3 = _SL()
+        try:
+            s2 = _get_or_create_settings(db3)
+            s2.last_discovery_refresh = datetime.utcnow()
+            db3.commit()
+        finally:
+            db3.close()
+
         log.info(f"Discovery refresh complete: +{total_added} items total")
         _set_discovery_state(
             running=False, phase="Complete",
@@ -543,8 +605,6 @@ async def _run_discovery_refresh():
     except Exception as e:
         log.error(f"Discovery refresh run failed: {e}")
         _set_discovery_state(running=False, phase="Error", error=str(e))
-    finally:
-        db.close()
 
 
 async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bool = True):
@@ -752,30 +812,32 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
 async def _run_popularity_cache_refresh():
     """
     Scheduled job: refresh the artist-level popularity cache.
-
-    Fetches listener counts, tags, similar artists, and top albums from
-    Last.fm (and other configured adapters) for every artist in the library,
-    writing results to the PopularityCache table keyed as 'artist:{name_lower}'.
-
-    Stamping last_popularity_cache_refresh on completion lets the scheduler
-    use last-run-based scheduling (same pattern as discovery/playlists) so
-    container restarts do not reset the clock.
+    Runs the blocking HTTP+DB work in a thread so the event loop stays free.
     """
-    from services.indexer import refresh_library_popularity_cache
-    db = SessionLocal()
-    try:
-        log.info("Scheduled popularity cache refresh starting…")
-        await refresh_library_popularity_cache(db)
-        # Stamp last run time
-        s = db.query(AutomationSettings).first()
-        if s:
-            s.last_popularity_cache_refresh = datetime.utcnow()
-            db.commit()
-        log.info("Scheduled popularity cache refresh complete.")
-    except Exception as e:
-        log.error(f"Popularity cache refresh job failed: {e}")
-    finally:
-        db.close()
+    import asyncio
+
+    def _run_sync():
+        from services.indexer import refresh_library_popularity_cache
+        import asyncio as _aio
+        db = SessionLocal()
+        try:
+            log.info("Scheduled popularity cache refresh starting…")
+            loop = _aio.new_event_loop()
+            try:
+                loop.run_until_complete(refresh_library_popularity_cache(db))
+            finally:
+                loop.close()
+            s = db.query(AutomationSettings).first()
+            if s:
+                s.last_popularity_cache_refresh = datetime.utcnow()
+                db.commit()
+            log.info("Scheduled popularity cache refresh complete.")
+        except Exception as e:
+            log.error(f"Popularity cache refresh job failed: {e}")
+        finally:
+            db.close()
+
+    await asyncio.to_thread(_run_sync)
 
 
 # ── Auto-download history ──────────────────────────────────────────────────────

@@ -51,7 +51,10 @@ if "sqlite" in DATABASE_URL:
     def _set_sqlite_pragma(dbapi_conn, _connection_record):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, faster than FULL
+        cursor.execute("PRAGMA synchronous=NORMAL")   # safe with WAL, faster than FULL
+        cursor.execute("PRAGMA busy_timeout=5000")    # 5s retry window before "db locked" error
+        cursor.execute("PRAGMA cache_size=-32000")    # 32MB page cache — reduces disk I/O
+        cursor.execute("PRAGMA wal_autocheckpoint=100")  # checkpoint more often to keep WAL small
         cursor.close()
 
 # Session factory — use get_db() as a FastAPI dependency to get a session
