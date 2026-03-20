@@ -1,55 +1,76 @@
 """
-JellyDJ Scoring Engine — v6
+JellyDJ Scoring Engine — v7
 
-Changes from v5:
-  New-album discovery fix.
+Changes from v6:
+  Artist affinity overhaul.
 
-  After a month of operation users observed that newly added albums were
-  essentially never surfacing in "New For You" even when the added artist
-  was a firm favourite (e.g. Simon & Garfunkel, The White Stripes).
+  Root-cause analysis of v6 artist scoring bugs:
 
-  Root-cause analysis:
-    1. UNPLAYED_CAP was 65.0.  The "New For You" discovery block AND-intersects
-       with global_popularity >= 50.  Tracks from artists with high affinity
-       but no enrichment data (NULL global_popularity) or niche artists with
-       low chart popularity were therefore doubly suppressed: their score was
-       already low AND the popularity filter excluded them entirely.
+    1. CEILING BUG — scores capped at ~65/100 for all users.
+       The formula was:
+         raw_score = W_PLAY * avg_play + W_RECENCY * avg_recency   (+ fav_boost)
+       W_PLAY=0.45 and W_RECENCY=0.25 sum to only 0.70, so even at perfect
+       avg_play=100 and avg_recency=100 the maximum raw_score before the
+       fav_boost is 70.0.  FAVORITE_ARTIST_BOOST=15 can push it to 85, but only
+       for favorited artists.  Non-favorited artists were hard-capped at 70.
 
-    2. novelty_bonus was a flat 2.0 regardless of artist/genre affinity.
-       A track from a beloved artist got exactly the same unplayed bonus as
-       a track from a completely unknown one — no lift whatsoever for "I love
-       this artist but haven't heard this album yet."
+    2. BREADTH PUNISHMENT — artists with many songs penalised vs. one-hit wonders.
+       avg_play was calculated per-track: each track's play_score was computed
+       relative to the single most-played track in the ENTIRE library
+       (max_plays), then averaged across all of the artist's tracks.
 
-    3. The affinity contribution to unplayed scoring was small:
-         UNPLAYED_ARTIST_W = 0.20  × (a_aff * 0.70)  ≈ 14 pts at full affinity
-       So even a 100-affinity artist only pushed an unplayed track from 37 → 51,
-       still well below the "New For You" discovery thresholds.
+       Example (from real user data):
+         Radiohead: 1 track (Creep) played 60× → play_score = 100 → avg = 100
+         George Ezra: 30 tracks, each played 15× → each play_score ≈ 67 → avg ≈ 67
 
-  v6 fixes:
-    1. UNPLAYED_CAP raised 65 → 78.  High-affinity unplayed tracks can now
-       compete meaningfully with the discovery block's filters.
+       Radiohead's avg_play is 49% higher than George Ezra's, so Radiohead
+       scores dramatically higher even though George Ezra represents
+       30× the total listening engagement.
 
-    2. UNPLAYED_ARTIST_W raised 0.20 → 0.35, UNPLAYED_GENRE_W raised 0.14 → 0.20.
-       Affinity now drives a bigger share of unplayed score.
+       This is the opposite of the desired behaviour.
 
-    3. novelty_bonus is now DYNAMIC: a loved-artist unplayed track gets a bonus
-       proportional to its artist_affinity (0–15 pts) rather than a flat 2 pts.
-       Formula:  novelty_bonus = UNPLAYED_NOVELTY_BASE
-                               + UNPLAYED_NOVELTY_ARTIST_SCALE * (a_aff / 100)
-       (still capped by UNPLAYED_CAP, so it never inflates past the ceiling).
+  v7 fixes:
 
-    4. UNPLAYED_BASE unchanged at 35 so truly unknown tracks are still scored
-       conservatively — we only lift tracks from artists/genres the user has
-       demonstrated affinity for.
+    1. TOTAL-PLAYS normalisation (mirrors the genre-profile fix in v5).
+       Artist affinity now uses the artist's TOTAL plays normalised against
+       the most-played artist (by total plays), not the per-track average.
+       An artist with 30 tracks × 15 plays = 450 total plays correctly scores
+       higher than an artist with 1 track × 60 plays.
 
-  Resulting approximate unplayed score tiers (no popularity bonus):
-    35        zero artist/genre affinity (unchanged)
-    48–55     mild affinity (previously ~38–43)
-    62–70     moderate affinity (previously ~45–52)
-    71–78     high-affinity artist, loved genre (previously ~55–65 → now reaches cap)
+    2. BREADTH BONUS — reward catalogue depth.
+       A log-scaled bonus (0–ARTIST_BREADTH_BONUS_MAX pts) rewards artists
+       where the user has played many distinct tracks.  This captures "I enjoy
+       their whole back-catalogue" vs. "I heard one song".
+       Formula: log(tracks_played+1) / log(ARTIST_BREADTH_MAX_TRACKS+1)
+                × ARTIST_BREADTH_BONUS_MAX
+       (capped at ARTIST_BREADTH_BONUS_MAX regardless of track count)
 
-  These scores now fall cleanly within the discovery block's effective range
-  and above the "New For You" familiar-track threshold of 70.
+    3. BEST-RECENCY instead of AVERAGE-RECENCY.
+       Recency now uses the most-recently-played track for the artist, not
+       the average across all tracks.  This mirrors the genre fix: if you
+       played any George Ezra track this week, George Ezra is "current" —
+       averaging in 29 older track dates should not penalise him.
+
+    4. WEIGHTS adjusted so the full 0–100 range is reachable.
+       New formula (before skip penalty):
+         raw = W_PLAY * total_play_score
+             + W_RECENCY * best_recency_score
+             + breadth_bonus
+             [+ FAVORITE_ARTIST_BOOST if any track is favorited]
+       W_PLAY(0.45) + W_RECENCY(0.25) = 0.70 → 70 pts at perfect play+recency
+       ARTIST_BREADTH_BONUS_MAX = 15 pts → up to 85 without favorite
+       FAVORITE_ARTIST_BOOST    = 15 pts → up to 100 with favorite
+       Scores now span the full 0–100 range naturally.
+
+  Resulting approximate artist affinity tiers (no favorite):
+    0         never played (not stored in ArtistProfile)
+    5–15      heard one track once, long ago
+    25–45     casual listener — some plays, moderate catalogue
+    55–75     regular listener — many plays or wide catalogue
+    80–90     heavy listener — deep catalogue + high play count
+    90–100    heavy listener with favorited tracks
+
+Changes from v5/v6 (unplayed scoring) are preserved unchanged.
 """
 from __future__ import annotations
 
@@ -108,6 +129,12 @@ REPLAY_BOOST_CAP      = 12.0
 POPULARITY_PLAYED_MAX   = 5.0
 POPULARITY_UNPLAYED_MAX = 10.0
 
+# v7: artist breadth bonus constants
+# Rewards users who listen to many distinct tracks from an artist.
+# log-scaled so the bonus grows quickly for the first ~10 tracks then plateaus.
+ARTIST_BREADTH_BONUS_MAX  = 15.0   # max pts awarded for catalogue depth
+ARTIST_BREADTH_MAX_TRACKS = 50     # track count at which bonus is fully awarded
+
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -140,6 +167,20 @@ def _compress(raw: float) -> float:
     return round(100.0 * ((scaled / 100.0) ** COMPRESSION_EXP), 2)
 
 
+def _breadth_bonus(tracks_played: int) -> float:
+    """
+    Log-scaled bonus for playing many distinct tracks from an artist.
+    Returns 0–ARTIST_BREADTH_BONUS_MAX points.
+    """
+    if tracks_played <= 0:
+        return 0.0
+    return round(
+        (math.log1p(tracks_played) / math.log1p(ARTIST_BREADTH_MAX_TRACKS))
+        * ARTIST_BREADTH_BONUS_MAX,
+        2,
+    )
+
+
 # ── Phase 1: Build ArtistProfile ─────────────────────────────────────────────
 
 def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
@@ -149,14 +190,18 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
     v2: also reads replay boosts and enrichment data to populate
     ArtistProfile.replay_boost, .related_artists, .tags.
 
+    v7: artist affinity overhaul — see module docstring.
+      - Normalises against total artist plays (not per-track average).
+      - Uses best (most recent) recency, not average.
+      - Adds a breadth bonus for catalogue depth.
+      - Scores now span the full 0–100 range.
+
     Returns dict of artist_name → affinity_score for use in TrackScore phase.
     """
     now = datetime.utcnow()
     plays = db.query(Play).filter_by(user_id=user_id).all()
     if not plays:
         return {}
-
-    max_plays = max((p.play_count for p in plays if p.play_count), default=1) or 1
 
     artist_agg: dict[str, dict] = {}
     for p in plays:
@@ -167,21 +212,32 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             artist_agg[key] = {
                 "total_plays": 0,
                 "tracks_played": 0,
-                "play_scores": [],
-                "recency_scores": [],
+                "best_last_played": None,   # v7: best recency instead of average
                 "has_favorite": False,
                 "genres": {},
             }
         agg = artist_agg[key]
         agg["total_plays"] += p.play_count
         agg["tracks_played"] += 1
-        if p.play_count > 0:
-            agg["play_scores"].append(_play_score(p.play_count, max_plays))
-            agg["recency_scores"].append(_recency_score(p.last_played))
+
+        # v7: track the most-recently-played date across all artist tracks
+        if p.last_played:
+            if (agg["best_last_played"] is None
+                    or p.last_played > agg["best_last_played"]):
+                agg["best_last_played"] = p.last_played
+
         if p.is_favorite:
             agg["has_favorite"] = True
         if p.genre:
             agg["genres"][p.genre] = agg["genres"].get(p.genre, 0) + p.play_count
+
+    # v7: normalise against the most-played ARTIST (by total plays),
+    #     not the most-played single track.  This prevents one-hit wonders
+    #     from dominating the normalisation denominator.
+    max_artist_plays = max(
+        (a["total_plays"] for a in artist_agg.values()),
+        default=1,
+    ) or 1
 
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
     artist_skips: dict[str, dict] = {}
@@ -213,14 +269,25 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
     affinity_map: dict[str, float] = {}
 
     for artist, agg in artist_agg.items():
-        ps = agg["play_scores"]
-        rs = agg["recency_scores"]
-        avg_play = sum(ps) / len(ps) if ps else 0.0
-        avg_recency = sum(rs) / len(rs) if rs else 0.0
+        # v7: total-play score — how much has the user played this artist overall?
+        total_play_score = _play_score(agg["total_plays"], max_artist_plays)
+
+        # v7: best-recency — is *any* of this artist's tracks fresh?
+        best_recency = _recency_score(agg["best_last_played"])
+
+        # v7: breadth bonus — reward catalogue depth (many distinct tracks)
+        breadth = _breadth_bonus(agg["tracks_played"])
+
         fav_boost = FAVORITE_ARTIST_BOOST if agg["has_favorite"] else 0.0
-        raw_score = W_PLAY * avg_play + W_RECENCY * avg_recency
+
+        raw_score = (
+            W_PLAY    * total_play_score
+            + W_RECENCY * best_recency
+            + breadth
+        )
         affinity = round(min(100.0, raw_score + fav_boost), 2)
 
+        # Skip penalty — reduces affinity proportionally
         sk_data = artist_skips.get(artist, {})
         total_ev = sk_data.get("total_events", 0)
         skip_ct = sk_data.get("skip_count", 0)
@@ -229,7 +296,10 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             effective_skip_rate = skip_rate * (0.5 if agg["has_favorite"] else 1.0)
             affinity = round(affinity * (1.0 - effective_skip_rate * 0.5), 2)
 
-        primary_genre = max(agg["genres"].items(), key=lambda x: x[1])[0] if agg["genres"] else ""
+        primary_genre = (
+            max(agg["genres"].items(), key=lambda x: x[1])[0]
+            if agg["genres"] else ""
+        )
         affinity_map[artist] = affinity
 
         # v2: replay boost at artist level
@@ -384,6 +454,11 @@ def rebuild_track_scores(
         more of the unplayed base score.
       - UNPLAYED_CAP raised 65 → 78 so high-affinity unplayed tracks can
         reach the thresholds used by "New For You" discovery filters.
+
+    v7 note:
+      - artist_affinity values coming in from rebuild_artist_profiles() now
+        use the v7 total-play / breadth-bonus formula, so a_aff correctly
+        reflects genuine engagement.  No changes needed in this phase.
     """
     now = datetime.utcnow()
 

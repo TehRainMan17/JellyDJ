@@ -259,7 +259,12 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
 
 # ── Queue population ──────────────────────────────────────────────────────────
 
-async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
+async def _populate_queue_for_user(
+    user_id: str,
+    db: Session,
+    limit: int = 20,
+    path_e_global_seen: set | None = None,
+):
     """
     Run the recommender and add new items to the discovery queue.
 
@@ -270,6 +275,10 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
        approved + Lidarr live check). Deleted pending items must NOT be in the
        exclusion set or they block every new rec.
     3. Fill back up to exactly `limit` fresh recs.
+
+    path_e_global_seen: shared set across all users in a single refresh run.
+    Prevents Path E (hub-artist) recs from surfacing the same breakout artist
+    for every user. Pass None (default) for single-user manual refreshes.
     """
     import httpx
     from sqlalchemy import text as satext
@@ -371,7 +380,8 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
             log.warning(f"  Could not fetch Lidarr monitored albums: {e}")
 
     # ── Step 4: Get recommendations ──────────────────────────────────────────
-    recs = recommend_new_albums(user_id, effective_limit * 4, db)
+    recs = recommend_new_albums(user_id, effective_limit * 4, db,
+                                path_e_global_seen=path_e_global_seen)
 
     # ── Step 5: Enforce discovery bias — 75% new artists, 25% known ──────────
     # Split recs by type, then build an oversized ordered pool before the

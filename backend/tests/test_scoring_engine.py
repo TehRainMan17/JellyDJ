@@ -10,6 +10,15 @@ Tests cover:
   - Unplayed cap enforcement
   - Skip penalty propagation to unplayed tracks
   - Score distribution stats
+
+v7 additions:
+  - Artist breadth: deep-catalogue artists score higher than one-hit wonders
+    with the same total plays
+  - Ceiling fix: heavy non-favorited artists can score above 70
+  - Recency: best-track recency is used (not average), so a recently played
+    track lifts the whole artist even if other tracks are old
+  - Ordering: correctly ranked real-world analogs
+    (many-track heavy listener > one-song listener)
 """
 import pytest
 from datetime import datetime, timedelta
@@ -19,6 +28,7 @@ from services.scoring_engine import (
     _play_score,
     _recency_score,
     _skip_multiplier,
+    _breadth_bonus,
     rebuild_artist_profiles,
     rebuild_genre_profiles,
     rebuild_track_scores,
@@ -28,6 +38,9 @@ from services.scoring_engine import (
     UNPLAYED_BASE,
     FAVORITE_BONUS,
     SKIP_MIN_EVENTS,
+    ARTIST_BREADTH_BONUS_MAX,
+    ARTIST_BREADTH_MAX_TRACKS,
+    FAVORITE_ARTIST_BOOST,
 )
 from services.library_scanner import scan_library
 
@@ -171,7 +184,35 @@ class TestSkipMultiplier:
         assert _skip_multiplier(2.0) >= 0.1
 
 
-# ── Unit tests: scoring engine ────────────────────────────────────────────────
+class TestBreadthBonus:
+    """v7: new helper — rewards catalogue depth."""
+
+    def test_zero_tracks_returns_zero(self):
+        assert _breadth_bonus(0) == 0.0
+
+    def test_one_track_returns_small_value(self):
+        b = _breadth_bonus(1)
+        assert 0 < b < ARTIST_BREADTH_BONUS_MAX * 0.25
+
+    def test_increases_with_track_count(self):
+        b1 = _breadth_bonus(1)
+        b5 = _breadth_bonus(5)
+        b20 = _breadth_bonus(20)
+        assert b1 < b5 < b20
+
+    def test_saturates_at_max(self):
+        # At or beyond ARTIST_BREADTH_MAX_TRACKS the bonus should be at max
+        b_max = _breadth_bonus(ARTIST_BREADTH_MAX_TRACKS)
+        b_over = _breadth_bonus(ARTIST_BREADTH_MAX_TRACKS * 3)
+        assert b_max == pytest.approx(ARTIST_BREADTH_BONUS_MAX, abs=0.1)
+        assert b_over == pytest.approx(ARTIST_BREADTH_BONUS_MAX, abs=0.1)
+
+    def test_never_exceeds_max(self):
+        for n in [1, 5, 10, 50, 100, 500]:
+            assert _breadth_bonus(n) <= ARTIST_BREADTH_BONUS_MAX
+
+
+# ── Unit tests: artist profiles ───────────────────────────────────────────────
 
 class TestArtistProfiles:
     def test_builds_profile_from_plays(self):
@@ -192,8 +233,9 @@ class TestArtistProfiles:
         db_plain = _make_db(plays=plain)
         db_fav   = _make_db(plays=fav)
         plain_score = rebuild_artist_profiles(db_plain, "user1").get("X", 0)
-        fav_score   = rebuild_artist_profiles(db_fav, "user1").get("X", 0)
+        fav_score   = rebuild_artist_profiles(db_fav,   "user1").get("X", 0)
         assert fav_score > plain_score
+        assert fav_score - plain_score == pytest.approx(FAVORITE_ARTIST_BOOST, abs=2.0)
 
     def test_no_plays_returns_empty(self):
         db = _make_db(plays=[])
@@ -201,12 +243,214 @@ class TestArtistProfiles:
         assert result == {}
 
     def test_scores_are_between_0_and_100(self):
-        plays = [_make_play(f"t{i}", artist=f"Artist{i}", play_count=i*5) for i in range(1, 10)]
+        plays = [_make_play(f"t{i}", artist=f"Artist{i}", play_count=i * 5) for i in range(1, 10)]
         db = _make_db(plays=plays)
         result = rebuild_artist_profiles(db, "user1")
         for artist, score in result.items():
             assert 0.0 <= score <= 100.0, f"{artist} score {score} out of range"
 
+    # ── v7 regression tests ───────────────────────────────────────────────────
+
+    def test_ceiling_above_70_for_heavy_non_favorited_artist(self):
+        """
+        v7 fix: prior formula capped non-favorited artists at 70.
+        A user's most-listened artist (all plays, recent) must be able to
+        score above 70 without needing a favorite flag.
+        """
+        # Single artist, 20 recent tracks — they ARE the max, so total_play_score=100
+        plays = [
+            _make_play(f"t{i}", artist="HeavyListener",
+                       play_count=10,
+                       last_played=datetime.utcnow() - timedelta(days=5))
+            for i in range(20)
+        ]
+        db = _make_db(plays=plays)
+        result = rebuild_artist_profiles(db, "user1")
+        score = result.get("HeavyListener", 0)
+        assert score > 70.0, (
+            f"Non-favorited heavy artist scored {score}, expected > 70. "
+            "v7 ceiling fix may be broken."
+        )
+
+    def test_broad_catalogue_beats_one_hit_wonder_with_same_total_plays(self):
+        """
+        v7 fix: per-track average previously rewarded one-hit wonders.
+        An artist with N tracks × k plays should score HIGHER than an artist
+        with 1 track × (N*k) plays, because the user clearly enjoys their
+        broader catalogue.
+        """
+        # George: 20 tracks × 10 plays = 200 total plays
+        george_plays = [
+            _make_play(f"george_{i}", artist="GeorgeEzra",
+                       play_count=10,
+                       last_played=datetime.utcnow() - timedelta(days=10))
+            for i in range(20)
+        ]
+        # Radiohead: 1 track × 200 plays — same total engagement
+        radiohead_plays = [
+            _make_play("creep", artist="Radiohead",
+                       play_count=200,
+                       last_played=datetime.utcnow() - timedelta(days=10))
+        ]
+
+        db = _make_db(plays=george_plays + radiohead_plays)
+        result = rebuild_artist_profiles(db, "user1")
+
+        george_score    = result.get("GeorgeEzra", 0)
+        radiohead_score = result.get("Radiohead", 0)
+
+        assert george_score > radiohead_score, (
+            f"GeorgeEzra ({george_score:.1f}) should outscore Radiohead "
+            f"({radiohead_score:.1f}) when total plays are equal but "
+            f"catalogue breadth is much wider."
+        )
+
+    def test_breadth_bonus_differentiates_equal_play_counts(self):
+        """
+        Two artists with identical total plays: the one with more distinct
+        tracks played should score higher due to the breadth bonus.
+        """
+        # Artist A: 1 track × 50 plays
+        plays_narrow = [_make_play("a1", artist="Narrow", play_count=50,
+                                   last_played=datetime.utcnow() - timedelta(days=10))]
+        # Artist B: 10 tracks × 5 plays = 50 total plays
+        plays_broad = [
+            _make_play(f"b{i}", artist="Broad", play_count=5,
+                       last_played=datetime.utcnow() - timedelta(days=10))
+            for i in range(10)
+        ]
+
+        db = _make_db(plays=plays_narrow + plays_broad)
+        result = rebuild_artist_profiles(db, "user1")
+
+        assert result["Broad"] > result["Narrow"], (
+            f"Broad ({result['Broad']:.1f}) should outscore "
+            f"Narrow ({result['Narrow']:.1f}) at equal total plays."
+        )
+
+    def test_best_recency_not_average_recency(self):
+        """
+        v7 fix: recency uses the most-recently-played track.
+        An artist with one very recent track + many old tracks should score
+        the same on recency as if all tracks were recent, not a diluted average.
+        """
+        # Artist with 1 recent track + 9 very old tracks
+        plays_mixed = (
+            [_make_play("recent", artist="MixedRecency",
+                        play_count=5,
+                        last_played=datetime.utcnow() - timedelta(days=5))]
+            + [_make_play(f"old{i}", artist="MixedRecency",
+                          play_count=5,
+                          last_played=datetime.utcnow() - timedelta(days=360))
+               for i in range(9)]
+        )
+        # Artist where ALL tracks are recent
+        plays_all_recent = [
+            _make_play(f"r{i}", artist="AllRecent",
+                       play_count=5,
+                       last_played=datetime.utcnow() - timedelta(days=5))
+            for i in range(10)
+        ]
+
+        # Both have same total plays and same track count — only recency differs
+        # in naive average, but best-recency should make them equal on that axis.
+        db_mixed  = _make_db(plays=plays_mixed)
+        db_recent = _make_db(plays=plays_all_recent)
+
+        score_mixed  = rebuild_artist_profiles(db_mixed,  "user1").get("MixedRecency", 0)
+        score_recent = rebuild_artist_profiles(db_recent, "user1").get("AllRecent",    0)
+
+        # With best-recency they should be equal (same best date, same plays, same breadth).
+        # Allow a small tolerance for floating-point arithmetic.
+        assert abs(score_mixed - score_recent) < 1.0, (
+            f"MixedRecency ({score_mixed:.2f}) should ≈ AllRecent ({score_recent:.2f}) "
+            "because best-recency is used. If this fails, average recency may be leaking back in."
+        )
+
+    def test_real_world_ordering_george_over_radiohead(self):
+        """
+        Regression against the user's exact reported bug:
+          - Radiohead: 1 song (Creep) played many times
+          - George Ezra: many songs each played many times
+        George Ezra must rank higher.
+        """
+        radiohead = [
+            _make_play("creep", artist="Radiohead",
+                       play_count=60,
+                       last_played=datetime.utcnow() - timedelta(days=3))
+        ]
+        george = [
+            _make_play(f"ge_{i}", artist="GeorgeEzra",
+                       play_count=15,
+                       last_played=datetime.utcnow() - timedelta(days=3))
+            for i in range(30)
+        ]
+
+        db = _make_db(plays=radiohead + george)
+        result = rebuild_artist_profiles(db, "user1")
+
+        assert result["GeorgeEzra"] > result["Radiohead"], (
+            f"GeorgeEzra ({result['GeorgeEzra']:.1f}) should outscore "
+            f"Radiohead ({result['Radiohead']:.1f}). "
+            "This is the core v7 regression."
+        )
+
+    def test_loved_artist_can_reach_near_100(self):
+        """
+        An artist that dominates the user's listening (most total plays),
+        has a wide catalogue, is listened to recently, and is favorited
+        should be able to score ≥ 95.
+        """
+        plays = [
+            _make_play(f"t{i}", artist="Beloved",
+                       play_count=20,
+                       last_played=datetime.utcnow() - timedelta(days=2),
+                       is_favorite=True)
+            for i in range(40)
+        ]
+        db = _make_db(plays=plays)
+        result = rebuild_artist_profiles(db, "user1")
+        assert result["Beloved"] >= 95.0, (
+            f"Beloved artist scored {result['Beloved']:.1f}, expected ≥ 95. "
+            "Full-range scoring may be broken."
+        )
+
+    def test_skip_penalty_reduces_affinity(self):
+        from models import SkipPenalty
+        plays = [_make_play("t1", artist="SkippyArtist", play_count=20)]
+
+        sk = MagicMock(spec=SkipPenalty)
+        sk.artist_name = "SkippyArtist"
+        sk.genre = None
+        sk.jellyfin_item_id = "t1"
+        sk.total_events = 10
+        sk.skip_count = 8
+        sk.consecutive_skips = 0
+
+        db_clean = _make_db(plays=plays)
+        db_skip  = _make_db(plays=plays, skip_penalties=[sk])
+
+        clean_score = rebuild_artist_profiles(db_clean, "user1").get("SkippyArtist", 0)
+        skip_score  = rebuild_artist_profiles(db_skip,  "user1").get("SkippyArtist", 0)
+
+        assert skip_score < clean_score
+
+    def test_new_library_artist_not_in_results(self):
+        """
+        An artist with no plays should have zero affinity and should not
+        appear in the artist_affinity map at all (clean cold-start).
+        """
+        # Only plays for Artist A — Artist B is in the library but never played
+        plays = [_make_play("t1", artist="ArtistA", play_count=5)]
+        db = _make_db(plays=plays)
+        result = rebuild_artist_profiles(db, "user1")
+        assert "ArtistB" not in result, (
+            "Unplayed artists should not appear in artist_affinity. "
+            "They will correctly receive 0 affinity in the TrackScore phase."
+        )
+
+
+# ── Unit tests: genre profiles ────────────────────────────────────────────────
 
 class TestGenreProfiles:
     def test_builds_profile_from_plays(self):
@@ -222,12 +466,14 @@ class TestGenreProfiles:
         assert result["Rock"] > result["Pop"]
 
     def test_scores_are_between_0_and_100(self):
-        plays = [_make_play(f"t{i}", genre=f"Genre{i % 3}", play_count=i*3) for i in range(1, 8)]
+        plays = [_make_play(f"t{i}", genre=f"Genre{i % 3}", play_count=i * 3) for i in range(1, 8)]
         db = _make_db(plays=plays)
         result = rebuild_genre_profiles(db, "user1")
         for genre, score in result.items():
             assert 0.0 <= score <= 100.0
 
+
+# ── Unit tests: track scores ──────────────────────────────────────────────────
 
 class TestTrackScores:
     def test_played_track_scores_above_unplayed(self):
@@ -237,10 +483,8 @@ class TestTrackScores:
         ]
         plays = [_make_play("played", artist="X", genre="Rock", play_count=20)]
         db = _make_db(library_tracks=lib, plays=plays)
-        # Capture added scores
         added = []
         db.add = lambda obj: added.append(obj)
-        from models import TrackScore
         rebuild_track_scores(db, "user1", {"X": 80.0}, {"Rock": 70.0})
         scores = {s.jellyfin_item_id: float(s.final_score) for s in added if hasattr(s, 'final_score')}
         assert scores.get("played", 0) > scores.get("unplayed", 0)
@@ -262,10 +506,10 @@ class TestTrackScores:
         sk.jellyfin_item_id = "t1"
         sk.penalty = "0.6"
         sk.total_events = 10
+        sk.consecutive_skips = 0
         db_clean = _make_db(library_tracks=lib, plays=plays)
         db_skip  = _make_db(library_tracks=lib, plays=plays, skip_penalties=[sk])
-        added_clean = []
-        added_skip  = []
+        added_clean, added_skip = [], []
         db_clean.add = lambda obj: added_clean.append(obj)
         db_skip.add  = lambda obj: added_skip.append(obj)
         rebuild_track_scores(db_clean, "user1", {"Artist A": 80.0}, {"Rock": 70.0})
@@ -288,13 +532,11 @@ class TestTrackScores:
         ps = next(float(s.final_score) for s in added_p if hasattr(s, 'final_score'))
         fs = next(float(s.final_score) for s in added_f if hasattr(s, 'final_score'))
         assert fs > ps
-        # Bonus may be partially absorbed by the 100.0 cap at high base scores,
-        # so we assert it increases the score but don't require the exact magnitude.
         assert fs - ps > 0.5
 
     def test_high_affinity_unplayed_scores_higher_than_low_affinity(self):
         lib = [
-            _make_library_track("loved",   artist="Beatles", genre="Rock"),
+            _make_library_track("loved",   artist="Beatles",    genre="Rock"),
             _make_library_track("unknown", artist="NobodyBand", genre="Country"),
         ]
         db = _make_db(library_tracks=lib, plays=[])
@@ -333,6 +575,27 @@ class TestTrackScores:
         for s in scores:
             assert 0.0 <= s <= 100.0, f"Score {s} out of range"
 
+    def test_high_affinity_artist_unplayed_benefits_from_v7_affinity(self):
+        """
+        Because v7 artist affinity now correctly reaches high values,
+        unplayed tracks from a heavily-listened artist should get a
+        meaningfully higher score than the UNPLAYED_BASE floor.
+        """
+        lib = [_make_library_track("new_album_track", artist="GeorgeEzra", genre="Pop")]
+        db = _make_db(library_tracks=lib, plays=[])
+        added = []
+        db.add = lambda obj: added.append(obj)
+        # George Ezra now correctly has high affinity (e.g. 83)
+        rebuild_track_scores(db, "user1", {"GeorgeEzra": 83.0}, {"Pop": 60.0})
+        scores = [float(s.final_score) for s in added if hasattr(s, 'final_score')]
+        assert scores[0] > UNPLAYED_BASE + 10, (
+            f"Unplayed track from high-affinity artist scored {scores[0]:.1f}, "
+            f"expected > {UNPLAYED_BASE + 10:.1f}. "
+            "This tests that v7 affinity improvements feed correctly into discovery."
+        )
+
+
+# ── Unit tests: library scanner ───────────────────────────────────────────────
 
 class TestLibraryScanner:
     def test_scan_adds_new_tracks(self):
@@ -344,7 +607,6 @@ class TestLibraryScanner:
         ]
         from models import LibraryTrack
         db = MagicMock()
-        existing_map: dict = {}
         db.query.return_value.all.return_value = []
         db.query.return_value.filter.return_value.all.return_value = []
         db.query.return_value.filter.return_value.count.return_value = 2
@@ -372,7 +634,6 @@ class TestLibraryScanner:
         db.add = MagicMock()
         db.commit = MagicMock()
 
-        # Scan with no items — old track should be soft-deleted
         stats = scan_library(db, [])
         assert existing_track.missing_since is not None
         assert stats["soft_deleted"] == 1
