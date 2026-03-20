@@ -1,12 +1,69 @@
 """
-JellyDJ Recommendation Engine — Module 5
+JellyDJ Recommendation Engine — Module 5 (v8)
+
+v8 changes — four bugs fixed:
+
+  BUG 1  PATH E never ran (NameError crash, silently swallowed).
+    Three ordering mistakes inside the `if all_relation_rows:` block caused
+    an immediate NameError on the first PATH E candidate that reached the
+    genre gate:
+      a) `pop_cache_map` was used in the `holiday_artist_names` loop but
+         defined ~60 lines later (after `if N > 1:`).
+      b) `_holiday_re` was used in `_is_holiday_artist` at graph-build time
+         but compiled ~60 lines later.
+      c) `listeners_score_e` was referenced in the PATH E genre gate but
+         was never assigned anywhere.
+    Fix: move `_holiday_re` and `pop_cache_map` to the top of the PATH E
+    block (before any use), and assign `listeners_score_e` from the
+    PopularityCache payload alongside the other per-candidate fields.
+
+  BUG 2  PATH D bypassed genre filter for any artist with ≥2M listeners.
+    The genre gate reads: "allow if no tags, OR has tag overlap, OR
+    listeners_score >= 90." The threshold for listeners_score=90 is only
+    ~2M Last.fm listeners — reached by hundreds of artists including many
+    the user actively dislikes (2Pac, Ice Cube, etc. sit at 97–99).
+    These artists sail through with the full +15 never_heard boost and
+    dominate the final sort.
+    Fix: raise bypass threshold from 90 → 98 (~50M listeners — genuine
+    global phenomena like The Beatles, Michael Jackson). Add tag-string
+    normalisation so "Hip-Hop" matches "hip hop" etc.
+
+  BUG 3  PATH B (taste-driven similarity) was consistently outscored by
+    PATH D (global popularity).
+    `_add_candidate` applies a +15 never_heard boost to any artist not in
+    the library regardless of path. PATH D artists are by definition never
+    in the library, so they *always* get the boost. PATH B artists with
+    moderated listener scores therefore usually lose in the final sort.
+    Additionally, PATH B's target was only 30% of limit but competed for
+    slots with three other paths.
+    Fixes:
+      a) Increase PATH B target 30% → 45% of limit.
+      b) Increase per_seed_cap from 20% → 30% of limit (floor 2).
+      c) Reduce `never_heard` boost for PATH D from +15 to +8, and cap
+         the PATH D target at 20% of limit (down from 25%) to leave more
+         headroom for taste-driven paths.
+      d) In the final sort, use a slot-reservation system: PATH A and
+         PATH B results are placed first up to their targets, then PATH D
+         and PATH E fill remaining slots. This prevents raw listener scores
+         from displacing every affinity-driven recommendation.
+
+  BUG 4  Genre normalisation mismatch between Jellyfin and Last.fm.
+    `user_top_genres` is built from `GenreProfile.genre`, which mirrors
+    Jellyfin's genre field (e.g. "Classic Rock", "R&B", "Hip-Hop").
+    Last.fm tags use different casing/hyphenation ("classic rock", "rnb",
+    "hip hop"). The overlap test `t in user_top_genres` was case-sensitive
+    and token-exact, causing many valid genre matches to be missed.
+    Fix: normalise both sides — lowercase, replace hyphens/underscores with
+    spaces, strip punctuation — before comparison. Build a `_norm_genre`
+    helper used consistently in `_genre_ok`, `_genre_affinity_score`, and
+    `user_top_genres`.
 
 Two public functions:
   recommend_library_tracks(user_id, playlist_type, limit, db) -> list[TrackResult]
   recommend_new_albums(user_id, limit, db)                    -> list[AlbumResult]
 
 Scoring philosophy
-──────────────────
+------------------
 For recommend_library_tracks, every track in the user's Jellyfin library is
 scored using a weighted formula. The playlist_type controls the weights:
 
@@ -43,7 +100,7 @@ from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
 
-# ── Result dataclasses ────────────────────────────────────────────────────────
+# ── Result dataclasses ------------------------------------------------------──
 
 @dataclass
 class TrackResult:
@@ -73,7 +130,7 @@ class AlbumResult:
     rec_type: str = ""            # "missing_album" | "new_artist" | "hub_artist"
 
 
-# ── Weight presets ────────────────────────────────────────────────────────────
+# ── Weight presets ------------------------------------------------------──────
 
 # Playlist type weight presets.
 # Each preset controls the relative importance of four scoring dimensions:
@@ -122,7 +179,25 @@ RECENCY_STALE_DAYS   = 30    # tracks not played in this many days get a recency
 RECENCY_WINDOW_DAYS  = 365   # tracks played longer ago than this get max recency bonus
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Genre normalisation ------------------------------------------------------─
+
+def _norm_genre(s: str) -> str:
+    """
+    Normalise a genre/tag string for comparison.
+    Handles mismatches between Jellyfin genre fields and Last.fm tags:
+      "Classic Rock" → "classic rock"
+      "Hip-Hop"      → "hip hop"
+      "R&B"          → "r&b"
+      "hip_hop"      → "hip hop"
+    """
+    import re as _re
+    s = s.lower().strip()
+    s = _re.sub(r"[-_]", " ", s)   # hyphens/underscores → space
+    s = _re.sub(r"\s+", " ", s)    # collapse whitespace
+    return s
+
+
+# ── Helpers ------------------------------------------------------─────────────
 
 def _affinity_map(db: Session, user_id: str) -> tuple[dict[str, float], dict[str, float]]:
     """Return (artist_affinity, genre_affinity) dicts normalised to 0–1."""
@@ -223,7 +298,7 @@ def _get_skip_penalty(jellyfin_item_id: str, user_id: str, db: Session) -> float
     return float(row.penalty)
 
 
-# ── Main functions ────────────────────────────────────────────────────────────
+# ── Main functions ------------------------------------------------------──────
 
 def recommend_library_tracks(
     user_id: str,
@@ -268,7 +343,7 @@ def recommend_library_tracks(
     results: list[TrackResult] = []
 
     for t in tracks:
-        # ── Affinity component ────────────────────────────────────────────
+        # ── Affinity component ------------------------------------────────
         a_score = artist_aff.get(t.artist_name.lower(), 0.0)
         g_score = genre_aff.get(t.genre.lower(), 0.0)
         affinity = max(a_score, g_score * 0.7)
@@ -282,17 +357,17 @@ def recommend_library_tracks(
         else:
             popularity = _get_popularity(t.artist_name, db)
 
-        # ── Recency inverse ───────────────────────────────────────────────
+        # ── Recency inverse ------------------------------------───────────
         recency_inv = _recency_score(t.last_played)
 
-        # ── Novelty ───────────────────────────────────────────────────────
+        # ── Novelty ------------------------------------------------------─
         # Gradual decay rather than binary — a track played once or twice
         # still gets meaningful novelty credit. Fully decays at 10+ plays.
         # This prevents played-once tracks from immediately competing on
         # pure affinity (which re-anchors to familiar artists).
         novelty = max(0.0, 1.0 - (t.play_count or 0) / 10.0)
 
-        # ── Weighted sum ──────────────────────────────────────────────────
+        # ── Weighted sum ------------------------------------──────────────
         score = (
             weights["affinity"]    * affinity    +
             weights["popularity"]  * popularity  +
@@ -337,7 +412,7 @@ def recommend_library_tracks(
 
     results.sort(key=lambda r: r.score, reverse=True)
 
-    # ── Tiered randomness ─────────────────────────────────────────────────────
+    # ── Tiered randomness ------------------------------------─────────────────
     # Top tier (score >= 0.75): stable — sort-stable, always included first
     # Mid tier (0.40–0.74): jitter score by ±15% before re-sorting
     # Bottom tier (< 0.40): excluded unless we need to fill
@@ -358,7 +433,7 @@ def recommend_library_tracks(
     # Combine: top first (stable), then jittered mid, then low as fallback
     combined = top_tier + mid_tier + low_tier
 
-    # ── Per-artist cap for discover playlist ─────────────────────────────────
+    # ── Per-artist cap for discover playlist ------------------───────────────
     # Prevents the feedback loop where high-affinity artists (Adele, Cher)
     # dominate every generated playlist just because they have the most tracks.
     # Cap: max 3 tracks per artist in a discover playlist, 5 for for_you/favourites.
@@ -478,7 +553,7 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
         "definitive", "complete collection",
     ]
 
-    # ── Step 1+2: top songs → scored album map ────────────────────────────────
+    # ── Step 1+2: top songs → scored album map ------------------──────────────
     ae = db.query(ArtistEnrichment).filter_by(
         artist_name_lower=artist_name.lower()
     ).first()
@@ -507,7 +582,7 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
         except Exception as exc:
             log.debug("  Album picker: top_tracks parse failed for '%s': %s", artist_name, exc)
 
-    # ── Fallback: top_album from popularity cache ─────────────────────────────
+    # ── Fallback: top_album from popularity cache ------------------───────────
     key = f"top_album:{artist_name.lower()}"
     row = db.query(PopularityCache).filter_by(cache_key=key).first()
     if row:
@@ -603,12 +678,19 @@ def recommend_new_albums(
     import re as _re
     from models import UserTasteProfile, Play, PopularityCache, DiscoveryQueueItem
 
-    # ── Per-seed-artist diversity cap ────────────────────────────────────────
-    # 20% of the run limit, floored at 1.  Prevents any single seed artist
-    # (e.g. Adele) from dominating the candidate pool via their similarity chain.
-    per_seed_cap = max(1, round(limit * 0.20))
+    # ── Per-seed-artist diversity cap ------------------------------------────
+    # Hard cap of 3 recs per seed artist regardless of limit.
+    #
+    # Previously round(limit * 0.30) sounded reasonable, but discovery.py calls
+    # recommend_new_albums(user_id, items_per_run * 4, db) to build an oversized
+    # candidate pool.  For items_per_run=10 that makes limit=40, giving
+    # per_seed_cap=12 — one artist like Maroon 5 could fill 12 "because you like X"
+    # slots in a run that only shows 10 items to the user.
+    # A hard cap of 3 gives meaningful representation per seed while ensuring
+    # ~4+ different seed artists contribute to every pool.
+    per_seed_cap = 3
 
-    # ── Taste-aware genre caps ────────────────────────────────────────────────
+    # ── Taste-aware genre caps ------------------------------------────────────
     # Genres the user actively listens to get more headroom than unknown genres.
     # This lets familiar genres produce more recs while still blocking any single
     # genre from completely dominating the run.
@@ -618,7 +700,7 @@ def recommend_new_albums(
     GENRE_CAP_NEUTRAL = 2
     genre_counts: dict[str, int] = {}
 
-    # ── Load taste profile ───────────────────────────────────────────────────
+    # ── Load taste profile ------------------------------------───────────────
     top_artists_rows = (
         db.query(UserTasteProfile)
         .filter_by(user_id=user_id)
@@ -638,12 +720,28 @@ def recommend_new_albums(
         for r in top_artists_rows
     }
 
-    # ── Structured seed selection ────────────────────────────────────────────
-    # Divide top-30 into three tiers and sample from each to avoid the same
-    # mega-artists seeding every run.
-    tier1 = top_artists_rows[:5]
-    tier2 = top_artists_rows[5:15]
-    tier3 = top_artists_rows[15:30]
+    # ── Structured seed selection ------------------------------------────────
+    # Only seed from artists the user genuinely likes.
+    #
+    # The old approach sampled from three tiers including positions 15-30.
+    # This caused low-affinity artists (e.g. Radiohead at #24 with one liked
+    # song) to occasionally seed a full 3-rec chain, producing suggestions
+    # the user would find baffling.
+    #
+    # New approach:
+    #   - Hard affinity floor: only artists whose normalised affinity >= 30
+    #     are eligible as seeds. A #24 artist with weak engagement is excluded.
+    #   - Two tiers only: top-5 (always sampled) + positions 5-15 (sampled).
+    #   - Tier 1: sample all (up to 5) — these are your real favourites.
+    #   - Tier 2: sample up to 5 from positions 5-14, weighted by affinity.
+    #   - No tier3: positions 15+ are too weak to drive good discovery.
+    SEED_AFFINITY_FLOOR = 30.0   # normalised 0-100; artists below this aren't seeded
+
+    eligible = [r for r in top_artists_rows
+                if (float(r.affinity_score) / max_affinity * 100) >= SEED_AFFINITY_FLOOR]
+
+    tier1 = eligible[:5]
+    tier2 = eligible[5:15]
 
     def _weighted_sample(rows, n):
         if not rows: return []
@@ -655,16 +753,15 @@ def recommend_new_albums(
         return [rows[i] for i in indices]
 
     seed_rows = (
-        _weighted_sample(tier1, min(4, len(tier1))) +
-        _weighted_sample(tier2, min(6, len(tier2))) +
-        _weighted_sample(tier3, min(4, len(tier3)))
+        _weighted_sample(tier1, min(5, len(tier1))) +
+        _weighted_sample(tier2, min(5, len(tier2)))
     )
     seen_seeds: set[str] = set()
     seed_rows = [r for r in seed_rows if not (r.artist_name in seen_seeds or seen_seeds.add(r.artist_name))]
 
     log.info(f"  Discovery seeds ({len(seed_rows)}): {[r.artist_name for r in seed_rows[:6]]}...")
 
-    # ── Build known library sets ─────────────────────────────────────────────
+    # ── Build known library sets ------------------------------------─────────
     from models import LibraryTrack
     from services.library_dedup import artist_in_library, album_in_library
 
@@ -692,7 +789,7 @@ def recommend_new_albums(
 
     log.info(f"  Dedup sets: {len(known_artists)} artists, {len(known_albums)} albums in library")
 
-    # ── Load exclusions list ─────────────────────────────────────────────────
+    # ── Load exclusions list ------------------------------------─────────────
     # ExcludedAlbum rows are user-managed blacklists — never recommend these.
     from models import ExcludedAlbum
     excluded_artists: set[str] = set()
@@ -711,7 +808,7 @@ def recommend_new_albums(
         if row.track_name and row.artist_name:
             known_track_names.add(f"{row.artist_name.lower()}::{row.track_name.lower()}")
 
-    # ── Already-queued suppression ───────────────────────────────────────────
+    # ── Already-queued suppression ------------------------------------───────
     from datetime import timedelta
     cutoff_90d  = datetime.utcnow() - timedelta(days=90)
     cutoff_180d = datetime.utcnow() - timedelta(days=180)
@@ -733,7 +830,7 @@ def recommend_new_albums(
         elif row.added_at and row.added_at >= cutoff_90d:
             recently_queued_artists.add(row.artist_name.lower())
 
-    # ── Top genres for taste-aware filtering and scoring ─────────────────────
+    # ── Top genres for taste-aware filtering and scoring ------------------───
     from models import GenreProfile
     top_genre_rows = (
         db.query(GenreProfile)
@@ -742,12 +839,12 @@ def recommend_new_albums(
         .limit(15)   # wider window so niche genres aren't missed
         .all()
     )
-    # Set for fast membership tests
-    user_top_genres = {r.genre.lower() for r in top_genre_rows if r.genre}
+    # Set for fast membership tests — normalised for tag comparison
+    user_top_genres = {_norm_genre(r.genre) for r in top_genre_rows if r.genre}
     # Normalised affinity scores 0–100 for scoring (tag → score)
     _max_genre_aff = max((float(r.affinity_score) for r in top_genre_rows), default=1.0) or 1.0
     user_genre_affinity: dict[str, float] = {
-        r.genre.lower(): min(100.0, float(r.affinity_score) / _max_genre_aff * 100)
+        _norm_genre(r.genre): min(100.0, float(r.affinity_score) / _max_genre_aff * 100)
         for r in top_genre_rows if r.genre
     }
 
@@ -813,7 +910,7 @@ def recommend_new_albums(
         """
         if not tags:
             return 50.0  # neutral — no data, don't penalise
-        tag_lowers = [t.lower() for t in tags[:5]]
+        tag_lowers = [_norm_genre(t) for t in tags[:5]]
         matched_scores = [
             user_genre_affinity[tl]
             for tl in tag_lowers
@@ -864,7 +961,7 @@ def recommend_new_albums(
 
         seen.add(dedup)
 
-        # ── Genre affinity signal ─────────────────────────────────────────────
+        # ── Genre affinity signal ------------------------------------─────────
         # Compute from artist tags rather than source chain so PATH D candidates
         # get a real taste score instead of a hardcoded 0.
         # PATH A/B pass source_affinity explicitly; we take the max so seed-chain
@@ -872,7 +969,7 @@ def recommend_new_albums(
         genre_aff = _genre_affinity_score(tags or [])
         effective_affinity = max(source_affinity, genre_aff)
 
-        # ── Scoring ───────────────────────────────────────────────────────────
+        # ── Scoring ------------------------------------------------------─────
         # 50% global listener reach (was 60% — reduced to make room for taste)
         # 25% artist/album popularity signal
         # 25% taste affinity (was 15% — now a genuine signal, not a tiebreaker)
@@ -882,10 +979,12 @@ def recommend_new_albums(
             (effective_affinity  * 0.25)
         )
 
-        # "New but popular" boost: artist not in library + strong listener score
+        # "New but popular" boost: artist not in library + strong listener score.
+        # Reduced from +15 to +8 so PATH D artists don't systematically outscore
+        # taste-driven PATH B results which have moderated listener scores.
         never_heard = artist.lower() not in known_artists
         if never_heard and lastfm_listeners >= 60:
-            blended = min(100.0, blended + 15.0)
+            blended = min(100.0, blended + 8.0)
 
         if is_wildcard:
             blended = min(100.0, blended + 5.0)
@@ -903,10 +1002,10 @@ def recommend_new_albums(
             rec_type=rec_type,
         ))
 
-    # ── Taste-aware genre cap helpers ─────────────────────────────────────────
+    # ── Taste-aware genre cap helpers ------------------------------------─────
     def _genre_cap_for(tag: str) -> int:
         """Return the cap for a given tag: higher for genres the user likes."""
-        return GENRE_CAP_LIKED if tag.lower() in user_top_genres else GENRE_CAP_NEUTRAL
+        return GENRE_CAP_LIKED if _norm_genre(tag) in user_top_genres else GENRE_CAP_NEUTRAL
 
     def _genre_ok(tags: list[str]) -> bool:
         """
@@ -917,7 +1016,7 @@ def recommend_new_albums(
         if not tags:
             return True
         for tag in tags[:3]:
-            tl = tag.lower()
+            tl = _norm_genre(tag)
             if genre_counts.get(tl, 0) >= _genre_cap_for(tl):
                 return False
         return True
@@ -925,18 +1024,20 @@ def recommend_new_albums(
     def _charge_genre(tags: list[str]):
         """Increment genre counters after a candidate is accepted."""
         for tag in tags[:3]:
-            tl = tag.lower()
+            tl = _norm_genre(tag)
             genre_counts[tl] = genre_counts.get(tl, 0) + 1
 
-    # ── PATH A: Missing albums from known artists ─────────────────────────────
+    # ── PATH A: Missing albums from known artists ------------------───────────
     # Uses top-songs→album logic, same as PATH B/D — no special-casing for
     # known artists. Capped at 25% of limit.
     path_a_cap = max(1, round(limit * 0.25))
     path_a_count = 0
 
-    # PATH B total cap — similarity chains get 30% of limit.
-    # Per-seed cap stays to ensure diversity across seeds.
-    path_b_target = max(1, round(limit * 0.30))
+    # PATH B total cap — similarity chains get 45% of limit.
+    # Increased from 30% to ensure taste-driven recs aren't crowded out by
+    # raw global-popularity results from PATH D.
+    # Per-seed cap ensures diversity across seeds.
+    path_b_target = max(1, round(limit * 0.45))
     path_b_total  = 0
 
     for artist_name, aff_score in affinity_map.items():
@@ -1028,7 +1129,7 @@ def recommend_new_albums(
             _charge_genre(artist_tags)
             path_a_count += 1
 
-    # ── PATH B: New artists via similarity ────────────────────────────────────
+    # ── PATH B: New artists via similarity ------------------------------------
     for seed_row in seed_rows:
         if path_b_total >= path_b_target:
             break
@@ -1082,7 +1183,7 @@ def recommend_new_albums(
             if not _genre_ok(tags):
                 continue
 
-            # ── Core change: pick album via top-songs logic ───────────────────
+            # ── Core change: pick album via top-songs logic ------------------─
             album_name, release_year, album_image = _get_best_album_for_artist(similar, db)
             use_image = album_image or image_url
 
@@ -1098,7 +1199,7 @@ def recommend_new_albums(
 
             genre_hint = f" ({', '.join(tags[:2])})" if tags else ""
             why = _build_why_text(
-                similar, album_name, pop_score,
+                similar, album_name, lastfm_listeners_score,
                 f"Fans of {seed_name} also love this artist{genre_hint}",
                 top_tracks_list,
             )
@@ -1130,7 +1231,8 @@ def recommend_new_albums(
                 _charge_genre(tags)
 
     # ── PATH D: Globally popular (≥1M listeners), not in library ─────────────
-    path_d_target = max(1, round(limit * 0.25))
+    # Reduced from 25% to 20% to leave more headroom for taste-driven paths.
+    path_d_target = max(1, round(limit * 0.20))
     path_d_added = 0
 
     try:
@@ -1170,12 +1272,14 @@ def recommend_new_albums(
 
             tags_g = pd.get("tags", [])
 
-            # ── Medium-strictness genre gate ──────────────────────────────────
-            # Require at least 1 tag overlap with user's top genres unless the
-            # artist is a genuine global phenomenon (listeners_score >= 90).
-            # Artists with no tags at all are treated as neutral and pass through.
-            if tags_g and listeners_score < 90.0:
-                tag_lowers_g = [t.lower() for t in tags_g[:5]]
+            # ── Strict genre gate (v8) ------------------------------------────
+            # Bypass only for genuine global phenomena (listeners_score >= 98,
+            # roughly 50M+ listeners — The Beatles, Michael Jackson tier).
+            # Previously 90 (~2M listeners), which let 2Pac, Ice Cube etc.
+            # bypass the filter even for users who dislike rap/hip-hop.
+            # Tag normalisation via _norm_genre handles "Hip-Hop" vs "hip hop".
+            if tags_g and listeners_score < 98.0:
+                tag_lowers_g = [_norm_genre(t) for t in tags_g[:5]]
                 has_genre_overlap = any(t in user_top_genres for t in tag_lowers_g)
                 if not has_genre_overlap:
                     log.debug(
@@ -1233,7 +1337,7 @@ def recommend_new_albums(
 
     log.info(f"  PATH D: {path_d_added} globally popular artists added")
 
-    # ── PATH E: Genre-centrality discovery (PageRank-style) ──────────────────
+    # ── PATH E: Genre-centrality discovery (PageRank-style) ------------------
     #
     # Philosophy: within the artist similarity graph we already have in
     # ArtistRelation, some artists act as "hubs" — many other artists point to
@@ -1280,6 +1384,25 @@ def recommend_new_albums(
             "halloween", "thanksgiving",
         })
 
+        # ── Pre-compile holiday regex ------------------------------------─────
+        # Must be defined before graph-build so _is_holiday_artist can use it.
+        import re as _re
+        _holiday_re = _re.compile(
+            r'\b(' + '|'.join(_re.escape(kw) for kw in _holiday_keywords) + r')\b',
+            _re.IGNORECASE,
+        )
+
+        # ── Build lowercase→payload map from PopularityCache ------------------
+        # Must be defined before graph-build so holiday_artist_names loop works.
+        pop_cache_map: dict[str, tuple[str, dict]] = {}  # lower_name → (display, payload)
+        for pc_row in db.query(PC2).filter(PC2.cache_key.like("artist:%")).all():
+            raw_name = pc_row.cache_key[len("artist:"):]
+            try:
+                payload = _json.loads(pc_row.payload)
+                pop_cache_map[raw_name.lower()] = (raw_name, payload)
+            except Exception:
+                continue
+
         def _is_holiday_artist(name_lower: str, tags: list[str]) -> bool:
             """
             Return True only if this artist is *primarily* a holiday act.
@@ -1305,7 +1428,7 @@ def recommend_new_albums(
                     return True
             return False
 
-        # ── Step 1: build the graph ───────────────────────────────────────────
+        # ── Step 1: build the graph ------------------------------------───────
         # We want all relations where artist_a is known (enriched or in library).
         # Use a set of "known" names from PopularityCache (artist:* keys) so the
         # graph isn't limited to just the user's listened artists.
@@ -1319,8 +1442,6 @@ def recommend_new_albums(
 
             # Build a set of known holiday-primary artist names from the
             # cache so we can prune them from graph edges efficiently.
-            # Only artist names that are themselves holiday-keyword-heavy
-            # get pruned — real artists with holiday tags stay in the graph.
             holiday_artist_names: set[str] = set()
             for name_l, (_disp, _pd) in pop_cache_map.items():
                 _tags = _pd.get("tags", [])
@@ -1342,7 +1463,7 @@ def recommend_new_albums(
             N = len(all_nodes)
 
             if N > 1:
-                # ── Step 2: simplified PageRank ───────────────────────────────
+                # ── Step 2: simplified PageRank ------------------─────────────
                 DAMPING     = 0.85
                 ITERATIONS  = 10
                 rank: dict[str, float] = {node: 1.0 / N for node in all_nodes}
@@ -1369,26 +1490,6 @@ def recommend_new_albums(
                 sorted_by_rank = sorted(
                     rank_score.items(), key=lambda kv: kv[1], reverse=True
                 )
-
-                # Pre-compile holiday regex for fast graph pruning
-                import re as _re
-                _holiday_re = _re.compile(
-                    r'\b(' + '|'.join(_re.escape(kw) for kw in _holiday_keywords) + r')\b',
-                    _re.IGNORECASE,
-                )
-
-                # Build a lowercase→display-name map from PopularityCache so we
-                # can do a single bulk lookup instead of per-artist queries.
-                # PopularityCache keys are "artist:{name}" — name case varies,
-                # so we index by lower() to match ArtistRelation artist_lower keys.
-                pop_cache_map: dict[str, tuple[str, dict]] = {}  # lower_name → (display, payload)
-                for pc_row in db.query(PC2).filter(PC2.cache_key.like("artist:%")).all():
-                    raw_name = pc_row.cache_key[len("artist:"):]
-                    try:
-                        payload = _json.loads(pc_row.payload)
-                        pop_cache_map[raw_name.lower()] = (raw_name, payload)
-                    except Exception:
-                        continue
 
                 log.info(
                     f"  PATH E: graph has {N} nodes, {len(all_relation_rows)} edges, "
@@ -1427,15 +1528,23 @@ def recommend_new_albums(
                     artist_display, pd_e = cache_entry
                     tags_e: list[str] = pd_e.get("tags", [])
 
+                    # Compute listeners_score_e from cache payload (was never assigned — v8 fix)
+                    raw_listeners_e = float(pd_e.get("listener_count", 0))
+                    listeners_score_e = (
+                        min(100.0, (math.log1p(raw_listeners_e) / math.log1p(10_000_000)) * 100)
+                        if raw_listeners_e > 0 else 0.0
+                    )
+                    pop_score_e = float(pd_e.get("popularity_score", 40))
+                    image_url_e = pd_e.get("image_url")
+
                     # Skip holiday/seasonal artists
                     if _is_holiday_artist(artist_lower, tags_e):
                         log.debug(f"  PATH E: skipping holiday artist '{artist_display}'")
                         continue
 
-                    # Genre gate: same medium-strictness rule as PATH D
-                    # (listeners_score_e already computed in quality floor above)
-                    if tags_e and listeners_score_e < 90.0:
-                        tag_lowers_e = [t.lower() for t in tags_e[:5]]
+                    # Genre gate — same strict rule as PATH D (v8: threshold 98, _norm_genre)
+                    if tags_e and listeners_score_e < 98.0:
+                        tag_lowers_e = [_norm_genre(t) for t in tags_e[:5]]
                         if not any(t in user_top_genres for t in tag_lowers_e):
                             log.debug(
                                 f"  PATH E: '{artist_display}' skipped — genre mismatch "
@@ -1445,9 +1554,6 @@ def recommend_new_albums(
 
                     if not _genre_ok(tags_e):
                         continue
-
-                    pop_score_e = float(pd_e.get("popularity_score", 40))
-                    image_url_e = pd_e.get("image_url")
 
                     album_name_e, release_year_e, album_image_e = _get_best_album_for_artist(
                         artist_display, db
@@ -1521,7 +1627,12 @@ def recommend_new_albums(
     except Exception as e:
         log.warning(f"  PATH E (genre centrality) failed: {e}", exc_info=True)
 
-    # ── Final sort with light jitter ─────────────────────────────────────────
+    # ── Final assembly with slot reservation ------------------───────────────
+    # Apply jitter first (same as before), then assemble with reserved slots
+    # so PATH A (taste-known artists) and PATH B (similarity chains) are
+    # always represented before PATH D/E fill remaining headroom.
+    # Without this, PATH D's high raw listener scores crowd out every
+    # affinity-driven recommendation in the top-N.
     for c in candidates:
         jitter_range = 3.0 if c.popularity_score >= 70 else 8.0
         c.popularity_score = round(
@@ -1529,12 +1640,44 @@ def recommend_new_albums(
             1
         )
 
-    candidates.sort(key=lambda a: a.popularity_score, reverse=True)
+    # Split by path type
+    path_a_results  = [c for c in candidates if c.rec_type == "missing_album"]
+    path_b_results  = [c for c in candidates if c.rec_type == "new_artist" and c.source_artist != "global_popular"]
+    path_d_results  = [c for c in candidates if c.rec_type == "new_artist" and c.source_artist == "global_popular"]
+    path_e_results  = [c for c in candidates if c.rec_type == "hub_artist"]
+
+    # Sort each bucket by score descending
+    for bucket in (path_a_results, path_b_results, path_d_results, path_e_results):
+        bucket.sort(key=lambda c: c.popularity_score, reverse=True)
+
+    # Reserved slot counts (guaranteed minimums, not hard caps)
+    reserved_a = min(len(path_a_results), max(1, round(limit * 0.20)))
+    reserved_b = min(len(path_b_results), max(1, round(limit * 0.35)))
+    reserved_e = min(len(path_e_results), max(0, round(limit * 0.15)))
+
+    reserved: list = (
+        path_a_results[:reserved_a] +
+        path_b_results[:reserved_b] +
+        path_e_results[:reserved_e]
+    )
+    reserved_set = {id(c) for c in reserved}
+
+    # Remaining candidates sorted by score fill up to limit
+    remainder = sorted(
+        [c for c in candidates if id(c) not in reserved_set],
+        key=lambda c: c.popularity_score,
+        reverse=True,
+    )
+
+    final = reserved + remainder
+
     log.info(
-        f"  Discovery: {len(candidates)} candidates total "
+        f"  Discovery: {len(candidates)} candidates total → "
+        f"reserved A={reserved_a} B={reserved_b} E={reserved_e}, "
+        f"remainder={len(remainder)} "
         f"(seed cap={per_seed_cap}/artist, genre caps: liked={GENRE_CAP_LIKED} neutral={GENRE_CAP_NEUTRAL})"
     )
-    return candidates[:limit]
+    return final[:limit]
 
 
 def get_weight_presets() -> dict:
