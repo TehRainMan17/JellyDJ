@@ -1358,6 +1358,12 @@ def recommend_new_albums(
             if not _genre_ok(tags):
                 continue
 
+            # Hard holiday block — skip any artist with a holiday tag regardless
+            # of whether a non-holiday tag passed the genre gate above
+            if any(_holiday_re.search(t.lower()) for t in tags):
+                log.debug("  PATH B: skipping '%s' — has holiday tag in %s", similar, tags[:3])
+                continue
+
             # ── Core change: pick album via top-songs logic ------------------─
             album_name, release_year, album_image = _get_best_album_for_artist(similar, db, known_track_names)
             if not album_name:
@@ -1467,6 +1473,11 @@ def recommend_new_albums(
                     continue
 
             if not _genre_ok(tags_g):
+                continue
+
+            # Hard holiday block
+            if any(_holiday_re.search(t.lower()) for t in tags_g):
+                log.debug("  PATH D: skipping '%s' — has holiday tag in %s", artist_name_g, tags_g[:3])
                 continue
 
             image_url_g = pd.get("image_url")
@@ -1605,7 +1616,7 @@ def recommend_new_albums(
                 holiday_tag_count = sum(
                     1 for tag in tags if _holiday_re and _holiday_re.search(tag.lower())
                 )
-                if holiday_tag_count > len(tags) / 2:
+                if holiday_tag_count >= len(tags) / 2:  # >= so 1/2 tags = 50% still triggers
                     return True
             return False
 
@@ -1627,7 +1638,7 @@ def recommend_new_albums(
             for name_l, (_disp, _pd) in pop_cache_map.items():
                 _tags = _pd.get("tags", [])
                 _hcount = sum(1 for t in _tags if _holiday_re.search(t.lower()))
-                if _holiday_re.search(name_l) or (_tags and _hcount > len(_tags) / 2):
+                if _holiday_re.search(name_l) or (_tags and _hcount >= len(_tags) / 2):
                     holiday_artist_names.add(name_l)
             log.info(f"  PATH E: pruning {len(holiday_artist_names)} holiday-primary artists from graph")
 
@@ -1721,6 +1732,17 @@ def recommend_new_albums(
                     # Skip holiday/seasonal artists
                     if _is_holiday_artist(artist_lower, tags_e):
                         log.debug(f"  PATH E: skipping holiday artist '{artist_display}'")
+                        continue
+
+                    # Hard holiday block — if ANY tag is a holiday keyword, skip.
+                    # This runs before the genre gate so that an artist with tags
+                    # like ['novelty', 'christmas'] cannot slip through because
+                    # 'novelty' happens to overlap the user's genre profile.
+                    if any(_holiday_re.search(t.lower()) for t in tags_e):
+                        log.debug(
+                            "  PATH E: '%s' skipped — has holiday tag in %s",
+                            artist_display, tags_e[:3],
+                        )
                         continue
 
                     # Genre gate — same strict rule as PATH D (v8: threshold 98, _norm_genre)
