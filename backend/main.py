@@ -315,6 +315,35 @@ async def lifespan(app: FastAPI):
     # Create all tables defined in models.py (no-ops if they already exist)
     Base.metadata.create_all(bind=engine)
 
+    # ── Reset stale job states from previous process ──────────────────────────
+    # If the server crashed or was killed while a background job was running,
+    # the JobState row stays running=True in the DB. On the next boot every
+    # trigger endpoint sees "already running" and refuses to start — the job
+    # is permanently locked until someone manually resets the DB.
+    # Fix: on every startup, mark all running jobs as not-running so they can
+    # be triggered fresh. Any job that was genuinely mid-run is dead anyway
+    # (its thread died with the previous process).
+    try:
+        _boot_db = SessionLocal()
+        try:
+            from models import JobState
+            stale = _boot_db.query(JobState).filter_by(running=True).all()
+            if stale:
+                import logging as _logging
+                _boot_log = _logging.getLogger(__name__)
+                for row in stale:
+                    row.running = False
+                    row.phase = f"Interrupted (server restarted)"
+                _boot_db.commit()
+                _boot_log.warning(
+                    "Startup: reset %d stale running job(s): %s",
+                    len(stale), [r.job_id for r in stale]
+                )
+        finally:
+            _boot_db.close()
+    except Exception:
+        pass  # non-fatal — don't prevent startup
+
     # Add any new columns that appeared since the user's last install
     _run_migrations()
 

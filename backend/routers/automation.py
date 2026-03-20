@@ -69,8 +69,16 @@ def _get_job_state(job_id: str) -> dict:
         return dict(_JOB_DEFAULTS.get(job_id, {}))
 
 def _set_job_state(job_id: str, **kwargs):
-    """Write job state to DB. Uses its own session so it's safe from any thread."""
+    """
+    Write job state to DB. Uses its own session so it's safe from any thread.
+
+    For non-critical progress updates (tracks_done, current_item etc.), if the
+    DB is locked by the enrichment thread's open transaction, we skip silently —
+    the next progress callback fires in ~0.22s and will write the updated values.
+    Critical state changes (running, phase, error) still log a warning if they fail.
+    """
     from datetime import datetime as _dt
+    is_critical = "running" in kwargs or "phase" in kwargs or "error" in kwargs
     try:
         db = SessionLocal()
         try:
@@ -98,7 +106,10 @@ def _set_job_state(job_id: str, **kwargs):
         finally:
             db.close()
     except Exception as e:
-        log.warning(f"_set_job_state({job_id}) failed: {e}")
+        if is_critical:
+            log.warning(f"_set_job_state({job_id}) failed (critical): {e}")
+        else:
+            log.debug(f"_set_job_state({job_id}) skipped (db busy): {e}")
 
 # Convenience wrappers that match the old function signatures
 def _set_enrichment_state(**kwargs): _set_job_state("enrichment", **kwargs)
@@ -922,3 +933,48 @@ def scheduler_status(_: UserContext = Depends(get_current_user), db: Session = D
             "discovery_refresh_interval_hours": s.discovery_refresh_interval_hours,
         }
     }
+
+
+@router.post("/reset-job-state/{job_id}")
+def reset_job_state(
+    job_id: str,
+    _: UserContext = Depends(require_admin),
+):
+    """
+    Manually clear a stuck 'running' job state. Admin only.
+
+    Use this when a job crashed without cleaning up its state and the trigger
+    endpoint is refusing to start because it thinks the job is still running.
+
+    Valid job_ids: enrichment, discovery, download, index, popularity_cache
+    """
+    valid_ids = {"enrichment", "discovery", "download", "index", "popularity_cache"}
+    if job_id not in valid_ids:
+        raise HTTPException(400, f"Unknown job_id '{job_id}'. Valid: {sorted(valid_ids)}")
+
+    _set_job_state(job_id, running=False, phase="Reset by admin", error=None)
+    log.warning("Job state '%s' manually reset by admin", job_id)
+    return {"ok": True, "job_id": job_id, "message": f"'{job_id}' state cleared — you can now trigger it again"}
+
+
+@router.post("/reset-all-job-states")
+def reset_all_job_states(_: UserContext = Depends(require_admin)):
+    """
+    Clear all stuck 'running' job states in one call. Admin only.
+    """
+    from models import JobState
+    db = SessionLocal()
+    try:
+        stale = db.query(JobState).filter_by(running=True).all()
+        reset = []
+        for row in stale:
+            row.running = False
+            row.phase = "Reset by admin"
+            reset.append(row.job_id)
+        db.commit()
+    finally:
+        db.close()
+
+    if reset:
+        log.warning("All running job states reset by admin: %s", reset)
+    return {"ok": True, "reset": reset, "message": f"Cleared {len(reset)} job state(s)"}

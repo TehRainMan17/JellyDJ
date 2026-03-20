@@ -197,6 +197,33 @@ def _norm_genre(s: str) -> str:
     return s
 
 
+def _norm_track(s: str) -> str:
+    """
+    Normalise a track name for fuzzy matching between Last.fm and Jellyfin.
+    Strips punctuation, lowercases, collapses whitespace so that
+    'Good Luck, Babe!' matches 'Good Luck Babe' and
+    'HOT TO GO!' matches 'Hot to Go!'.
+    """
+    import re as _re
+    s = s.lower().strip()
+    s = _re.sub(r"[^\w\s]", "", s)   # strip all punctuation
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _norm_album_title(s: str) -> str:
+    """
+    Lightweight unicode transliteration for album title key comparison.
+    Handles album titles like Ed Sheeran's "× (Deluxe Edition)" where the
+    × symbol (U+00D7) is stripped as punctuation, leaving an empty string
+    that matches nothing in known_albums set lookups.
+    """
+    _MAP = {"×": "x", "÷": "/", "–": "-", "—": "-"}
+    for u, a in _MAP.items():
+        s = s.replace(u, a)
+    return s.lower()
+
+
 # ── Helpers ------------------------------------------------------─────────────
 
 def _affinity_map(db: Session, user_id: str) -> tuple[dict[str, float], dict[str, float]]:
@@ -527,7 +554,11 @@ def _score_album_from_top_tracks(top_tracks: list[dict]) -> dict[str, float]:
     )
 
 
-def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int], Optional[str]]:
+def _get_best_album_for_artist(
+    artist_name: str,
+    db,
+    known_track_names: set | None = None,
+) -> tuple[str, Optional[int], Optional[str]]:
     """
     Return the album most worth recommending for a given artist, chosen by
     scoring each album against the artist's top-5 songs on Last.fm.
@@ -540,11 +571,19 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
          each multiplied by a listener-count factor so monster hits carry extra weight.
          Tie-break: album containing the single highest-ranked song wins.
       3. Skip obvious compilations from the winner.
-      4. Fall back to PopularityCache top_album only if no track→album data exists.
+      4. Skip any album whose hit tracks are already in the user's library
+         (>= 50% of the album's attributed top tracks already owned).
+         This catches deluxe/edition variants like "Midwest Princess (Deluxe)"
+         when the user already owns "Midwest Princess" with the same songs.
+      5. Fall back to PopularityCache top_album only if no track→album data exists.
+
+    known_track_names: set of "artist_lower::track_name_lower" keys from the
+    user's library. Pass None to skip the overlap check.
 
     Returns (album_name, release_year, image_url).
     """
     import json
+    import re as _re
     from models import ArtistEnrichment, PopularityCache
 
     _COMPILATION_WORDS = [
@@ -552,6 +591,27 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
         "gold", "anthology", "singles", "ultimate", "the very best",
         "definitive", "complete collection",
     ]
+
+    _ALBUM_NOISE = _re.compile(
+        r'\s*[\(\[](deluxe|expanded|remaster(?:ed)?|anniversary|special'
+        r'|edition|version|bonus|explicit)[^\)\]]*[\)\]]',
+        _re.IGNORECASE,
+    )
+    # Strip "Track By Track", "Super Deluxe", "Commentary" etc. that appear
+    # as bare suffixes (no brackets) — e.g. "Overexposed Track By Track"
+    _ALBUM_SUFFIX_NOISE = _re.compile(
+        r'\s+(track\s+by\s+track|commentary|super\s+deluxe|'
+        r'\d+th\s+anniversary|anniversary\s+edition|deluxe\s+edition|'
+        r'expanded\s+edition|special\s+edition|bonus\s+tracks?)\s*$',
+        _re.IGNORECASE,
+    )
+
+    def _norm_alb(name: str) -> str:
+        s = _ALBUM_NOISE.sub("", name).strip()
+        s = _ALBUM_SUFFIX_NOISE.sub("", s).strip()
+        return s.lower()
+
+
 
     # ── Step 1+2: top songs → scored album map ------------------──────────────
     ae = db.query(ArtistEnrichment).filter_by(
@@ -563,7 +623,7 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
             top_tracks = json.loads(ae.top_tracks)
             scored = _score_album_from_top_tracks(top_tracks)
 
-            # Walk the ranked list, skip compilations
+            # Walk the ranked list, skip compilations and already-owned hits
             for album_name, _score in scored.items():
                 if any(w in album_name.lower() for w in _COMPILATION_WORDS):
                     log.debug(
@@ -571,6 +631,45 @@ def _get_best_album_for_artist(artist_name: str, db) -> tuple[str, Optional[int]
                         album_name, artist_name,
                     )
                     continue
+
+                # ── Hit-track overlap check ───────────────────────────────────
+                # Find which top tracks are attributed to this album (normalised
+                # to strip deluxe/remaster suffixes so "Midwest Princess (Deluxe)"
+                # matches tracks attributed to "Midwest Princess").
+                if known_track_names is not None:
+                    album_tracks = [
+                        t for t in top_tracks
+                        if t.get("album") and _norm_alb(t["album"]) == _norm_alb(album_name)
+                    ]
+                    if not album_tracks:
+                        # No album attribution for this specific album title.
+                        # Only fall back to tracks that DO have any album
+                        # attribution (top 5) — using all 10 dilutes the owned
+                        # ratio because tracks 6-10 never have album data and
+                        # may not be in the user's library, dropping 3/3 owned
+                        # to 3/10 (30%) and bypassing the 50% threshold.
+                        album_tracks = [t for t in top_tracks if t.get("album")]
+                        if not album_tracks:
+                            # Truly no attribution at all — use top 5 by rank
+                            album_tracks = top_tracks[:5]
+
+                    if album_tracks:
+                        artist_lower = artist_name.lower()
+                        owned = sum(
+                            1 for t in album_tracks
+                            if t.get("name") and
+                            f"{artist_lower}::{_norm_track(t['name'])}" in known_track_names
+                        )
+                        overlap_pct = owned / len(album_tracks)
+                        if overlap_pct >= 0.50:
+                            log.info(
+                                "  Album picker: skipping '%s' for '%s' — "
+                                "%d/%d hit tracks already in library (%.0f%%)",
+                                album_name, artist_name,
+                                owned, len(album_tracks), overlap_pct * 100,
+                            )
+                            continue
+
                 image_url = _get_album_image(artist_name, album_name, db)
                 log.debug(
                     "  Album picker: chose '%s' for '%s' (score=%.1f, ranked albums=%s)",
@@ -777,15 +876,15 @@ def recommend_new_albums(
             if name:
                 known_artists.add(name.lower())
         if row.artist_name and row.album_name:
-            known_albums.add(f"{row.artist_name.lower()}::{row.album_name.lower()}")
+            known_albums.add(f"{row.artist_name.lower()}::{_norm_album_title(row.album_name)}")
         if row.album_artist and row.album_name:
-            known_albums.add(f"{row.album_artist.lower()}::{row.album_name.lower()}")
+            known_albums.add(f"{row.album_artist.lower()}::{_norm_album_title(row.album_name)}")
 
     for row in db.query(Play.artist_name, Play.album_name).filter_by(user_id=user_id).distinct():
         if row.artist_name:
             known_artists.add(row.artist_name.lower())
         if row.artist_name and row.album_name:
-            known_albums.add(f"{row.artist_name.lower()}::{row.album_name.lower()}")
+            known_albums.add(f"{row.artist_name.lower()}::{_norm_album_title(row.album_name)}")
 
     log.info(f"  Dedup sets: {len(known_artists)} artists, {len(known_albums)} albums in library")
 
@@ -806,7 +905,9 @@ def recommend_new_albums(
         LibraryTrack.missing_since.is_(None)
     ).all():
         if row.track_name and row.artist_name:
-            known_track_names.add(f"{row.artist_name.lower()}::{row.track_name.lower()}")
+            # Store normalised form so Last.fm punctuation variants
+            # ("Good Luck, Babe!" vs "Good Luck Babe") still match.
+            known_track_names.add(f"{row.artist_name.lower()}::{_norm_track(row.track_name)}")
 
     # ── Already-queued suppression ------------------------------------───────
     from datetime import timedelta
@@ -865,24 +966,47 @@ def recommend_new_albums(
         """
         Build a human-readable 'why recommended' string that highlights
         the specific popular songs that led to this album being chosen.
+
+        Only mentions songs NOT already in the user's library — avoids
+        saying "Features: Thinking Out Loud" when the user already owns it.
+        Falls back to no song list if all hits are already owned.
         """
-        # Find which of the top tracks are on this album
-        _ALBUM_NOISE = re.compile(
+        import re as _re
+        _NOISE = _re.compile(
             r'\s*[\(\[](deluxe|expanded|remaster(?:ed)?|anniversary|special'
             r'|edition|version|bonus|explicit)[^\)\]]*[\)\]]',
-            re.IGNORECASE,
+            _re.IGNORECASE,
         )
-        def _norm(s): return _ALBUM_NOISE.sub("", s).strip().lower()
+        _SUFFIX = _re.compile(
+            r'\s+(track\s+by\s+track|commentary|super\s+deluxe|'
+            r'\d+th\s+anniversary|anniversary\s+edition|deluxe\s+edition|'
+            r'expanded\s+edition|special\s+edition|bonus\s+tracks?)\s*$',
+            _re.IGNORECASE,
+        )
+        def _norm(s):
+            s = _NOISE.sub("", s).strip()
+            s = _SUFFIX.sub("", s).strip()
+            return s.lower()
 
+        # Tracks attributed to this specific album (normalised match)
         album_tracks = [
             t for t in top_tracks
             if t.get("album") and _norm(t["album"]) == _norm(album_name)
         ]
-        # Fall back to top 3 tracks if album attribution is incomplete
+        # Fall back to tracks that have ANY attribution — never unattributed ones
         if not album_tracks:
-            album_tracks = top_tracks[:3]
+            album_tracks = [t for t in top_tracks if t.get("album")][:3]
 
-        hit_names = [t["name"] for t in album_tracks[:3] if t.get("name")]
+        # Filter to songs NOT already in the user's library so we never
+        # advertise "features Thinking Out Loud" when the user owns it
+        artist_lower = artist.lower()
+        unowned = [
+            t for t in album_tracks
+            if t.get("name") and
+            f"{artist_lower}::{_norm_track(t['name'])}" not in known_track_names
+        ]
+
+        hit_names = [t["name"] for t in unowned[:3] if t.get("name")]
         hits_str = ""
         if hit_names:
             if len(hit_names) == 1:
@@ -936,6 +1060,13 @@ def recommend_new_albums(
         tags: list = None,
         is_wildcard: bool = False,
     ):
+        # Require a specific album — artist-only recs with no album produce
+        # queue items that show "album unknown" and add the artist to Lidarr
+        # with monitor=future only, which downloads nothing and confuses users.
+        if not album or not album.strip():
+            log.debug("  Skipping '%s' — no album identified, would produce useless queue item", artist)
+            return
+
         dedup = f"{artist.lower()}::{album.lower()}"
         if dedup in seen or dedup in queued:
             return
@@ -950,14 +1081,17 @@ def recommend_new_albums(
             return
 
         if album:
-            exact_key = f"{artist.lower()}::{album.lower()}"
+            exact_key = f"{artist.lower()}::{_norm_album_title(album)}"
             if exact_key in known_albums:
                 return
             if album_in_library(artist, album, db):
                 log.info(f"  Dedup (fuzzy album): '{album}' by '{artist}' — already in library")
                 return
-            if f"{artist.lower()}::{album.lower()}" in known_track_names:
-                return
+            # Check if the album's own name appears as a track key — this was
+            # previously broken (compared album name against track-name keys)
+            # and is now superseded by the hit-track overlap check below.
+            # Left intentionally empty; overlap check in _add_candidate's caller
+            # handles this case properly via known_track_names.
 
         seen.add(dedup)
 
@@ -1068,23 +1202,66 @@ def recommend_new_albums(
             except Exception:
                 pass
 
+        # ── Whole-artist top-track coverage check ────────────────────────────
+        # Before spending time picking an album, check whether the user already
+        # owns most of this artist's popular catalogue (e.g. via compilation
+        # albums). If ≥60% of the artist's top tracks (across ALL albums) are
+        # already in the library, there's no point recommending any album —
+        # the user already has the songs that would make them want to buy it.
+        from models import ArtistEnrichment
+        ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist_name.lower()).first()
+        if ae and ae.top_tracks:
+            try:
+                all_top = json.loads(ae.top_tracks)
+                artist_lower_cov = artist_name.lower()
+                owned_top = sum(
+                    1 for t in all_top
+                    if t.get("name") and
+                    f"{artist_lower_cov}::{_norm_track(t['name'])}" in known_track_names
+                )
+                coverage = owned_top / len(all_top) if all_top else 0.0
+                if coverage >= 0.60:
+                    log.info(
+                        "  PATH A: skipping '%s' — %.0f%% of top tracks already owned "
+                        "(%d/%d across all albums)",
+                        artist_name, coverage * 100, owned_top, len(all_top),
+                    )
+                    continue
+            except Exception:
+                pass
+
         # Choose the best missing album using top-songs logic
-        best_album, best_year, best_image = _get_best_album_for_artist(artist_name, db)
+        best_album, best_year, best_image = _get_best_album_for_artist(artist_name, db, known_track_names)
 
         if not best_album:
             continue
-        lib_key = f"{artist_name.lower()}::{best_album.lower()}"
+        lib_key = f"{artist_name.lower()}::{_norm_album_title(best_album)}"
         if lib_key in known_albums or album_in_library(artist_name, best_album, db):
-            # Top album already owned — try the next best from discography
+            # Top album already owned — try the next best from discography,
+            # applying track-overlap check to each candidate.
             best_album = ""
             for alb in albums_data:
                 alb_name = alb.get("name", "")
                 if not alb_name:
                     continue
-                if f"{artist_name.lower()}::{alb_name.lower()}" in known_albums:
+                if f"{artist_name.lower()}::{_norm_album_title(alb_name)}" in known_albums:
                     continue
                 if album_in_library(artist_name, alb_name, db):
                     continue
+                # Track-overlap check: skip if user already owns ≥50%
+                # of this artist's top tracks (they likely have the key songs
+                # already via compilations, so this album adds no new value).
+                # We use the artist's global top tracks as proxy since the
+                # discography cache doesn't have per-album track lists.
+                from services.library_dedup import tracks_in_library_for_album
+                alb_top_tracks = [
+                    t.get("name") for t in (json.loads(ae.top_tracks) if ae and ae.top_tracks else [])
+                    if t.get("name")
+                ]
+                if alb_top_tracks:
+                    owned_c, total_c = tracks_in_library_for_album(artist_name, alb_top_tracks, db)
+                    if total_c > 0 and owned_c / total_c >= 0.50:
+                        continue
                 best_album = alb_name
                 best_year = alb.get("release_year")
                 best_image = alb.get("image_url")
@@ -1095,9 +1272,7 @@ def recommend_new_albums(
         if not _genre_ok(artist_tags):
             continue
 
-        # Get top tracks for why-text
-        from models import ArtistEnrichment
-        ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist_name.lower()).first()
+        # Get top tracks for why-text (ae already loaded above)
         top_tracks_list: list[dict] = []
         if ae and ae.top_tracks:
             try:
@@ -1184,7 +1359,10 @@ def recommend_new_albums(
                 continue
 
             # ── Core change: pick album via top-songs logic ------------------─
-            album_name, release_year, album_image = _get_best_album_for_artist(similar, db)
+            album_name, release_year, album_image = _get_best_album_for_artist(similar, db, known_track_names)
+            if not album_name:
+                log.debug("  PATH B: skipping '%s' — no recommendable album found", similar)
+                continue
             use_image = album_image or image_url
 
             # Load top tracks for why-text
@@ -1293,7 +1471,10 @@ def recommend_new_albums(
 
             image_url_g = pd.get("image_url")
             # Top-songs → album logic for globally popular artists
-            album_name_g, release_year_g, album_image_g = _get_best_album_for_artist(artist_name_g, db)
+            album_name_g, release_year_g, album_image_g = _get_best_album_for_artist(artist_name_g, db, known_track_names)
+            if not album_name_g:
+                log.debug("  PATH D: skipping '%s' — no recommendable album found", artist_name_g)
+                continue
             use_image_g = album_image_g or image_url_g
             genre_hint_g = f" ({', '.join(tags_g[:2])})" if tags_g else ""
 
@@ -1556,8 +1737,11 @@ def recommend_new_albums(
                         continue
 
                     album_name_e, release_year_e, album_image_e = _get_best_album_for_artist(
-                        artist_display, db
+                        artist_display, db, known_track_names
                     )
+                    if not album_name_e:
+                        log.debug("  PATH E: skipping '%s' — no recommendable album found", artist_display)
+                        continue
                     use_image_e = album_image_e or image_url_e
 
                     # Build why string — name-drop up to 3 user-library voters,

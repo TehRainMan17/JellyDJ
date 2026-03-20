@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import re
 import logging
 import math
@@ -37,6 +39,37 @@ log = logging.getLogger(__name__)
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 LASTFM_DELAY   = 0.22   # seconds between calls (rate limit: ~4 rps safe)
 LASTFM_BASE    = "https://ws.audioscrobbler.com/2.0/"  # direct REST — 1 call/track
+
+# ── Shared requests session ───────────────────────────────────────────────────
+# Using a Session (not bare requests.get) gives us:
+#   - Explicit (connect_timeout, read_timeout) tuple so DNS/TCP hangs are bounded
+#   - A retry adapter for transient 429/500/503 responses
+#   - Connection pooling across calls in the same enrichment run
+#
+# CONNECT_TIMEOUT: max seconds to establish TCP connection (catches DNS + SYN hangs)
+# READ_TIMEOUT:    max seconds waiting for the first byte after connecting
+# Previously only timeout=8 (a single socket timeout) was set, which does NOT
+# bound DNS resolution — a stalled DNS query could hang indefinitely.
+_CONNECT_TIMEOUT = 10   # seconds — generous for cold DNS lookups
+_READ_TIMEOUT    = 10   # seconds — Last.fm API is fast; 10s is plenty
+
+def _make_lastfm_session() -> requests.Session:
+    """
+    Build a requests.Session with conservative timeouts and a retry strategy.
+    Called once per enrichment run so the connection pool is reused.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return session
 MB_DELAY       = 1.1    # seconds between MusicBrainz calls
 
 # ── Enrichment TTL ────────────────────────────────────────────────────────────
@@ -183,7 +216,8 @@ def _clean_artist_for_lastfm(artist: str) -> str:
     return artist.strip()
 
 
-def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
+def _enrich_track_lastfm(net, artist_name: str, track_name: str,
+                         session: requests.Session | None = None) -> dict:
     """
     Fetch track data from Last.fm using a single track.getInfo REST call.
 
@@ -191,6 +225,11 @@ def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
     This replaces the previous approach of 6 separate pylast lazy-eval calls
     (each triggering its own HTTP round-trip), cutting time from 3-5s to ~0.3s.
     Similar tracks are skipped — not worth an extra call for what we need.
+
+    session: a requests.Session to reuse across calls. If None, falls back to
+    a one-off call (backward compat). Always pass a session in normal use so
+    the (_CONNECT_TIMEOUT, _READ_TIMEOUT) tuple is applied and DNS hangs are
+    bounded — bare requests.get(timeout=N) does NOT bound DNS resolution.
     """
     result = {
         "mbid": None,
@@ -223,7 +262,9 @@ def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
 
     def _getinfo(artist: str, title: str) -> dict:
         try:
-            r = requests.get(
+            log.debug("  Last.fm track.getInfo: %r — %r", artist, title)
+            _req = session if session is not None else requests
+            r = _req.get(
                 LASTFM_BASE,
                 params={
                     "method":      "track.getInfo",
@@ -233,12 +274,22 @@ def _enrich_track_lastfm(net, artist_name: str, track_name: str) -> dict:
                     "autocorrect": 1,
                     "format":      "json",
                 },
-                timeout=8,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
             )
+            log.debug("  Last.fm HTTP %d for %r — %r", r.status_code, artist, title)
             if r.status_code == 200:
                 return r.json().get("track", {})
+            if r.status_code == 429:
+                log.warning("  Last.fm rate-limited (429) — sleeping 30s")
+                time.sleep(30)
+        except requests.exceptions.ConnectTimeout:
+            log.warning("  Last.fm connect timeout for %r — %r (DNS/TCP >%ds)",
+                        artist, title, _CONNECT_TIMEOUT)
+        except requests.exceptions.ReadTimeout:
+            log.warning("  Last.fm read timeout for %r — %r (no response in %ds)",
+                        artist, title, _READ_TIMEOUT)
         except Exception as e:
-            log.debug(f"  track.getInfo request failed: {e}")
+            log.debug("  track.getInfo request failed: %s", e)
         return {}
 
     data = _getinfo(lookup_artist, lookup_name)
@@ -307,6 +358,11 @@ def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
     if not net:
         log.info("Enrichment: Last.fm not configured — skipping track enrichment")
         return {"skipped": True, "reason": "lastfm_not_configured"}
+
+    # One session for the whole run — bounds DNS/TCP hangs via tuple timeout
+    _session = _make_lastfm_session()
+    log.debug("Enrichment: Last.fm session created (connect=%ds, read=%ds)",
+              _CONNECT_TIMEOUT, _READ_TIMEOUT)
 
     now = datetime.utcnow()
 
@@ -377,7 +433,8 @@ def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
         if progress_callback:
             progress_callback(i, total, lt.track_name, lookup_artist, enriched, failed)
 
-        data = _enrich_track_lastfm(net, lookup_artist, lt.track_name)
+        log.debug("  Enriching track %d/%d: %r — %r", i+1, total, lt.track_name, lookup_artist)
+        data = _enrich_track_lastfm(net, lookup_artist, lt.track_name, session=_session)
         time.sleep(LASTFM_DELAY)
 
         try:
@@ -417,7 +474,10 @@ def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
             lt.enriched_at = now
             lt.enrichment_source = data["source"]
 
-            db.flush()   # stage to transaction but don't fsync yet
+            # Do NOT flush() here — it opens a write transaction that stays
+            # open until the next commit(), blocking _set_job_state's writes
+            # and causing "database is locked" rollbacks every 25 tracks.
+            # SQLAlchemy will flush automatically when commit() is called.
             enriched += 1
 
         except Exception as e:
@@ -425,10 +485,10 @@ def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
             db.rollback()
             failed += 1
 
-        # Commit every 25 tracks — one fsync per 25 writes instead of per 1.
-        # Reduces SSD wear ~25× with no meaningful data-loss risk
-        # (worst case: lose the last <25 enrichment rows on crash, re-enriched next run).
-        if (enriched + failed) % 25 == 0:
+        # Commit every 50 tracks — larger batches mean fewer lock-contention
+        # windows. Each commit() releases the write lock so _set_job_state
+        # (progress state writer) can get through between batches.
+        if (enriched + failed) % 50 == 0:
             try:
                 db.commit()
             except Exception as e:
@@ -451,7 +511,8 @@ def enrich_tracks(db: Session, force: bool = False, limit=TRACKS_PER_RUN,
 
 # ── Artist enrichment ─────────────────────────────────────────────────────────
 
-def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[int]) -> dict:
+def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[int],
+                          session: requests.Session | None = None) -> dict:
     """
     Fetch artist data from Last.fm using a single artist.getInfo REST call.
 
@@ -485,15 +546,25 @@ def _enrich_artist_lastfm(net, artist_name: str, previous_listeners: Optional[in
 
     def _lastfm_get(method: str, params: dict) -> dict:
         try:
-            r = requests.get(
+            log.debug("  Last.fm %s: %s", method, params.get("artist", params.get("track", "")))
+            _req = session if session is not None else requests
+            r = _req.get(
                 LASTFM_BASE,
                 params={"method": method, "api_key": api_key, "format": "json", **params},
-                timeout=8,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
             )
+            log.debug("  Last.fm HTTP %d for %s", r.status_code, method)
             if r.status_code == 200:
                 return r.json()
+            if r.status_code == 429:
+                log.warning("  Last.fm rate-limited (429) on %s — sleeping 30s", method)
+                time.sleep(30)
+        except requests.exceptions.ConnectTimeout:
+            log.warning("  Last.fm connect timeout on %s (DNS/TCP >%ds)", method, _CONNECT_TIMEOUT)
+        except requests.exceptions.ReadTimeout:
+            log.warning("  Last.fm read timeout on %s (no response in %ds)", method, _READ_TIMEOUT)
         except Exception as e:
-            log.debug(f"  {method} request failed: {e}")
+            log.debug("  %s request failed: %s", method, e)
         return {}
 
     info_data = _lastfm_get("artist.getInfo", {"artist": artist_name, "autocorrect": 1})
@@ -639,6 +710,8 @@ def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
         log.info("Enrichment: Last.fm not configured — skipping artist enrichment")
         return {"skipped": True, "reason": "lastfm_not_configured"}
 
+    _session = _make_lastfm_session()
+
     now = datetime.utcnow()
 
     # Find all unique artist names in the library
@@ -684,7 +757,7 @@ def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
         ).first()
         prev_listeners = existing.global_listeners if existing else None
 
-        data = _enrich_artist_lastfm(net, artist_name, prev_listeners)
+        data = _enrich_artist_lastfm(net, artist_name, prev_listeners, session=_session)
         time.sleep(LASTFM_DELAY)
 
         try:
@@ -712,7 +785,7 @@ def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
             existing.enriched_at = now
             existing.expires_at = now + timedelta(days=ARTIST_TTL_DAYS)
 
-            db.flush()
+            # No flush() here — see track enrichment comment above
 
             # Populate ArtistRelation edges
             if data["similar_artists"]:
@@ -739,7 +812,6 @@ def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
                 except Exception as e:
                     log.debug(f"  ArtistRelation upsert failed for {artist_name}: {e}")
 
-            db.flush()
             enriched += 1
 
         except Exception as e:
@@ -747,7 +819,7 @@ def enrich_artists(db: Session, force: bool = False, limit=ARTISTS_PER_RUN,
             db.rollback()
             failed += 1
 
-        if (enriched + failed) % 25 == 0:
+        if (enriched + failed) % 50 == 0:
             try:
                 db.commit()
             except Exception as e:

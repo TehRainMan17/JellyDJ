@@ -995,3 +995,99 @@ async def debug_recommend(user_id: str, db: Session = Depends(get_db)):
             for r in recs
         ],
     }
+
+
+@router.get("/debug/maroon5-dedup/{user_id}")
+async def debug_maroon5_dedup(user_id: str, artist: str = "Maroon 5", album: str = "Overexposed", db: Session = Depends(get_db)):
+    """
+    Diagnostic endpoint — shows exactly what the recommender sees when
+    deciding whether an artist/album is already in the library.
+    Call: GET /api/discovery/debug/maroon5-dedup/{user_id}?artist=Maroon+5&album=Overexposed
+    """
+    import json
+    from models import LibraryTrack, Play, ArtistEnrichment
+    from services.library_dedup import album_in_library, get_artist_tracks_in_library
+    from services.recommender import _norm_track
+
+    # 1. What the known_albums set contains for this artist
+    lib_rows = db.query(
+        LibraryTrack.artist_name, LibraryTrack.album_name, LibraryTrack.album_artist
+    ).filter(LibraryTrack.missing_since.is_(None)).all()
+
+    known_albums = set()
+    for row in lib_rows:
+        for name in (row.artist_name, row.album_artist):
+            if name:
+                known_albums.add(f"{name.lower()}::{(row.album_name or '').lower()}")
+
+    play_rows = db.query(Play.artist_name, Play.album_name).filter_by(user_id=user_id).distinct().all()
+    for row in play_rows:
+        if row.artist_name and row.album_name:
+            known_albums.add(f"{row.artist_name.lower()}::{row.album_name.lower()}")
+
+    artist_albums_in_set = sorted([k for k in known_albums if artist.lower() in k])
+
+    # 2. known_track_names for this artist
+    track_rows = db.query(LibraryTrack.track_name, LibraryTrack.artist_name).filter(
+        LibraryTrack.missing_since.is_(None)
+    ).all()
+    known_track_names = set()
+    for row in track_rows:
+        if row.track_name and row.artist_name:
+            known_track_names.add(f"{row.artist_name.lower()}::{_norm_track(row.track_name)}")
+    artist_tracks_in_set = sorted([k for k in known_track_names if artist.lower() in k])
+
+    # 3. What _get_best_album_for_artist would see in top_tracks
+    ae = db.query(ArtistEnrichment).filter_by(artist_name_lower=artist.lower()).first()
+    top_tracks = []
+    if ae and ae.top_tracks:
+        try:
+            top_tracks = json.loads(ae.top_tracks)
+        except Exception:
+            pass
+
+    # 4. Check each dedup gate manually
+    exact_key = f"{artist.lower()}::{album.lower()}"
+    exact_hit = exact_key in known_albums
+    fuzzy_hit = album_in_library(artist, album, db)
+
+    # 5. For each top track, show whether it matches known_track_names
+    track_checks = []
+    for t in top_tracks:
+        name = t.get("name", "")
+        norm = _norm_track(name)
+        key = f"{artist.lower()}::{norm}"
+        track_checks.append({
+            "lastfm_name": name,
+            "normalised": norm,
+            "lookup_key": key,
+            "in_library": key in known_track_names,
+            "album_attr": t.get("album"),
+            "rank": t.get("rank"),
+        })
+
+    owned_count = sum(1 for t in track_checks if t["in_library"])
+    attributed = [t for t in track_checks if t.get("album_attr")]
+    owned_attributed = sum(1 for t in attributed if t["in_library"])
+
+    return {
+        "query": {"artist": artist, "album": album, "user_id": user_id},
+        "dedup_checks": {
+            "exact_key_checked": exact_key,
+            "exact_key_in_known_albums": exact_hit,
+            "album_in_library_fuzzy": fuzzy_hit,
+            "would_be_skipped": exact_hit or fuzzy_hit,
+        },
+        "track_overlap": {
+            "total_top_tracks": len(top_tracks),
+            "tracks_with_album_attribution": len(attributed),
+            "owned_of_all_tracks": f"{owned_count}/{len(top_tracks)}",
+            "owned_of_attributed_tracks": f"{owned_attributed}/{len(attributed)}",
+            "overlap_pct_all": round(owned_count / len(top_tracks) * 100, 1) if top_tracks else 0,
+            "overlap_pct_attributed": round(owned_attributed / len(attributed) * 100, 1) if attributed else 0,
+            "would_skip_at_50pct_attributed": (owned_attributed / len(attributed) >= 0.50) if attributed else False,
+        },
+        "artist_albums_in_known_set": artist_albums_in_set,
+        "artist_tracks_in_known_set": artist_tracks_in_set[:30],
+        "top_tracks_detail": track_checks,
+    }

@@ -92,9 +92,39 @@ def _normalise(s: str) -> str:
 
     This makes "Jagged Little Pill (2015 Remaster)" normalise to the same
     token-sorted string as "Jagged Little Pill".
+
+    Unicode transliteration (phase 0):
+      Jellyfin and streaming services use unicode symbols as album titles
+      (Ed Sheeran's "×", "÷", Taylor Swift's "1989", etc.). The multiply
+      sign × (U+00D7) and division sign ÷ (U+00F7) would be stripped as
+      punctuation, leaving an empty string that matches nothing.
+      We map known music-title unicode symbols to ASCII equivalents first.
     """
     if not s:
         return ""
+    # Phase 0: transliterate unicode symbols used as album/artist titles
+    _UNICODE_MAP = {
+        "×": "x",   # Ed Sheeran ×  (U+00D7 multiplication sign)
+        "÷": "/",   # Ed Sheeran ÷  (U+00F7 division sign)
+        "–": "-",   # en dash → hyphen
+        "—": "-",   # em dash → hyphen
+        "\u2019": "'",  # right single quotation mark
+        "\u2018": "'",  # left single quotation mark
+        "\u201c": '"',  # left double quotation mark
+        "\u201d": '"',  # right double quotation mark
+        "\u2026": "...",  # ellipsis
+        "\u00e9": "e",  # é → e (common in French loanwords)
+        "\u00e8": "e",  # è → e
+        "\u00ea": "e",  # ê → e
+        "\u00e0": "a",  # à → a
+        "\u00e2": "a",  # â → a
+        "\u00f6": "o",  # ö → o
+        "\u00fc": "u",  # ü → u
+        "\u00e4": "a",  # ä → a
+        "\u00f1": "n",  # ñ → n
+    }
+    for uni, asc in _UNICODE_MAP.items():
+        s = s.replace(uni, asc)
     s = s.lower()
     s = _STRIP_BRACKET_NOISE.sub("", s)
     s = _STRIP_BARE_SUFFIX.sub("", s)
