@@ -200,13 +200,26 @@ def _norm_genre(s: str) -> str:
 def _norm_track(s: str) -> str:
     """
     Normalise a track name for fuzzy matching between Last.fm and Jellyfin.
-    Strips punctuation, lowercases, collapses whitespace so that
-    'Good Luck, Babe!' matches 'Good Luck Babe' and
-    'HOT TO GO!' matches 'Hot to Go!'.
+
+    Handles the common mismatches:
+      - Punctuation:  'Good Luck, Babe!' → 'good luck babe'
+      - Feat. suffix: 'Bang Bang feat. Ariana Grande' → 'bang bang'
+                      'Bang Bang (feat. Ariana Grande)' → 'bang bang'
+      - Soundtrack:   'Flashlight - From Pitch Perfect 2 Soundtrack' → 'flashlight'
+
+    Both the Jellyfin track name and the Last.fm track name are normalised
+    through this function before comparison, so the stripping is symmetric.
     """
     import re as _re
     s = s.lower().strip()
-    s = _re.sub(r"[^\w\s]", "", s)   # strip all punctuation
+    # Strip parenthesised feat./ft./with/featuring blocks first
+    s = _re.sub(r'\s*\(\s*(?:feat(?:uring)?\s*\.?|ft\.?|with)\s+[^)]+\)', '', s, flags=_re.IGNORECASE)
+    # Strip bare feat./ft. suffix: "Bang Bang feat. Ariana Grande & Nicki Minaj"
+    s = _re.sub(r'\s+(?:feat(?:uring)?\s*\.?|ft\.)\s+.*$', '', s, flags=_re.IGNORECASE)
+    # Strip soundtrack/film suffixes: "Song - From \"Movie\" Soundtrack"
+    s = _re.sub(r'\s*[-–]\s+(?:from|ost|soundtrack|theme\s+from)\b.*$', '', s, flags=_re.IGNORECASE)
+    # Strip remaining punctuation, collapse whitespace
+    s = _re.sub(r"[^\w\s]", "", s)
     s = _re.sub(r"\s+", " ", s).strip()
     return s
 
