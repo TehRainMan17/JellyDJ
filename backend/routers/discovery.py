@@ -259,7 +259,7 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
 
 # ── Queue population ──────────────────────────────────────────────────────────
 
-async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
+async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20, path_e_global_seen: set = None):
     """
     Run the recommender and add new items to the discovery queue.
 
@@ -371,7 +371,7 @@ async def _populate_queue_for_user(user_id: str, db: Session, limit: int = 20):
             log.warning(f"  Could not fetch Lidarr monitored albums: {e}")
 
     # ── Step 4: Get recommendations ──────────────────────────────────────────
-    recs = recommend_new_albums(user_id, effective_limit * 4, db)
+    recs = recommend_new_albums(user_id, effective_limit * 4, db, path_e_global_seen=path_e_global_seen)
 
     # ── Step 5: Enforce discovery bias — 75% new artists, 25% known ──────────
     # Split recs by type, then build an oversized ordered pool before the
@@ -600,12 +600,14 @@ def get_counts(
 
 @router.post("/populate")
 async def populate_queue(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
     Populate queue for all enabled users.
-    Runs synchronously so the client gets the real added count and can
-    immediately refresh the list. Limit is always read from AutomationSettings.
+    Returns immediately and runs the heavy work in a background task so the
+    event loop stays free for auth refreshes and other requests during the run.
+    Limit is always read from AutomationSettings.
     """
     from models import AutomationSettings
     users = db.query(ManagedUser).filter_by(has_activated=True).all()
@@ -614,45 +616,58 @@ async def populate_queue(
 
     s = db.query(AutomationSettings).first()
     effective_limit = s.discovery_items_per_run if s else 10
-    log.info(f"Discovery populate: limit={effective_limit} (from AutomationSettings)")
+    log.info(f"Discovery populate: limit={effective_limit} — starting background run")
 
-    total_added = 0
-    for user in users:
-        try:
-            added = await _populate_queue_for_user(user.jellyfin_user_id, db, effective_limit)
-            total_added += added
-            log.info(f"Discovery queue: +{added} items for {user.username}")
-        except Exception as e:
-            log.warning(f"Discovery populate failed for {user.username}: {e}")
+    background_tasks.add_task(_populate_all_users, users, effective_limit)
 
-    return {"ok": True, "added": total_added,
-            "message": f"Added {total_added} new recommendation(s)"}
+    return {"ok": True, "message": "Discovery refresh started"}
 
 
 async def _populate_all_users(users, limit: int = 0):
     """
     Background task: populate discovery queue for all users.
-    Always reads the limit from AutomationSettings so the user's control is respected.
+    Opens a fresh DB session per user and closes it immediately after so the
+    SQLite write lock is only held in short bursts, keeping auth and other
+    requests responsive throughout the run.
     The limit parameter is ignored — it exists only for backwards compatibility.
     """
+    import asyncio
     from database import SessionLocal
     from models import AutomationSettings
+
+    # Read settings once with a short-lived session
     db = SessionLocal()
     try:
         s = db.query(AutomationSettings).first()
         effective_limit = s.discovery_items_per_run if s else 10
-        log.info(f"Discovery populate: effective_limit={effective_limit} (from AutomationSettings)")
-
-        for user in users:
-            try:
-                added = await _populate_queue_for_user(
-                    user.jellyfin_user_id, db, effective_limit
-                )
-                log.info(f"Discovery queue: +{added} items for {user.username}")
-            except Exception as e:
-                log.warning(f"Discovery populate failed for {user.username}: {e}")
     finally:
         db.close()
+
+    log.info(f"Discovery populate: effective_limit={effective_limit} (from AutomationSettings)")
+
+    # Shared set of PATH E (genre cornerstone) artists already queued this run.
+    # Prevents the same hub artist appearing in every user's queue when they
+    # share similar taste profiles.
+    path_e_global_seen: set[str] = set()
+
+    for user in users:
+        # Fresh session per user — lock is held only during this user's run,
+        # then released before moving to the next user.
+        db = SessionLocal()
+        try:
+            added = await _populate_queue_for_user(
+                user.jellyfin_user_id, db, effective_limit,
+                path_e_global_seen=path_e_global_seen,
+            )
+            log.info(f"Discovery queue: +{added} items for {user.username}")
+        except Exception as e:
+            log.warning(f"Discovery populate failed for {user.username}: {e}")
+        finally:
+            db.close()
+
+        # Yield to the event loop between users so auth refreshes and other
+        # requests aren't starved while we work through the user list.
+        await asyncio.sleep(0)
 
 
 @router.post("/{item_id}/action")

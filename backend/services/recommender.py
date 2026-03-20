@@ -1,4 +1,3 @@
-
 """
 JellyDJ Recommendation Engine — Module 5
 
@@ -71,7 +70,7 @@ class AlbumResult:
     source_artist: str            # the user's artist that led to this rec
     source_affinity: float        # how much the user likes source_artist (0–100)
     lastfm_listeners: float = 0.0 # raw Last.fm listener score 0–100
-    rec_type: str = ""            # "missing_album" | "new_artist"
+    rec_type: str = ""            # "missing_album" | "new_artist" | "hub_artist"
 
 
 # ── Weight presets ────────────────────────────────────────────────────────────
@@ -550,6 +549,7 @@ def recommend_new_albums(
     user_id: str,
     limit: int,
     db,
+    path_e_global_seen: set = None,
 ) -> list[AlbumResult]:
     """
     Album-first discovery engine — song-quality driven, taste-aware.
@@ -580,13 +580,22 @@ def recommend_new_albums(
       - Seed artist selection: structured tiered sampling.
       - 90-day artist suppression + 180-day rejection suppression.
 
-    Three recommendation paths:
+    Four recommendation paths:
       PATH A — Missing albums from known artists (complete their collection).
                 Capped at 25% of limit. Uses top-songs→album logic.
       PATH B — New artists via similarity chains from sampled seed artists.
                 Capped per seed artist at floor(limit * 0.20).
-      PATH D — Globally popular artists (≥1M listeners) not in library.
+      PATH D — Globally popular artists (>=1M listeners) not in library.
                 Targets 40% of output. Genre-filtered (medium strictness).
+      PATH E — Genre-centrality / "hub artist" discovery (PageRank-style).
+                Builds a directed artist-similarity graph from ArtistRelation
+                rows, runs simplified PageRank (10 iters, damping=0.85), and
+                surfaces artists with high in-degree — i.e. many other artists
+                list them as similar — who are not yet in the user's library.
+                Requires >=2 library artists to vote for a candidate.
+                Targets 20% of output. Score blends listener reach (40%),
+                popularity (25%), PageRank centrality (25%), genre affinity
+                (10%) plus a per-voter bonus (up to +15 pts).
     """
     import random
     import json
@@ -597,7 +606,7 @@ def recommend_new_albums(
     # ── Per-seed-artist diversity cap ────────────────────────────────────────
     # 20% of the run limit, floored at 1.  Prevents any single seed artist
     # (e.g. Adele) from dominating the candidate pool via their similarity chain.
-    per_seed_cap = max(1, int(limit * 0.20))
+    per_seed_cap = max(1, round(limit * 0.20))
 
     # ── Taste-aware genre caps ────────────────────────────────────────────────
     # Genres the user actively listens to get more headroom than unknown genres.
@@ -682,6 +691,18 @@ def recommend_new_albums(
             known_albums.add(f"{row.artist_name.lower()}::{row.album_name.lower()}")
 
     log.info(f"  Dedup sets: {len(known_artists)} artists, {len(known_albums)} albums in library")
+
+    # ── Load exclusions list ─────────────────────────────────────────────────
+    # ExcludedAlbum rows are user-managed blacklists — never recommend these.
+    from models import ExcludedAlbum
+    excluded_artists: set[str] = set()
+    excluded_album_keys: set[str] = set()
+    for row in db.query(ExcludedAlbum).all():
+        if row.artist_name:
+            excluded_artists.add(row.artist_name.lower())
+        if row.artist_name and row.album_name:
+            excluded_album_keys.add(f"{row.artist_name.lower()}::{row.album_name.lower()}")
+    log.info(f"  Exclusions: {len(excluded_artists)} excluded artists, {len(excluded_album_keys)} excluded albums")
 
     known_track_names: set[str] = set()
     for row in db.query(LibraryTrack.track_name, LibraryTrack.artist_name).filter(
@@ -826,6 +847,10 @@ def recommend_new_albums(
             return
         if artist.lower() in recently_queued_artists:
             return
+        if artist.lower() in excluded_artists:
+            return
+        if album and f"{artist.lower()}::{album.lower()}" in excluded_album_keys:
+            return
 
         if album:
             exact_key = f"{artist.lower()}::{album.lower()}"
@@ -906,8 +931,13 @@ def recommend_new_albums(
     # ── PATH A: Missing albums from known artists ─────────────────────────────
     # Uses top-songs→album logic, same as PATH B/D — no special-casing for
     # known artists. Capped at 25% of limit.
-    path_a_cap = max(2, limit // 4)
+    path_a_cap = max(1, round(limit * 0.25))
     path_a_count = 0
+
+    # PATH B total cap — similarity chains get 30% of limit.
+    # Per-seed cap stays to ensure diversity across seeds.
+    path_b_target = max(1, round(limit * 0.30))
+    path_b_total  = 0
 
     for artist_name, aff_score in affinity_map.items():
         if path_a_count >= path_a_cap:
@@ -1000,6 +1030,9 @@ def recommend_new_albums(
 
     # ── PATH B: New artists via similarity ────────────────────────────────────
     for seed_row in seed_rows:
+        if path_b_total >= path_b_target:
+            break
+
         seed_name = seed_row.artist_name
         source_affinity = affinity_map.get(seed_name, 50.0)
 
@@ -1066,9 +1099,16 @@ def recommend_new_albums(
             genre_hint = f" ({', '.join(tags[:2])})" if tags else ""
             why = _build_why_text(
                 similar, album_name, pop_score,
-                f"Similar to {seed_name}{genre_hint}, an artist you love",
+                f"Fans of {seed_name} also love this artist{genre_hint}",
                 top_tracks_list,
             )
+
+            # Moderate the listener score by source affinity so PATH B results
+            # aren't scored identically to PATH D global-popular results.
+            # A globally popular artist recommended via a high-affinity seed
+            # still scores well; one via a weak-affinity seed scores lower.
+            affinity_factor = 0.5 + (source_affinity / 200.0)  # 0.5–1.0
+            moderated_listeners = lastfm_listeners_score * affinity_factor
 
             before = len(candidates)
             _add_candidate(
@@ -1079,17 +1119,18 @@ def recommend_new_albums(
                 image_url=use_image,
                 source_artist=seed_name,
                 source_affinity=source_affinity,
-                lastfm_listeners=lastfm_listeners_score,
+                lastfm_listeners=moderated_listeners,
                 why=why,
                 rec_type="new_artist",
                 tags=tags,
             )
             if len(candidates) > before:
                 seed_artist_counts[seed_name] = seed_artist_counts.get(seed_name, 0) + 1
+                path_b_total += 1
                 _charge_genre(tags)
 
     # ── PATH D: Globally popular (≥1M listeners), not in library ─────────────
-    path_d_target = max(4, int(limit * 0.40))
+    path_d_target = max(1, round(limit * 0.25))
     path_d_added = 0
 
     try:
@@ -1165,7 +1206,7 @@ def recommend_new_albums(
 
             why_g = _build_why_text(
                 artist_name_g, album_name_g, listeners_score,
-                f"Globally popular{genre_hint_g}: {listeners_score:.0f}/100 listener score — not yet in your library",
+                f"Popular pick{genre_hint_g}: highly listened to worldwide but not yet in your library",
                 top_tracks_g,
             )
 
@@ -1191,6 +1232,294 @@ def recommend_new_albums(
         log.warning(f"  PATH D (global popular) failed: {e}")
 
     log.info(f"  PATH D: {path_d_added} globally popular artists added")
+
+    # ── PATH E: Genre-centrality discovery (PageRank-style) ──────────────────
+    #
+    # Philosophy: within the artist similarity graph we already have in
+    # ArtistRelation, some artists act as "hubs" — many other artists point to
+    # them via their similar-artist lists, even though they may not appear in
+    # the user's own top-30 seeds.  These hub artists are structurally
+    # important in a genre (analogous to a highly-linked page in Google's
+    # original PageRank model).  If the user hasn't heard them, they are
+    # premium discovery targets.
+    #
+    # Algorithm:
+    #   1. Load every ArtistRelation row whose artist_a is a user-library
+    #      artist OR appears in the PopularityCache (i.e. enriched globally).
+    #      This gives us a directed similarity graph: A → B means "A lists B
+    #      as similar".
+    #   2. Run a simplified PageRank (10 iterations, damping=0.85) on the
+    #      *in-degree* of each artist — how many other artists point at them.
+    #      Artists the user already owns are still included in the graph (they
+    #      act as "voters") but are excluded from the candidate output.
+    #   3. Take the top N by PageRank score who are not in the user's library,
+    #      not already queued, and pass the genre filter.
+    #   4. Add them as rec_type="hub_artist" with a why string that names the
+    #      genre and centrality rank.
+    #
+    # Target: up to 20% of the discovery limit (floor 2).
+    # This path runs after PATH D so it only fills remaining headroom.
+
+    path_e_target = max(1, round(limit * 0.20))
+    path_e_added  = 0
+
+    try:
+        from models import ArtistRelation, PopularityCache as PC2
+        import json as _json
+        from services.holiday import HOLIDAY_RULES
+
+        # Build a flat set of all holiday keywords for fast tag/name matching
+        _holiday_keywords: set[str] = set()
+        for _slug, _keywords, _start, _end in HOLIDAY_RULES:
+            for _kw in _keywords:
+                _holiday_keywords.add(_kw.lower())
+        # Add common genre-level holiday terms that may appear as Last.fm tags
+        _holiday_keywords.update({
+            "christmas music", "holiday", "holiday music", "seasonal",
+            "winter holiday", "christmas songs", "christmas carols",
+            "halloween", "thanksgiving",
+        })
+
+        def _is_holiday_artist(name_lower: str, tags: list[str]) -> bool:
+            """
+            Return True only if this artist is *primarily* a holiday act.
+            An artist with one Christmas single should not be excluded —
+            only acts whose identity is holiday music (e.g. "Christmas Hits",
+            "Holiday Classics") should be filtered.
+
+            Rules:
+              - If the artist NAME itself contains a holiday keyword → exclude
+                (e.g. "Christmas Jazz Orchestra", "Holiday Hits")
+              - If the majority (>50%) of their Last.fm tags are holiday tags → exclude
+              - A single holiday tag among many real-genre tags → keep
+            """
+            # Artist name is a strong signal — "Christmas Choir" etc.
+            if _holiday_re and _holiday_re.search(name_lower):
+                return True
+            # Tag majority check — only exclude if holiday tags dominate
+            if tags:
+                holiday_tag_count = sum(
+                    1 for tag in tags if _holiday_re and _holiday_re.search(tag.lower())
+                )
+                if holiday_tag_count > len(tags) / 2:
+                    return True
+            return False
+
+        # ── Step 1: build the graph ───────────────────────────────────────────
+        # We want all relations where artist_a is known (enriched or in library).
+        # Use a set of "known" names from PopularityCache (artist:* keys) so the
+        # graph isn't limited to just the user's listened artists.
+        all_relation_rows = db.query(ArtistRelation).all()
+
+        if all_relation_rows:
+            # Build in-degree map: how many unique artists point to each artist.
+            # Use a dict of sets so duplicate edges don't inflate the count.
+            in_edges: dict[str, set[str]] = {}   # target → {source, ...}
+            out_edges: dict[str, set[str]] = {}  # source → {target, ...}
+
+            # Build a set of known holiday-primary artist names from the
+            # cache so we can prune them from graph edges efficiently.
+            # Only artist names that are themselves holiday-keyword-heavy
+            # get pruned — real artists with holiday tags stay in the graph.
+            holiday_artist_names: set[str] = set()
+            for name_l, (_disp, _pd) in pop_cache_map.items():
+                _tags = _pd.get("tags", [])
+                _hcount = sum(1 for t in _tags if _holiday_re.search(t.lower()))
+                if _holiday_re.search(name_l) or (_tags and _hcount > len(_tags) / 2):
+                    holiday_artist_names.add(name_l)
+            log.info(f"  PATH E: pruning {len(holiday_artist_names)} holiday-primary artists from graph")
+
+            for rel in all_relation_rows:
+                a = rel.artist_a.lower()
+                b = rel.artist_b.lower()
+                # Only exclude artists whose primary identity is holiday music
+                if a in holiday_artist_names or b in holiday_artist_names:
+                    continue
+                in_edges.setdefault(b, set()).add(a)
+                out_edges.setdefault(a, set()).add(b)
+
+            all_nodes = set(in_edges.keys()) | set(out_edges.keys())
+            N = len(all_nodes)
+
+            if N > 1:
+                # ── Step 2: simplified PageRank ───────────────────────────────
+                DAMPING     = 0.85
+                ITERATIONS  = 10
+                rank: dict[str, float] = {node: 1.0 / N for node in all_nodes}
+
+                for _ in range(ITERATIONS):
+                    new_rank: dict[str, float] = {}
+                    for node in all_nodes:
+                        # Sum of (rank[src] / out_degree[src]) for all srcs → node
+                        in_flow = 0.0
+                        for src in in_edges.get(node, set()):
+                            out_d = len(out_edges.get(src, set())) or 1
+                            in_flow += rank[src] / out_d
+                        new_rank[node] = (1.0 - DAMPING) / N + DAMPING * in_flow
+                    rank = new_rank
+
+                # Normalise to 0–100
+                max_rank = max(rank.values()) or 1.0
+                rank_score: dict[str, float] = {
+                    node: (r / max_rank) * 100.0 for node, r in rank.items()
+                }
+
+                # ── Step 3: pick top candidates not in user's library ─────────
+                # Sort by PageRank descending, filter to unknowns
+                sorted_by_rank = sorted(
+                    rank_score.items(), key=lambda kv: kv[1], reverse=True
+                )
+
+                # Pre-compile holiday regex for fast graph pruning
+                import re as _re
+                _holiday_re = _re.compile(
+                    r'\b(' + '|'.join(_re.escape(kw) for kw in _holiday_keywords) + r')\b',
+                    _re.IGNORECASE,
+                )
+
+                # Build a lowercase→display-name map from PopularityCache so we
+                # can do a single bulk lookup instead of per-artist queries.
+                # PopularityCache keys are "artist:{name}" — name case varies,
+                # so we index by lower() to match ArtistRelation artist_lower keys.
+                pop_cache_map: dict[str, tuple[str, dict]] = {}  # lower_name → (display, payload)
+                for pc_row in db.query(PC2).filter(PC2.cache_key.like("artist:%")).all():
+                    raw_name = pc_row.cache_key[len("artist:"):]
+                    try:
+                        payload = _json.loads(pc_row.payload)
+                        pop_cache_map[raw_name.lower()] = (raw_name, payload)
+                    except Exception:
+                        continue
+
+                log.info(
+                    f"  PATH E: graph has {N} nodes, {len(all_relation_rows)} edges, "
+                    f"{len(pop_cache_map)} enriched artists in cache"
+                )
+
+                for artist_lower, pr_score in sorted_by_rank:
+                    if path_e_added >= path_e_target:
+                        break
+
+                    if artist_lower in known_artists:
+                        continue
+                    if artist_lower in recently_queued_artists:
+                        continue
+                    if artist_lower in rejected_artists:
+                        continue
+
+                    # How many library artists reference this one (in-degree from library)
+                    lib_voters = [
+                        src for src in in_edges.get(artist_lower, set())
+                        if src in known_artists
+                    ]
+                    n_lib_voters = len(lib_voters)
+
+                    # Lower threshold to 1 — even a single strong library pointer
+                    # is meaningful if PageRank is high. Log but don't skip.
+                    if n_lib_voters < 1:
+                        continue
+
+                    # Look up enrichment via the pre-built lowercase map
+                    cache_entry = pop_cache_map.get(artist_lower)
+                    if not cache_entry:
+                        log.debug(f"  PATH E: no cache entry for '{artist_lower}' — skipping")
+                        continue
+
+                    artist_display, pd_e = cache_entry
+                    tags_e: list[str] = pd_e.get("tags", [])
+
+                    # Skip holiday/seasonal artists
+                    if _is_holiday_artist(artist_lower, tags_e):
+                        log.debug(f"  PATH E: skipping holiday artist '{artist_display}'")
+                        continue
+
+                    # Genre gate: same medium-strictness rule as PATH D
+                    # (listeners_score_e already computed in quality floor above)
+                    if tags_e and listeners_score_e < 90.0:
+                        tag_lowers_e = [t.lower() for t in tags_e[:5]]
+                        if not any(t in user_top_genres for t in tag_lowers_e):
+                            log.debug(
+                                f"  PATH E: '{artist_display}' skipped — genre mismatch "
+                                f"tags={tags_e[:3]} not in user genres"
+                            )
+                            continue
+
+                    if not _genre_ok(tags_e):
+                        continue
+
+                    pop_score_e = float(pd_e.get("popularity_score", 40))
+                    image_url_e = pd_e.get("image_url")
+
+                    album_name_e, release_year_e, album_image_e = _get_best_album_for_artist(
+                        artist_display, db
+                    )
+                    use_image_e = album_image_e or image_url_e
+
+                    # Build why string — name-drop up to 3 user-library voters,
+                    # sorted by their own affinity score so the most-loved names appear first
+                    sample_voters = sorted(
+                        lib_voters, key=lambda s: rank_score.get(s, 0), reverse=True
+                    )[:3]
+                    voter_names = [v.title() for v in sample_voters]
+                    voter_str = (
+                        f"{voter_names[0]}" if len(voter_names) == 1
+                        else f"{', '.join(voter_names[:-1])} and {voter_names[-1]}"
+                    )
+                    genre_hint_e = f" ({', '.join(tags_e[:2])})" if tags_e else ""
+                    why_e = (
+                        f"Genre cornerstone{genre_hint_e}: {voter_str} "
+                        f"{'all ' if n_lib_voters > 1 else ''}"
+                        f"consider{'s' if n_lib_voters == 1 else ''} them essential — "
+                        f"{n_lib_voters} artist{'s' if n_lib_voters != 1 else ''} "
+                        f"in your library point here. "
+                        f"Popularity: {listeners_score_e:.0f}/100."
+                    )
+
+                    # Blend: 40% listener reach, 25% pop score, 25% PageRank, 10% genre affinity
+                    genre_aff_e = _genre_affinity_score(tags_e)
+                    pr_normalised = min(100.0, pr_score)   # already 0–100
+                    blended_e = (
+                        listeners_score_e * 0.40 +
+                        pop_score_e       * 0.25 +
+                        pr_normalised     * 0.25 +
+                        genre_aff_e       * 0.10
+                    )
+
+                    # Voter bonus: extra lift for being referenced by many library artists
+                    voter_bonus = min(15.0, n_lib_voters * 2.5)
+                    blended_e = min(100.0, blended_e + voter_bonus)
+
+                    # Skip if this hub artist was already queued for another
+                    # user this run (prevents identical recs across all users)
+                    if path_e_global_seen is not None and artist_lower in path_e_global_seen:
+                        continue
+
+                    before = len(candidates)
+                    _add_candidate(
+                        artist=artist_display,
+                        album=album_name_e,
+                        release_year=release_year_e,
+                        pop_score=pop_score_e,
+                        image_url=use_image_e,
+                        source_artist="genre_centrality",
+                        source_affinity=genre_aff_e,
+                        lastfm_listeners=listeners_score_e,
+                        why=why_e,
+                        rec_type="hub_artist",
+                        tags=tags_e,
+                    )
+                    # Override the blended score set by _add_candidate so our
+                    # PageRank-boosted value is used instead
+                    if len(candidates) > before:
+                        candidates[-1].popularity_score = round(blended_e, 1)
+                        path_e_added += 1
+                        _charge_genre(tags_e)
+                        if path_e_global_seen is not None:
+                            path_e_global_seen.add(artist_lower)
+
+        log.info(f"  PATH E: {path_e_added} genre-hub artists added (PageRank)")
+
+    except Exception as e:
+        log.warning(f"  PATH E (genre centrality) failed: {e}", exc_info=True)
 
     # ── Final sort with light jitter ─────────────────────────────────────────
     for c in candidates:

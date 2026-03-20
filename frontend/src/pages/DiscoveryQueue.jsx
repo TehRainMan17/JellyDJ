@@ -1,5 +1,4 @@
-
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../lib/api.js'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import {
@@ -327,20 +326,81 @@ export default function DiscoveryQueue() {
     return i
   }))
 
-  const [popResult, setPopResult] = useState(null)  // { ok, text }
+  const [popResult, setPopResult]   = useState(null)  // { ok, text }
+  const [popPhase, setPopPhase]     = useState(0)     // cycles through status messages
+  const [popFound, setPopFound]     = useState(0)     // items found so far
+  const pollRef                     = useRef(null)
+  const phaseRef                    = useRef(null)
+
+  // Status messages that cycle during the run so it never looks frozen
+  const POP_PHASES = [
+    'Analysing your taste profile…',
+    'Finding missing albums from artists you love…',
+    'Following similarity chains from your top artists…',
+    'Checking globally popular artists not yet in your library…',
+    'Running genre centrality analysis…',
+    'Scoring and ranking candidates…',
+    'Filtering duplicates and deduplicating with your library…',
+    'Almost there — finalising recommendations…',
+  ]
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current)  { clearInterval(pollRef.current);  pollRef.current  = null }
+    if (phaseRef.current) { clearInterval(phaseRef.current); phaseRef.current = null }
+  }, [])
 
   const handlePopulate = async () => {
-    setPopulating(true); setPopMsg('Generating recommendations…'); setPopResult(null)
+    setPopulating(true); setPopResult(null); setPopFound(0); setPopPhase(0)
+    stopPolling()
+
     try {
-      const d = await api.post('/api/discovery/populate')
-      setPopMsg('')
-      setPopResult(d.ok
-        ? { ok:true,  text:`Added ${d.added} new recommendation${d.added!==1?'s':''}` }
-        : { ok:false, text: d.detail || 'Populate failed' })
-      fetchItems(activeTab); fetchCounts()
-    } catch (err) { setPopMsg(''); setPopResult({ ok:false, text: err?.message || 'Network error' }) }
-    finally { setPopulating(false); setTimeout(() => setPopResult(null), 10000) }
+      await api.post('/api/discovery/populate')
+    } catch (err) {
+      setPopulating(false)
+      setPopResult({ ok: false, text: err?.message || 'Network error' })
+      stopPolling()
+      return
+    }
+
+    // Cycle through phase messages every 4s so it never looks frozen
+    phaseRef.current = setInterval(() => {
+      setPopPhase(p => (p + 1) % POP_PHASES.length)
+    }, 4000)
+
+    // Poll counts every 3s — stop when count stabilises for 2 consecutive checks
+    let lastCount = 0
+    let stableRounds = 0
+    const startTime = Date.now()
+    const MAX_WAIT_MS = 3 * 60 * 1000  // 3 min hard stop
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const c = await api.get('/api/discovery/counts')
+        const pending = c.pending || 0
+        setPopFound(pending)
+
+        const elapsed = Date.now() - startTime
+        if (pending > 0 && pending === lastCount) {
+          stableRounds++
+        } else {
+          stableRounds = 0
+        }
+        lastCount = pending
+
+        // Done when stable for 2 rounds (6s) or hard timeout
+        if ((stableRounds >= 2 && elapsed > 10000) || elapsed > MAX_WAIT_MS) {
+          stopPolling()
+          setPopulating(false)
+          setPopResult({ ok: true, text: `Found ${pending} recommendation${pending !== 1 ? 's' : ''}` })
+          fetchItems(activeTab); fetchCounts()
+          setTimeout(() => setPopResult(null), 10000)
+        }
+      } catch (_) { /* ignore transient poll errors */ }
+    }, 3000)
   }
+
+  // Clean up polling on unmount
+  useEffect(() => () => stopPolling(), [stopPolling])
 
   const tabCounts = STATUS_TABS.map(t => ({
     ...t,
@@ -373,14 +433,24 @@ export default function DiscoveryQueue() {
       {populating && (
         <div className="rounded-xl px-4 py-3 space-y-2 anim-scale-in"
              style={{ background:'rgba(0,212,170,0.05)', border:'1px solid rgba(0,212,170,0.15)' }}>
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full" style={{ background:'var(--accent)', animation:'pulse 1s ease-in-out infinite' }} />
-            <span className="text-xs font-medium" style={{ color:'var(--accent)' }}>Generating recommendations</span>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ background:'var(--accent)', animation:'pulse 1s ease-in-out infinite' }} />
+              <span className="text-xs font-medium" style={{ color:'var(--accent)' }}>Generating recommendations…</span>
+            </div>
+            {popFound > 0 && (
+              <span className="text-[10px] font-mono font-bold" style={{ color:'var(--accent)', opacity:0.8 }}>
+                {popFound} found
+              </span>
+            )}
           </div>
+          {/* Animated indeterminate bar */}
           <div className="h-1 w-full rounded-full overflow-hidden" style={{ background:'var(--bg-overlay)' }}>
-            <div className="h-full rounded-full" style={{ width:'100%', background:'var(--accent)', opacity:0.6 }} />
+            <div className="anim-progress-bar h-full rounded-full" style={{ background:'var(--accent)', opacity:0.7 }} />
           </div>
-          <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>Analysing your taste profile and finding new music…</div>
+          <div className="text-[10px] transition-all" style={{ color:'var(--text-muted)', minHeight: '1em' }}>
+            {POP_PHASES[popPhase]}
+          </div>
         </div>
       )}
       {popResult && !populating && (
