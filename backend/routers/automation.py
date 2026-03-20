@@ -114,9 +114,12 @@ class AutomationSettingsUpdate(BaseModel):
     discovery_refresh_interval_hours: Optional[int] = None
     discovery_items_per_run: Optional[int] = None
 
+    auto_download_enabled: Optional[bool] = None        # was missing — caused 422 on every save
     auto_download_max_per_run: Optional[int] = None
     auto_download_cooldown_days: Optional[int] = None
     popularity_cache_refresh_interval_hours: Optional[int] = None
+    billboard_refresh_enabled: Optional[bool] = None    # was missing — caused 422 on every save
+    billboard_refresh_interval_hours: Optional[int] = None  # was missing — caused 422 on every save
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -145,6 +148,8 @@ def get_settings(_: UserContext = Depends(get_current_user), db: Session = Depen
         "auto_download_max_per_run": s.auto_download_max_per_run,
         "auto_download_cooldown_days": s.auto_download_cooldown_days,
         "popularity_cache_refresh_interval_hours": s.popularity_cache_refresh_interval_hours,
+        "billboard_refresh_enabled": bool(s.billboard_refresh_enabled) if s.billboard_refresh_enabled is not None else True,
+        "billboard_refresh_interval_hours": s.billboard_refresh_interval_hours or 168,
         "last_auto_download": s.last_auto_download,
         "last_index": s.last_index,
         "last_discovery_refresh": s.last_discovery_refresh,
@@ -199,6 +204,14 @@ def update_settings(payload: AutomationSettingsUpdate, _: UserContext = Depends(
         if not (1 <= payload.popularity_cache_refresh_interval_hours <= 168):
             raise HTTPException(400, "Popularity cache interval must be 1–168 hours")
         s.popularity_cache_refresh_interval_hours = payload.popularity_cache_refresh_interval_hours
+
+    if payload.billboard_refresh_enabled is not None:
+        s.billboard_refresh_enabled = payload.billboard_refresh_enabled
+
+    if payload.billboard_refresh_interval_hours is not None:
+        if not (24 <= payload.billboard_refresh_interval_hours <= 168):
+            raise HTTPException(400, "Billboard interval must be 24–168 hours")
+        s.billboard_refresh_interval_hours = payload.billboard_refresh_interval_hours
 
     db.commit()
 
