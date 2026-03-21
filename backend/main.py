@@ -97,7 +97,9 @@ def _run_migrations():
         ("track_scores",   "holiday_tag",     "TEXT",    "NULL"),
         ("track_scores",   "holiday_exclude", "BOOLEAN", "0"),
         # v5: Jellyfin album container ID for reliable album exclusion matching
-        ("library_tracks", "jellyfin_album_id", "TEXT", "NULL"),
+        ("library_tracks", "jellyfin_album_id",  "TEXT", "NULL"),
+        # v6a: Jellyfin artist item ID for direct artist profile deep-links
+        ("library_tracks", "jellyfin_artist_id", "TEXT", "NULL"),
         # v6: fix missing columns on track_enrichments — their absence caused
         # enrich_tracks() to crash on the expires_at staleness-check query,
         # preventing popularity_score from ever reaching TrackScore.global_popularity.

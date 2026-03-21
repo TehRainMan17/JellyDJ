@@ -250,6 +250,9 @@ class LibraryTrack(Base):
     # v5: Jellyfin album container ID — enables reliable album exclusion matching
     # regardless of how album_name is tagged in the audio file metadata.
     jellyfin_album_id = Column(String, nullable=True, index=True)
+    # v6: Jellyfin artist item ID — enables direct deep-links to the artist
+    # profile page in the Jellyfin web client instead of falling back to search.
+    jellyfin_artist_id = Column(String, nullable=True, index=True)
 
 
 class ArtistProfile(Base):

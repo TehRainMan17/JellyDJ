@@ -171,14 +171,19 @@ def get_tracks(
         )
         skip_map = {sr.jellyfin_item_id: sr for sr in skip_rows}
 
-    # ── Album ID lookup from LibraryTrack ────────────────────────────────────
-    # TrackScore doesn't store jellyfin_album_id; LibraryTrack does.
+    # ── Album ID + Artist ID lookup from LibraryTrack ────────────────────────
+    # TrackScore doesn't store jellyfin_album_id / jellyfin_artist_id; LibraryTrack does.
     album_id_map: dict[str, str] = {}
+    artist_id_map: dict[str, str] = {}
     if item_ids:
         try:
             from models import LibraryTrack
             lt_rows = (
-                db.query(LibraryTrack.jellyfin_item_id, LibraryTrack.jellyfin_album_id)
+                db.query(
+                    LibraryTrack.jellyfin_item_id,
+                    LibraryTrack.jellyfin_album_id,
+                    LibraryTrack.jellyfin_artist_id,
+                )
                 .filter(LibraryTrack.jellyfin_item_id.in_(item_ids))
                 .all()
             )
@@ -186,6 +191,11 @@ def get_tracks(
                 r.jellyfin_item_id: r.jellyfin_album_id
                 for r in lt_rows
                 if r.jellyfin_album_id
+            }
+            artist_id_map = {
+                r.jellyfin_item_id: r.jellyfin_artist_id
+                for r in lt_rows
+                if r.jellyfin_artist_id
             }
         except Exception:
             pass
@@ -279,11 +289,12 @@ def get_tracks(
         "pages": max(1, (total + page_size - 1) // page_size),
         "tracks": [
             {
-                "jellyfin_item_id":  r.jellyfin_item_id,
-                "track_name":        r.track_name,
-                "artist_name":       r.artist_name,
-                "album_name":        r.album_name,
-                "jellyfin_album_id": album_id_map.get(r.jellyfin_item_id, ""),
+                "jellyfin_item_id":   r.jellyfin_item_id,
+                "track_name":         r.track_name,
+                "artist_name":        r.artist_name,
+                "album_name":         r.album_name,
+                "jellyfin_album_id":  album_id_map.get(r.jellyfin_item_id, ""),
+                "jellyfin_artist_id": artist_id_map.get(r.jellyfin_item_id, ""),
                 "genre":             r.genre,
                 "play_count":        r.play_count,
                 "last_played":       r.last_played.isoformat() if r.last_played else None,
@@ -410,6 +421,23 @@ def get_artists(
 
     import json as _json
 
+    # Build artist_name → jellyfin_artist_id map from LibraryTrack so we can
+    # provide a direct deep-link to the Jellyfin artist profile page.
+    try:
+        from models import LibraryTrack
+        _artist_id_rows = (
+            db.query(LibraryTrack.artist_name, LibraryTrack.jellyfin_artist_id)
+            .filter(LibraryTrack.jellyfin_artist_id.isnot(None))
+            .distinct(LibraryTrack.artist_name)
+            .all()
+        )
+        artist_id_by_name: dict[str, str] = {
+            r.artist_name: r.jellyfin_artist_id
+            for r in _artist_id_rows
+        }
+    except Exception:
+        artist_id_by_name = {}
+
     def _parse_related(raw):
         """Return list of {name, match} dicts regardless of stored format."""
         if not raw:
@@ -434,6 +462,7 @@ def get_artists(
         "artists": [
             {
                 "artist_name":          r.artist_name,
+                "jellyfin_artist_id":   artist_id_by_name.get(r.artist_name, ""),
                 "affinity_score":       float(r.affinity_score),
                 "total_plays":          r.total_plays,
                 "total_tracks_played":  r.total_tracks_played,

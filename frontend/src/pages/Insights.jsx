@@ -124,7 +124,11 @@ function SortHeader({ label, field, currentSort, currentOrder, onSort, hint }) {
 // the artist (search), album (item detail), or track (item detail).
 
 function JellyfinLinkStrip({ track, buildItemUrl, buildSearchUrl }) {
-  const artistUrl = buildSearchUrl(track.artist_name)
+  // Prefer a direct artist profile link if we have the Jellyfin artist item ID;
+  // fall back to a name search so the button is never silently broken.
+  const artistUrl = track.jellyfin_artist_id
+    ? buildItemUrl(track.jellyfin_artist_id)
+    : buildSearchUrl(track.artist_name)
   const albumUrl  = track.jellyfin_album_id ? buildItemUrl(track.jellyfin_album_id) : null
   const trackUrl  = track.jellyfin_item_id  ? buildItemUrl(track.jellyfin_item_id)  : null
 
@@ -152,7 +156,9 @@ function JellyfinLinkStrip({ track, buildItemUrl, buildSearchUrl }) {
                      text-[var(--text-secondary)] hover:text-[var(--text-primary)]
                      hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
                      transition-all duration-150"
-          title={`Search for "${track.artist_name}" in Jellyfin`}
+          title={track.jellyfin_artist_id
+            ? `Open artist "${track.artist_name}" in Jellyfin`
+            : `Search for "${track.artist_name}" in Jellyfin`}
         >
           <Mic2 size={10} />
           Artist
@@ -202,10 +208,13 @@ function JellyfinLinkStrip({ track, buildItemUrl, buildSearchUrl }) {
 }
 
 // ── Jellyfin artist link button ───────────────────────────────────────────────
-// Shown in expanded artist rows. Opens a Jellyfin search for the artist.
+// Shown in expanded artist rows. Links directly to the Jellyfin artist profile
+// if we have the item ID; falls back to a name search otherwise.
 
-function JellyfinArtistLink({ artistName, buildSearchUrl }) {
-  const url = buildSearchUrl(artistName)
+function JellyfinArtistLink({ artistName, jellyfinArtistId, buildItemUrl, buildSearchUrl }) {
+  const url = jellyfinArtistId
+    ? buildItemUrl(jellyfinArtistId)
+    : buildSearchUrl(artistName)
   if (!url) return null
 
   return (
@@ -226,7 +235,9 @@ function JellyfinArtistLink({ artistName, buildSearchUrl }) {
                    text-[var(--text-secondary)] hover:text-[var(--text-primary)]
                    hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
                    transition-all duration-150"
-        title={`Search for "${artistName}" in Jellyfin`}
+        title={jellyfinArtistId
+          ? `Open artist "${artistName}" in Jellyfin`
+          : `Search for "${artistName}" in Jellyfin`}
       >
         <Mic2 size={10} />
         View Artist in Jellyfin
@@ -1176,7 +1187,7 @@ function ArtistTable({ userId }) {
   const [expandedRow, setExpandedRow] = useState(null)
   const [visibleCols, setVisibleCols] = useState(() => loadSavedArtistCols())
 
-  const { buildSearchUrl } = useJellyfinUrl()
+  const { buildItemUrl, buildSearchUrl } = useJellyfinUrl()
 
   const acol = (key) => visibleCols.has(key)
 
@@ -1405,6 +1416,8 @@ function ArtistTable({ userId }) {
                           {/* ── Jellyfin artist link ── */}
                           <JellyfinArtistLink
                             artistName={a.artist_name}
+                            jellyfinArtistId={a.jellyfin_artist_id}
+                            buildItemUrl={buildItemUrl}
                             buildSearchUrl={buildSearchUrl}
                           />
                         </div>

@@ -58,7 +58,7 @@ async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
             params = {
                 "IncludeItemTypes": "Audio",
                 "Recursive": "true",
-                "Fields": "DateCreated,Genres,Album,AlbumArtist,Artists,"
+                "Fields": "DateCreated,Genres,Album,AlbumArtist,Artists,AlbumArtists,ArtistItems,"
                           "IndexNumber,ParentIndexNumber,RunTimeTicks,ProductionYear,AlbumId",
                 "StartIndex": start_index,
                 "Limit": BATCH_SIZE,
@@ -132,6 +132,41 @@ def _extract_artist(item: dict) -> str:
     return track_artists[0] if track_artists else album_artist
 
 
+def _extract_artist_id(item: dict) -> Optional[str]:
+    """
+    Return the Jellyfin item ID for the artist so the frontend can build a
+    direct deep-link to the artist profile page instead of falling back to
+    a name-based search.
+
+    Jellyfin returns AlbumArtists as a list of {Id, Name} objects on Audio
+    items when the Artists/AlbumArtists field is requested.  We mirror the
+    same compilation-aware logic used by _extract_artist: prefer the first
+    non-Various AlbumArtists entry, then fall back to ArtistItems.
+    """
+    album_artists: list[dict] = item.get("AlbumArtists") or []
+    real_album = [
+        a for a in album_artists
+        if isinstance(a, dict) and (a.get("Name") or "").strip().lower() not in _VARIOUS_ARTISTS
+    ]
+    if real_album:
+        return real_album[0].get("Id") or None
+
+    # Compilation fallback — try ArtistItems (track-level artist objects)
+    artist_items: list[dict] = item.get("ArtistItems") or []
+    real_track = [
+        a for a in artist_items
+        if isinstance(a, dict) and (a.get("Name") or "").strip().lower() not in _VARIOUS_ARTISTS
+    ]
+    if real_track:
+        return real_track[0].get("Id") or None
+
+    # Last resort: take whatever is there
+    if album_artists and isinstance(album_artists[0], dict):
+        return album_artists[0].get("Id") or None
+
+    return None
+
+
 def scan_library(db: Session, items: list[dict]) -> dict:
     """
     Upsert all Jellyfin items into LibraryTrack.
@@ -156,6 +191,7 @@ def scan_library(db: Session, items: list[dict]) -> dict:
         seen_ids.add(jid)
 
         artist = _extract_artist(item)
+        artist_id = _extract_artist_id(item)
         album = item.get("Album", "")
         track_name = item.get("Name", "")
         genre = _extract_genre(item)
@@ -176,6 +212,10 @@ def scan_library(db: Session, items: list[dict]) -> dict:
             row.last_seen = now
             row.missing_since = None   # clear any soft-delete
             row.jellyfin_album_id = item.get("AlbumId") or None
+            # Only overwrite if Jellyfin returned a value — avoids clobbering
+            # a previously stored ID when AlbumArtists is absent on a re-scan.
+            if artist_id:
+                row.jellyfin_artist_id = artist_id
             updated += 1
         else:
             db.add(LibraryTrack(
@@ -194,6 +234,7 @@ def scan_library(db: Session, items: list[dict]) -> dict:
                 last_seen=now,
                 missing_since=None,
                 jellyfin_album_id=item.get("AlbumId") or None,
+                jellyfin_artist_id=artist_id,
             ))
             added += 1
 
