@@ -171,6 +171,25 @@ def get_tracks(
         )
         skip_map = {sr.jellyfin_item_id: sr for sr in skip_rows}
 
+    # ── Album ID lookup from LibraryTrack ────────────────────────────────────
+    # TrackScore doesn't store jellyfin_album_id; LibraryTrack does.
+    album_id_map: dict[str, str] = {}
+    if item_ids:
+        try:
+            from models import LibraryTrack
+            lt_rows = (
+                db.query(LibraryTrack.jellyfin_item_id, LibraryTrack.jellyfin_album_id)
+                .filter(LibraryTrack.jellyfin_item_id.in_(item_ids))
+                .all()
+            )
+            album_id_map = {
+                r.jellyfin_item_id: r.jellyfin_album_id
+                for r in lt_rows
+                if r.jellyfin_album_id
+            }
+        except Exception:
+            pass
+
     # ── Popularity resolution (three-tier fallback) ───────────────────────────
     # Tier 1: TrackScore.global_popularity  — written by scoring_engine after enrichment
     # Tier 2: TrackEnrichment.popularity_score — written by enrich_tracks()
@@ -264,6 +283,7 @@ def get_tracks(
                 "track_name":        r.track_name,
                 "artist_name":       r.artist_name,
                 "album_name":        r.album_name,
+                "jellyfin_album_id": album_id_map.get(r.jellyfin_item_id, ""),
                 "genre":             r.genre,
                 "play_count":        r.play_count,
                 "last_played":       r.last_played.isoformat() if r.last_played else None,

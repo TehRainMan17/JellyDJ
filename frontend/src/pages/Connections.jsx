@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
 import WebhookSetupPanel from '../components/WebhookSetupPanel.jsx'
 import { api } from '../lib/api.js'
+import { invalidateJellyfinUrlCache } from '../hooks/useJellyfinUrl.js'
 import {
   Plug, CheckCircle2, XCircle, Loader2, Eye, EyeOff,
   RefreshCw, Users, ChevronDown, ChevronUp, Save, Trash2,
-  AlertCircle, ShieldCheck,
+  AlertCircle, ShieldCheck, Globe,
 } from 'lucide-react'
 
 // ── Shared sub-components ─────────────────────────────────────────────────────
@@ -169,7 +170,6 @@ function TrackedUsersPanel() {
               </div>
             </div>
 
-            {/* Delete / Confirm */}
             {confirmId === user.jellyfin_user_id ? (
               <div className="flex items-center gap-2">
                 <span className="text-[11px] text-[var(--danger)]">Delete all data?</span>
@@ -222,20 +222,21 @@ function TrackedUsersPanel() {
 // ── Jellyfin Card ─────────────────────────────────────────────────────────────
 
 function JellyfinCard() {
-  const [url, setUrl] = useState('')
-  const [apiKey, setApiKey] = useState('')
+  const [url, setUrl]               = useState('')
+  const [publicUrl, setPublicUrl]   = useState('')
+  const [apiKey, setApiKey]         = useState('')
   const [hasStoredKey, setHasStoredKey] = useState(false)
-  const [status, setStatus] = useState('idle')
+  const [status, setStatus]         = useState('idle')
   const [lastTested, setLastTested] = useState(null)
-  const [saving, setSaving] = useState(false)
-  const [msg, setMsg] = useState({ text: '', isError: false })
-  const [showUsers, setShowUsers] = useState(false)
+  const [saving, setSaving]         = useState(false)
+  const [msg, setMsg]               = useState({ text: '', isError: false })
+  const [showUsers, setShowUsers]   = useState(false)
 
   useEffect(() => {
     api.get('/api/connections/jellyfin')
-      
       .then(data => {
         setUrl(data.base_url || '')
+        setPublicUrl(data.public_url || '')
         setHasStoredKey(data.has_api_key)
         setStatus(data.is_connected ? 'connected' : 'idle')
         if (data.last_tested) setLastTested(new Date(data.last_tested))
@@ -253,10 +254,16 @@ function JellyfinCard() {
     if (!apiKey) { showMsg('Enter an API key.', true); return }
     setSaving(true)
     try {
-      await api.post('/api/connections/jellyfin', { base_url: url, api_key: apiKey })
+      await api.post('/api/connections/jellyfin', {
+        base_url: url,
+        api_key: apiKey,
+        public_url: publicUrl,
+      })
       showMsg('Credentials saved.')
       setHasStoredKey(true)
       setStatus('idle')
+      // Bust the deep-link URL cache so Insights/Playlists pick up the change
+      invalidateJellyfinUrlCache()
     } finally {
       setSaving(false)
     }
@@ -299,6 +306,7 @@ function JellyfinCard() {
       </div>
 
       <div className="space-y-4">
+        {/* Internal / LAN base URL — used by the backend for API calls */}
         <div>
           <FieldLabel>Base URL</FieldLabel>
           <input
@@ -311,7 +319,37 @@ function JellyfinCard() {
                        focus:outline-none focus:border-[var(--accent)]/60 focus:ring-1 focus:ring-[var(--accent)]/20
                        transition-colors"
           />
+          <p className="text-[11px] text-[var(--text-secondary)] mt-1.5">
+            Your LAN or Docker address — used by the JellyDJ backend for all API calls.
+          </p>
         </div>
+
+        {/* Public / DNS URL — optional, browser-only deep-links */}
+        <div>
+          <FieldLabel>
+            <span className="flex items-center gap-1.5">
+              <Globe size={11} />
+              Public URL
+              <span className="normal-case font-normal text-[var(--text-muted)]">(optional)</span>
+            </span>
+          </FieldLabel>
+          <input
+            type="url"
+            value={publicUrl}
+            onChange={e => setPublicUrl(e.target.value)}
+            placeholder="https://jellyfin.yourdomain.com"
+            className="w-full bg-[var(--bg)] border border-[var(--border)] rounded-lg px-3 py-2
+                       text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)]
+                       focus:outline-none focus:border-[var(--accent)]/60 focus:ring-1 focus:ring-[var(--accent)]/20
+                       transition-colors"
+          />
+          <p className="text-[11px] text-[var(--text-secondary)] mt-1.5">
+            Your internet-facing DNS address. When set, deep-links in Insights and Playlists
+            will use this URL instead of the Base URL above — so clicking "Open in Jellyfin"
+            works from outside your LAN. The backend never sends requests to this address.
+          </p>
+        </div>
+
         <div>
           <FieldLabel>API Key</FieldLabel>
           <ApiKeyInput
@@ -384,7 +422,6 @@ function LidarrCard() {
 
   useEffect(() => {
     api.get('/api/connections/lidarr')
-      
       .then(data => {
         setUrl(data.base_url || '')
         setHasStoredKey(data.has_api_key)
@@ -844,7 +881,6 @@ export default function Connections() {
 
   const fetchExtStatus = () => {
     api.get('/api/external-apis/status')
-      
       .then(setExtStatus)
       .catch(() => {})
   }

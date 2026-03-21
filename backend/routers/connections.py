@@ -25,9 +25,8 @@ from crypto import encrypt, decrypt
 router = APIRouter(prefix="/api/connections", tags=["connections"])
 
 # ── Connection status cache ───────────────────────────────────────────────────
-# Keyed by service name. Avoids live HTTP on every dashboard load.
-_conn_cache: dict = {}   # service -> {"ok": bool, "tested_at": float, "last_tested": datetime}
-_CONN_CACHE_TTL = 60     # seconds
+_conn_cache: dict = {}
+_CONN_CACHE_TTL = 60
 
 
 def _cache_put(service: str, ok: bool, last_tested: datetime):
@@ -58,9 +57,26 @@ class ConnectionPayload(BaseModel):
     api_key: str
 
 
+class JellyfinConnectionPayload(BaseModel):
+    base_url: str
+    api_key: str
+    # Optional public-facing URL used only by the browser for deep-links.
+    # Never passed to any server-side HTTP request — no SSRF validation needed.
+    public_url: Optional[str] = ""
+
+
 class ConnectionResponse(BaseModel):
     service: str
     base_url: str
+    is_connected: bool
+    last_tested: Optional[datetime]
+    has_api_key: bool
+
+
+class JellyfinConnectionResponse(BaseModel):
+    service: str
+    base_url: str
+    public_url: Optional[str]
     is_connected: bool
     last_tested: Optional[datetime]
     has_api_key: bool
@@ -83,68 +99,28 @@ def _safe_url(url: str) -> str:
 
 
 # ── SSRF protection ────────────────────────────────────────────────────────────
-# IP networks that must never be the target of a server-side HTTP request.
-# Covers loopback, RFC-1918 private ranges, link-local (IMDS on all major
-# cloud providers lives at 169.254.169.254), and unspecified addresses.
-# IP ranges that are never legitimate targets for outbound service connections.
-#
-# RFC-1918 private ranges (10.x, 172.16-31.x, 192.168.x) are intentionally
-# NOT blocked here — Jellyfin and Lidarr are almost always self-hosted on a
-# private LAN or Docker network, both of which use RFC-1918 addresses.
-# Blocking them would prevent the core use case of this application.
-#
-# What IS blocked:
-#   Loopback   — the backend should not be calling its own localhost services
-#   Link-local — 169.254.169.254 is the cloud IMDS endpoint on AWS/GCP/Azure;
-#                reaching it from a compromised admin account could leak cloud
-#                IAM credentials with account-wide blast radius
-#   Unspecified — 0.0.0.0 / :: have no valid use as service endpoints
 _BLOCKED_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),    # IPv4 loopback
-    ipaddress.ip_network("::1/128"),         # IPv6 loopback
-    ipaddress.ip_network("169.254.0.0/16"), # Link-local / cloud IMDS (highest SSRF risk)
-    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
-    ipaddress.ip_network("0.0.0.0/8"),       # Unspecified
-    ipaddress.ip_network("::/128"),          # IPv6 unspecified
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::/128"),
 ]
 
 
 def _ip_is_blocked(addr: str) -> bool:
-    """Return True if addr falls in any blocked network."""
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
-        return True  # unparseable → block
+        return True
     return any(ip in net for net in _BLOCKED_NETWORKS)
 
 
 def _validate_service_url(url: str, field_name: str = "URL") -> str:
     """
     Validate a user-supplied service base URL for SSRF safety.
-
-    Raises HTTP 422 if:
-      - The URL is empty or has no scheme
-      - The scheme is not http or https
-      - The hostname resolves to a blocked range: loopback (127.x, ::1) or
-        link-local (169.254.x.x / fe80::) which covers the cloud metadata
-        endpoint at 169.254.169.254 used by AWS, GCP, and Azure
-      - The hostname cannot be resolved at all
-
-    RFC-1918 private ranges (10.x, 172.16-31.x, 192.168.x) and Docker bridge
-    networks are explicitly allowed — self-hosted Jellyfin and Lidarr instances
-    almost always live on these addresses.
-
-    Returns the URL with trailing slash stripped, ready to store.
-
-    The test endpoints (POST /jellyfin/test, POST /lidarr/test) read the URL
-    from the database, so they are automatically covered — only a URL that
-    passed this check on save can ever be used in an outbound request.
-
-    DNS rebinding note: resolution happens at save time under admin auth.
-    This stops the common case (typing a private IP directly) and raises the
-    bar for an attacker who would need to control the DNS server for the
-    target hostname to bypass the check. Defence-in-depth, not a complete
-    guarantee against a targeted DNS rebinding attack.
+    Used for base_url (server-side requests) only — NOT for public_url.
     """
     url = url.strip().rstrip("/")
     if not url:
@@ -167,8 +143,6 @@ def _validate_service_url(url: str, field_name: str = "URL") -> str:
     if not hostname:
         raise HTTPException(422, f"{field_name} is missing a hostname.")
 
-    # Resolve hostname — getaddrinfo gives both A and AAAA records and handles
-    # bracket-wrapped IPv6 literals correctly.
     try:
         results = socket.getaddrinfo(hostname, None)
     except socket.gaierror as exc:
@@ -190,20 +164,40 @@ def _validate_service_url(url: str, field_name: str = "URL") -> str:
     return url
 
 
+def _validate_public_url(url: str) -> str:
+    """
+    Light validation for the public_url field.
+    This URL is returned to the browser only — never used for server-side requests.
+    We just normalise it; no SSRF resolution required.
+    """
+    url = url.strip().rstrip("/")
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            422,
+            "Public URL must start with http:// or https://",
+        )
+    if not parsed.hostname:
+        raise HTTPException(422, "Public URL is missing a hostname.")
+    return url
+
+
 # ── Jellyfin endpoints ────────────────────────────────────────────────────────
 
-@router.get("/jellyfin", response_model=ConnectionResponse)
+@router.get("/jellyfin", response_model=JellyfinConnectionResponse)
 def get_jellyfin(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "jellyfin")
 
-    # Return cached status if fresh
     cached = _cache_get("jellyfin")
     is_connected = cached["ok"] if cached else obj.is_connected
     last_tested = cached["last_tested"] if cached else obj.last_tested
 
-    return ConnectionResponse(
+    return JellyfinConnectionResponse(
         service="jellyfin",
         base_url=obj.base_url,
+        public_url=obj.public_url or "",
         is_connected=is_connected,
         last_tested=last_tested,
         has_api_key=bool(obj.api_key_encrypted),
@@ -211,14 +205,20 @@ def get_jellyfin(_: UserContext = Depends(get_current_user), db: Session = Depen
 
 
 @router.post("/jellyfin")
-def save_jellyfin(payload: ConnectionPayload, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
+def save_jellyfin(
+    payload: JellyfinConnectionPayload,
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     obj = _get_or_create(db, "jellyfin")
     obj.base_url = _validate_service_url(payload.base_url, "Jellyfin URL")
     obj.api_key_encrypted = encrypt(payload.api_key)
-    obj.is_connected = False  # reset until next test
+    # public_url is optional — empty string means "use base_url for links"
+    obj.public_url = _validate_public_url(payload.public_url or "")
+    obj.is_connected = False
     obj.updated_at = datetime.utcnow()
     db.commit()
-    _cache_invalidate("jellyfin")   # credentials changed → flush cache
+    _cache_invalidate("jellyfin")
     return {"ok": True}
 
 
@@ -257,10 +257,6 @@ async def test_jellyfin(_: UserContext = Depends(require_admin), db: Session = D
 
 @router.get("/jellyfin/users/tracked")
 def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
-    """
-    Return all users who have activated JellyDJ (pushed at least one playlist).
-    Used by the admin Connections page to show who has data and offer a delete option.
-    """
     users = db.query(ManagedUser).filter_by(has_activated=True).all()
     return [
         {
@@ -275,21 +271,12 @@ def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Dep
 
 @router.delete("/jellyfin/users/{jellyfin_user_id}")
 def delete_user_data(jellyfin_user_id: str, _: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
-    """
-    Wipe all JellyDJ data for a user and de-activate them.
-
-    Deletes: plays, track_scores, artist_profiles, genre_profiles,
-             discovery_queue, playlist_run_items, user_playlists, refresh_tokens.
-    Sets has_activated=False so the user won't be indexed until they push
-    another playlist.
-    """
     from models import (
         Play, TrackScore, ArtistProfile, GenreProfile,
         DiscoveryQueueItem, PlaylistRunItem, UserPlaylist, RefreshToken,
     )
 
     uid = jellyfin_user_id
-
     deleted = {}
 
     def _del(model, label):
@@ -303,35 +290,22 @@ def delete_user_data(jellyfin_user_id: str, _: UserContext = Depends(require_adm
     _del(DiscoveryQueueItem, "discovery_queue")
     _del(PlaylistRunItem,    "playlist_run_items")
 
-    # UserPlaylist uses owner_user_id, not user_id
     n = db.query(UserPlaylist).filter_by(owner_user_id=uid).delete(synchronize_session=False)
     deleted["user_playlists"] = n
 
-    # RefreshTokens use user_id
     n = db.query(RefreshToken).filter_by(user_id=uid).delete(synchronize_session=False)
     deleted["refresh_tokens"] = n
 
-    # Also clear SkipPenalty and UserTasteProfile if they exist
-    try:
-        from models import SkipPenalty
-        n = db.query(SkipPenalty).filter_by(user_id=uid).delete(synchronize_session=False)
-        deleted["skip_penalties"] = n
-    except Exception:
-        pass
-    try:
-        from models import UserTasteProfile
-        n = db.query(UserTasteProfile).filter_by(user_id=uid).delete(synchronize_session=False)
-        deleted["taste_profiles"] = n
-    except Exception:
-        pass
-    try:
-        from models import UserSyncStatus
-        n = db.query(UserSyncStatus).filter_by(user_id=uid).delete(synchronize_session=False)
-        deleted["sync_status"] = n
-    except Exception:
-        pass
+    for model_name in ("SkipPenalty", "UserTasteProfile", "UserSyncStatus"):
+        try:
+            from models import __dict__ as mdict
+            model = mdict.get(model_name)
+            if model:
+                n = db.query(model).filter_by(user_id=uid).delete(synchronize_session=False)
+                deleted[model_name.lower()] = n
+        except Exception:
+            pass
 
-    # De-activate the user — they won't be indexed until they push another playlist
     user = db.query(ManagedUser).filter_by(jellyfin_user_id=uid).first()
     if user:
         user.has_activated = False
@@ -340,15 +314,12 @@ def delete_user_data(jellyfin_user_id: str, _: UserContext = Depends(require_adm
     db.commit()
 
     import logging
-    logging.getLogger(__name__).info(
-        "Admin wiped data for user %s: %s", uid, deleted
-    )
+    logging.getLogger(__name__).info("Admin wiped data for user %s: %s", uid, deleted)
     return {"ok": True, "deleted": deleted}
 
 
 @router.post("/jellyfin/users/sync")
 async def sync_managed_user_names(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
-    """Pull fresh usernames from Jellyfin and update local records."""
     obj = _get_or_create(db, "jellyfin")
     if not obj.base_url or not obj.api_key_encrypted:
         raise HTTPException(400, "Jellyfin not configured.")
@@ -378,7 +349,6 @@ async def sync_managed_user_names(_: UserContext = Depends(require_admin), db: S
 def get_lidarr(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     obj = _get_or_create(db, "lidarr")
 
-    # Return cached status if fresh
     cached = _cache_get("lidarr")
     is_connected = cached["ok"] if cached else obj.is_connected
     last_tested = cached["last_tested"] if cached else obj.last_tested
@@ -400,7 +370,7 @@ def save_lidarr(payload: ConnectionPayload, _: UserContext = Depends(require_adm
     obj.is_connected = False
     obj.updated_at = datetime.utcnow()
     db.commit()
-    _cache_invalidate("lidarr")   # credentials changed → flush cache
+    _cache_invalidate("lidarr")
     return {"ok": True}
 
 

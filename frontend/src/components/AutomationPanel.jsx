@@ -329,13 +329,13 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       <TaskCard icon={Star} color="#a78bfa" title="Track & Artist Enrichment"
                 description="Fetches per-song and per-artist Last.fm data — populates Song Popularity and Artist Popularity in Insights"
                 lastRun={s?.last_enrichment}
-                triggerLabel={enrichStatus?.running ? "Running…" : "Run Now"}
-                triggering={trigEnrich || !!enrichStatus?.running}
+                triggerLabel="Run Now"
+                triggering={trigEnrich}
                 onTrigger={triggerEnrichment}>
         <div className="space-y-3">
 
-          {/* Idle info */}
-          {(!enrichStatus || (!enrichStatus.running && enrichStatus.phase !== 'Complete' && enrichStatus.phase !== 'Error')) && (
+          {/* Idle / static info — live progress is shown in the JobProgress bar above */}
+          {!enrichStatus?.running && enrichStatus?.phase !== 'Error' && (
             <div className="text-[11px] px-3 py-2.5 rounded-xl space-y-1.5"
                  style={{ background:'rgba(167,139,250,0.06)', border:'1px solid rgba(167,139,250,0.18)', color:'var(--text-secondary)' }}>
               <div><strong style={{ color:'#a78bfa' }}>Run Now</strong> — processes your entire library with no limit. A 5,000-track library takes ~18 minutes.</div>
@@ -352,87 +352,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
             </div>
           )}
 
-          {/* Live progress — song phase */}
-          {enrichStatus?.running && enrichStatus.phase === 'Fetching song data' && (() => {
-            const done  = enrichStatus.tracks_done  ?? 0
-            const total = enrichStatus.tracks_total ?? 0
-            const pct   = total > 0 ? Math.round(done / total * 100) : 0
-            return (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-[11px]">
-                  <span style={{ color:'#a78bfa' }}>Fetching song data from Last.fm</span>
-                  <span className="font-mono tabular-nums" style={{ color:'var(--text-secondary)' }}>
-                    {done} / {total || '…'}
-                  </span>
-                </div>
-                <div className="h-1.5 rounded-full overflow-hidden" style={{ background:'var(--bg-overlay)' }}>
-                  <div className="h-full rounded-full transition-all duration-500"
-                       style={{ width: total > 0 ? `${pct}%` : '0%', background:'linear-gradient(90deg,#7c3aed,#a78bfa)' }} />
-                </div>
-                {enrichStatus.current_item && (
-                  <div className="text-[10px] truncate" style={{ color:'var(--text-muted)' }}>
-                    ↳ {enrichStatus.current_item}
-                  </div>
-                )}
-                <div className="flex gap-3 text-[10px]" style={{ color:'var(--text-muted)' }}>
-                  <span>✓ {enrichStatus.tracks_enriched ?? 0} enriched</span>
-                  {(enrichStatus.tracks_failed ?? 0) > 0 && (
-                    <span style={{ color:'#f87171' }}>✗ {enrichStatus.tracks_failed} name not matched — check server logs</span>
-                  )}
-                </div>
-              </div>
-            )
-          })()}
-
-          {/* Live progress — artist phase */}
-          {enrichStatus?.running && enrichStatus.phase === 'Fetching artist data' && (() => {
-            const done  = enrichStatus.artists_done  ?? 0
-            const total = enrichStatus.artists_total ?? 0
-            const pct   = total > 0 ? Math.round(done / total * 100) : 0
-            return (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-[11px]">
-                  <span style={{ color:'#a78bfa' }}>Fetching artist data from Last.fm</span>
-                  <span className="font-mono tabular-nums" style={{ color:'var(--text-secondary)' }}>
-                    {done} / {total || '…'}
-                  </span>
-                </div>
-                <div className="h-1.5 rounded-full overflow-hidden" style={{ background:'var(--bg-overlay)' }}>
-                  <div className="h-full rounded-full transition-all duration-500"
-                       style={{ width: total > 0 ? `${pct}%` : '15%', background:'linear-gradient(90deg,#7c3aed,#a78bfa)' }} />
-                </div>
-                {enrichStatus.current_item && (
-                  <div className="text-[10px] truncate" style={{ color:'var(--text-muted)' }}>
-                    ↳ {enrichStatus.current_item}
-                  </div>
-                )}
-                <div className="flex gap-3 text-[10px]" style={{ color:'var(--text-muted)' }}>
-                  <span>✓ Songs done: {enrichStatus.tracks_enriched ?? 0}</span>
-                  <span>✓ {enrichStatus.artists_enriched ?? 0} artists enriched</span>
-                  {(enrichStatus.artists_failed ?? 0) > 0 && (
-                    <span style={{ color:'#f87171' }}>✗ {enrichStatus.artists_failed} not found</span>
-                  )}
-                </div>
-              </div>
-            )
-          })()}
-
-          {/* Complete summary */}
-          {enrichStatus?.phase === 'Complete' && (
-            <div className="space-y-1.5 px-3 py-2.5 rounded-xl"
-                 style={{ background:'rgba(167,139,250,0.06)', border:'1px solid rgba(167,139,250,0.2)' }}>
-              <div className="text-[11px] font-semibold" style={{ color:'#a78bfa' }}>✓ Enrichment complete</div>
-              <div className="flex gap-4 text-[11px]" style={{ color:'var(--text-secondary)' }}>
-                <span>{enrichStatus.tracks_enriched ?? 0} songs enriched{enrichStatus.tracks_failed > 0 ? `, ${enrichStatus.tracks_failed} not on Last.fm` : ''}</span>
-                <span>{enrichStatus.artists_enriched ?? 0} artists enriched{enrichStatus.artists_failed > 0 ? `, ${enrichStatus.artists_failed} not found` : ''}</span>
-              </div>
-              <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>
-                Scores are live immediately — new playlists will use them now.
-                Run Library Index only if you want artist affinity scores updated too.
-              </div>
-            </div>
-          )}
-
         </div>
       </TaskCard>
 
@@ -441,8 +360,8 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                 description="Fetches artist-level listener counts, tags, similar artists and top albums from Last.fm"
                 lastRun={s?.last_popularity_cache_refresh}
                 nextRun={jobStatus.popularity_cache_refresh}
-                triggerLabel={jobStatuses.cacheStatus?.running ? 'Running…' : 'Refresh Now'}
-                triggering={trigPopCache || !!jobStatuses.cacheStatus?.running}
+                triggerLabel='Refresh Now'
+                triggering={trigPopCache}
                 onTrigger={() => { trigger('/api/automation/trigger/popularity-cache', setTrigPopCache); setTimeout(fetchCacheStats, 3000) }}>
         <div className="space-y-3">
           <Slider label="Run every" value={popCacheInterval} onChange={setPopCacheInterval}

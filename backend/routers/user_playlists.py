@@ -71,6 +71,7 @@ def _playlist_out(playlist: UserPlaylist, template_name: Optional[str], username
         "schedule_interval_h": playlist.schedule_interval_h,
         "last_generated_at": playlist.last_generated_at,
         "last_track_count": playlist.last_track_count,
+        "jellyfin_playlist_id": getattr(playlist, "jellyfin_playlist_id", ""),
         "created_at": playlist.created_at,
         "updated_at": playlist.updated_at,
     }
@@ -340,6 +341,7 @@ async def push_user_playlist(
     now = datetime.utcnow()
     playlist.last_generated_at = now
     playlist.last_track_count = len(track_ids)
+    playlist.jellyfin_playlist_id = jf_playlist_id
     playlist.updated_at = now
 
     # Activate the user on their first successful push — this is the signal that

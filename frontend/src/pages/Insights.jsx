@@ -5,9 +5,12 @@ import {
   BarChart2, Music2, Mic2, Tag, TrendingUp, TrendingDown,
   ChevronUp, ChevronDown, ChevronsUpDown, Star, Loader2,
   AlertCircle, Play, SkipForward, Heart, Snowflake, Zap,
-  Clock, Globe, RefreshCw, ThumbsDown, Info, Flame, Activity
+  Clock, Globe, RefreshCw, ThumbsDown, Info, Flame, Activity,
+  ExternalLink,
 } from 'lucide-react'
 import MusicUniverseMap from '../components/MusicUniverseMap.jsx'
+import { useJellyfinUrl } from '../hooks/useJellyfinUrl.js'
+import JellyfinIcon from '../components/JellyfinIcon.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -116,6 +119,123 @@ function SortHeader({ label, field, currentSort, currentOrder, onSort, hint }) {
   )
 }
 
+// ── Jellyfin deep-link button strip ──────────────────────────────────────────
+// Shown in expanded track rows. Opens Jellyfin in a new tab for
+// the artist (search), album (item detail), or track (item detail).
+
+function JellyfinLinkStrip({ track, buildItemUrl, buildSearchUrl }) {
+  const artistUrl = buildSearchUrl(track.artist_name)
+  const albumUrl  = track.jellyfin_album_id ? buildItemUrl(track.jellyfin_album_id) : null
+  const trackUrl  = track.jellyfin_item_id  ? buildItemUrl(track.jellyfin_item_id)  : null
+
+  // Only render if we have at least one valid URL
+  if (!artistUrl && !trackUrl) return null
+
+  return (
+    <div className="flex items-center gap-2 pt-3 border-t border-[var(--bg-overlay)]">
+      {/* Logo mark */}
+      <div className="flex items-center gap-1.5 mr-1">
+        <JellyfinIcon size={14} />
+        <span className="text-[10px] uppercase tracking-wider text-[var(--text-secondary)] font-semibold">
+          Play on Jellyfin
+        </span>
+      </div>
+
+      {artistUrl && (
+        <a
+          href={artistUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={e => e.stopPropagation()}
+          className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold
+                     bg-[var(--bg-overlay)] border border-[var(--border)]
+                     text-[var(--text-secondary)] hover:text-[var(--text-primary)]
+                     hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
+                     transition-all duration-150"
+          title={`Search for "${track.artist_name}" in Jellyfin`}
+        >
+          <Mic2 size={10} />
+          Artist
+          <ExternalLink size={9} className="opacity-50 ml-0.5" />
+        </a>
+      )}
+
+      {albumUrl && (
+        <a
+          href={albumUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={e => e.stopPropagation()}
+          className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold
+                     bg-[var(--bg-overlay)] border border-[var(--border)]
+                     text-[var(--text-secondary)] hover:text-[var(--text-primary)]
+                     hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
+                     transition-all duration-150"
+          title={`Open album "${track.album_name}" in Jellyfin`}
+        >
+          <Tag size={10} />
+          Album
+          <ExternalLink size={9} className="opacity-50 ml-0.5" />
+        </a>
+      )}
+
+      {trackUrl && (
+        <a
+          href={trackUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={e => e.stopPropagation()}
+          className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold
+                     bg-[var(--bg-overlay)] border border-[var(--border)]
+                     text-[var(--text-secondary)] hover:text-[var(--text-primary)]
+                     hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
+                     transition-all duration-150"
+          title={`Open "${track.track_name}" in Jellyfin`}
+        >
+          <Music2 size={10} />
+          Track
+          <ExternalLink size={9} className="opacity-50 ml-0.5" />
+        </a>
+      )}
+    </div>
+  )
+}
+
+// ── Jellyfin artist link button ───────────────────────────────────────────────
+// Shown in expanded artist rows. Opens a Jellyfin search for the artist.
+
+function JellyfinArtistLink({ artistName, buildSearchUrl }) {
+  const url = buildSearchUrl(artistName)
+  if (!url) return null
+
+  return (
+    <div className="flex items-center gap-2 pt-3 border-t border-[var(--bg-overlay)]">
+      <div className="flex items-center gap-1.5 mr-1">
+        <JellyfinIcon size={14} />
+        <span className="text-[10px] uppercase tracking-wider text-[var(--text-secondary)] font-semibold">
+          Jellyfin
+        </span>
+      </div>
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={e => e.stopPropagation()}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold
+                   bg-[var(--bg-overlay)] border border-[var(--border)]
+                   text-[var(--text-secondary)] hover:text-[var(--text-primary)]
+                   hover:border-[var(--accent)]/40 hover:bg-[var(--accent)]/8
+                   transition-all duration-150"
+        title={`Search for "${artistName}" in Jellyfin`}
+      >
+        <Mic2 size={10} />
+        View Artist in Jellyfin
+        <ExternalLink size={9} className="opacity-50 ml-0.5" />
+      </a>
+    </div>
+  )
+}
+
 // ── Column definitions ────────────────────────────────────────────────────────
 
 const ALL_COLUMNS = [
@@ -151,10 +271,8 @@ function loadSavedCols() {
     if (!raw) return DEFAULT_VISIBLE
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_VISIBLE
-    // Validate — keep only keys that still exist in ALL_COLUMNS
     const valid = new Set(ALL_COLUMNS.map(c => c.key))
     const filtered = parsed.filter(k => valid.has(k))
-    // Always include always-on columns
     ALL_COLUMNS.filter(c => c.always).forEach(c => filtered.push(c.key))
     return new Set(filtered)
   } catch {
@@ -355,6 +473,8 @@ function TrackTable({ userId }) {
   const [expandedRow, setExpandedRow] = useState(null)
   const [visibleCols, setVisibleCols] = useState(() => loadSavedCols())
 
+  const { buildItemUrl, buildSearchUrl } = useJellyfinUrl()
+
   const doFetch = (uid, sb, ord, pf, af, pg, hf, cf) => {
     if (!uid) return
     setLoading(true)
@@ -391,12 +511,6 @@ function TrackTable({ userId }) {
   const scoreColor = (s) => s >= 75 ? 'var(--accent)' : s >= 55 ? 'var(--text-primary)' : 'var(--text-secondary)'
 
   const col = (key) => visibleCols.has(key)
-
-  // Sort field mapping for columns that need a specific backend key
-  const sortFieldFor = (key) => {
-    const map = { on_cooldown: 'cooldown_until', holiday: 'holiday_tag' }
-    return map[key] || key
-  }
 
   return (
     <div>
@@ -916,6 +1030,13 @@ function TrackTable({ userId }) {
                               </>
                             )}
                           </div>
+
+                          {/* ── Jellyfin deep-links ── */}
+                          <JellyfinLinkStrip
+                            track={t}
+                            buildItemUrl={buildItemUrl}
+                            buildSearchUrl={buildSearchUrl}
+                          />
                         </div>
                       </td>
                     </tr>
@@ -1054,6 +1175,8 @@ function ArtistTable({ userId }) {
   const [page, setPage] = useState(1)
   const [expandedRow, setExpandedRow] = useState(null)
   const [visibleCols, setVisibleCols] = useState(() => loadSavedArtistCols())
+
+  const { buildSearchUrl } = useJellyfinUrl()
 
   const acol = (key) => visibleCols.has(key)
 
@@ -1278,6 +1401,12 @@ function ArtistTable({ userId }) {
                               </div>
                             </div>
                           )}
+
+                          {/* ── Jellyfin artist link ── */}
+                          <JellyfinArtistLink
+                            artistName={a.artist_name}
+                            buildSearchUrl={buildSearchUrl}
+                          />
                         </div>
                       </td>
                     </tr>
@@ -1326,7 +1455,6 @@ function HolidayTable() {
 
   useEffect(() => {
     api.get('/api/insights/holiday')
-      
       .then(d => { setData(d); setLoading(false) })
       .catch(e => { setError(e.message); setLoading(false) })
   }, [])
@@ -1458,7 +1586,6 @@ export default function Insights() {
 
   useEffect(() => {
     if (!isAdmin) {
-      // Non-admins only see their own data — no user-picker needed
       if (user?.user_id) setSelectedUser(user.user_id)
       return
     }

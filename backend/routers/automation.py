@@ -19,6 +19,39 @@ from models import AutomationSettings, SystemEvent, ManagedUser, JobState
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/automation", tags=["automation"])
 
+
+def _stamp_setting(field: str, value, max_retries: int = 5, delay: float = 0.3):
+    """
+    Write a single timestamp/value field to AutomationSettings with retry logic.
+
+    SQLite's busy_timeout pragma is set on the engine's connection pool, but
+    short-lived SessionLocal() instances created in background threads sometimes
+    miss it and get an immediate OperationalError: database is locked when
+    multiple jobs try to write to automation_settings concurrently.
+
+    Retrying with a short sleep resolves the contention without requiring a
+    connection-level change.
+    """
+    import time
+    from database import SessionLocal as _SL
+    for attempt in range(max_retries):
+        db = _SL()
+        try:
+            s = db.query(AutomationSettings).first()
+            if s:
+                setattr(s, field, value)
+                db.commit()
+                return
+        except Exception as e:
+            db.rollback()
+            if attempt < max_retries - 1:
+                log.warning(f"_stamp_setting({field}) attempt {attempt+1} failed: {e} — retrying")
+                time.sleep(delay * (attempt + 1))
+            else:
+                log.error(f"_stamp_setting({field}) failed after {max_retries} attempts: {e}")
+        finally:
+            db.close()
+
 # ── DB-backed job state — shared across all uvicorn workers ─────────────────
 #
 # Previously these were module-level dicts. With multiple workers each process
@@ -32,19 +65,30 @@ router = APIRouter(prefix="/api/automation", tags=["automation"])
 import json as _json
 
 _JOB_DEFAULTS = {
+    "index": {
+        "running": False, "phase": "", "detail": "",
+        "percent": 0, "started_at": None, "finished_at": None, "error": None,
+    },
+    "cache": {
+        "running": False, "phase": "", "done": 0, "total": 0,
+        "current_artist": None, "progress_pct": 0,
+        "started_at": None, "finished_at": None, "error": None,
+    },
     "enrichment": {
         "running": False, "phase": "", "current_item": "",
         "tracks_done": 0, "tracks_total": 0, "tracks_enriched": 0, "tracks_failed": 0,
         "artists_done": 0, "artists_total": 0, "artists_enriched": 0, "artists_failed": 0,
-        "error": None,
+        "started_at": None, "finished_at": None, "error": None,
     },
     "discovery": {
         "running": False, "phase": "", "detail": "",
-        "users_done": 0, "users_total": 0, "items_added": 0, "error": None,
+        "users_done": 0, "users_total": 0, "items_added": 0,
+        "started_at": None, "finished_at": None, "error": None,
     },
     "download": {
         "running": False, "phase": "", "detail": "",
-        "sent": 0, "total": 0, "error": None,
+        "sent": 0, "total": 0,
+        "started_at": None, "finished_at": None, "error": None,
     },
 }
 
@@ -88,13 +132,15 @@ def _set_job_state(job_id: str, **kwargs):
                 db.add(row)
             # running / phase go on the row directly for fast queries
             if "running" in kwargs:
+                was_running = bool(row.running)   # capture BEFORE overwriting
                 row.running = bool(kwargs["running"])
-                if kwargs["running"] and not row.started_at:
+                if kwargs["running"] and not was_running:
+                    # Fresh start — record start time, clear previous finish
                     row.started_at  = _dt.utcnow()
                     row.finished_at = None
-                if not kwargs["running"]:
+                if not kwargs["running"] and was_running:
+                    # Job just finished — record finish time, KEEP started_at for elapsed display
                     row.finished_at = _dt.utcnow()
-                    row.started_at  = None
             if "phase" in kwargs:
                 row.phase = kwargs["phase"]
             # everything else goes into payload JSON
@@ -396,15 +442,7 @@ async def trigger_popularity_cache(_: UserContext = Depends(require_admin), db: 
 
     async def _run_and_stamp():
         await refresh_library_popularity_cache(db)
-        try:
-            db2 = SessionLocal()
-            s = db2.query(AutomationSettings).first()
-            if s:
-                s.last_popularity_cache_refresh = datetime.utcnow()
-                db2.commit()
-            db2.close()
-        except Exception as exc:
-            log.warning(f"Could not stamp last_popularity_cache_refresh: {exc}")
+        _stamp_setting("last_popularity_cache_refresh", datetime.utcnow())
 
     asyncio.create_task(_run_and_stamp())
     return {"ok": True, "message": "Cache refresh started in background — poll /status for progress"}
@@ -427,7 +465,7 @@ def discovery_trigger_status(user: UserContext = Depends(get_current_user)):
     state = _get_job_state("discovery")
     done = state.get("users_done", 0)
     total = state.get("users_total", 0)
-    pct = round(100 * done / total) if total > 0 else (50 if state.get("running") else 0)
+    pct = round(100 * done / total) if total > 0 else 0
     return {**_sanitize_state(state, user), "progress_pct": pct}
 
 
@@ -437,7 +475,7 @@ def download_trigger_status(user: UserContext = Depends(get_current_user)):
     state = _get_job_state("download")
     sent = state.get("sent", 0)
     total = state.get("total", 0)
-    pct = round(100 * sent / total) if total > 0 else (50 if state.get("running") else 0)
+    pct = round(100 * sent / total) if total > 0 else 0
     return {**_sanitize_state(state, user), "progress_pct": pct}
 
 
@@ -553,6 +591,14 @@ async def _run_discovery_refresh():
     import asyncio
     from database import SessionLocal as _SL
 
+    # ── Duplicate-run guard ───────────────────────────────────────────────────
+    # Both the scheduler and the manual trigger call this function.
+    # With 4 uvicorn workers the scheduler fires in one worker while a user
+    # might hit the manual button on another — both would pass without this check.
+    if _get_job_state("discovery").get("running"):
+        log.warning("Discovery refresh already running — skipping duplicate trigger")
+        return
+
     # Read settings and user list with a short-lived session
     db = _SL()
     try:
@@ -611,14 +657,8 @@ async def _run_discovery_refresh():
             log.info(f"  Discovery refresh: +{added} items for {user.username}")
             await asyncio.sleep(0)
 
-        # Stamp last_discovery_refresh
-        db3 = _SL()
-        try:
-            s2 = _get_or_create_settings(db3)
-            s2.last_discovery_refresh = datetime.utcnow()
-            db3.commit()
-        finally:
-            db3.close()
+        # Stamp last_discovery_refresh — use retry helper to avoid SQLite lock contention
+        _stamp_setting("last_discovery_refresh", datetime.utcnow())
 
         log.info(f"Discovery refresh complete: +{total_added} items total")
         _set_discovery_state(
@@ -647,6 +687,13 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
     - If any item has auto_queued=True (user said "getting this next"), send that first
     - Otherwise pick the highest-scored pending item not marked auto_skip
     """
+    # ── Duplicate-run guard ───────────────────────────────────────────────────
+    # bypass_cooldown=True is used for manual runs — they should still be blocked
+    # if a run is already in progress (don't send duplicate Lidarr requests).
+    if _get_job_state("download").get("running"):
+        log.warning("Auto-download already running — skipping duplicate trigger")
+        return
+
     _set_download_state(running=True, phase="Starting", detail="Checking gates…", sent=0, total=0, error=None)
     db = SessionLocal()
     try:
@@ -703,8 +750,9 @@ async def _run_auto_download(bypass_cooldown: bool = False, update_timestamp: bo
                         log.info(f"  Pre-refresh: +{added} items for {u.username}")
                     except Exception as e:
                         log.warning(f"  Pre-refresh failed for {u.username}: {e}")
-                s.last_discovery_refresh = datetime.utcnow()
-                db.commit()
+                # Use _stamp_setting so this write doesn't contend with other
+                # concurrent automation_settings writes from the scheduler.
+                _stamp_setting("last_discovery_refresh", datetime.utcnow())
             except Exception as e:
                 log.warning(f"Auto-download: pre-refresh failed, proceeding with existing queue — {e}")
 
@@ -851,15 +899,14 @@ async def _run_popularity_cache_refresh():
                 loop.run_until_complete(refresh_library_popularity_cache(db))
             finally:
                 loop.close()
-            s = db.query(AutomationSettings).first()
-            if s:
-                s.last_popularity_cache_refresh = datetime.utcnow()
-                db.commit()
             log.info("Scheduled popularity cache refresh complete.")
         except Exception as e:
             log.error(f"Popularity cache refresh job failed: {e}")
         finally:
             db.close()
+        # Stamp outside the main try/finally so a DB lock here doesn't suppress
+        # the completion log. Use retry helper to handle SQLite lock contention.
+        _stamp_setting("last_popularity_cache_refresh", datetime.utcnow())
 
     await asyncio.to_thread(_run_sync)
 
@@ -948,7 +995,7 @@ def reset_job_state(
 
     Valid job_ids: enrichment, discovery, download, index, popularity_cache
     """
-    valid_ids = {"enrichment", "discovery", "download", "index", "popularity_cache"}
+    valid_ids = {"enrichment", "discovery", "download", "index", "cache"}
     if job_id not in valid_ids:
         raise HTTPException(400, f"Unknown job_id '{job_id}'. Valid: {sorted(valid_ids)}")
 

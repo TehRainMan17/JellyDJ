@@ -11,13 +11,23 @@
  * Key behaviours:
  *   - Polling starts immediately on mount — any already-running job appears
  *     without a button click.
- *   - Adaptive interval: 2s while any job is running, 30s when all idle.
- *     This prevents a continuous burst of HTTP requests against the backend
- *     (and Jellyfin, which shares the same host) when the user just has a
- *     tab open and nothing is happening.
+ *   - Adaptive interval: 2s while any job is running, 10s after any job just
+ *     finished (keep showing the completion state), 30s when all fully idle.
+ *   - Once a job transitions to finished, we KEEP that finished state in memory
+ *     so JobProgress can run its 10-20s hide timer — we only reset it when the
+ *     backend confirms the job has been cleared (running=false, finished_at=null).
  *   - startPolling() snaps back to fast polling immediately (call after
  *     manually triggering a job).
- *   - onComplete fires once when the INDEX job transitions running → false.
+ *   - onComplete fires once when the INDEX job transitions running → finished.
+ *
+ * BUG FIXES vs previous version:
+ *   - State is never overwritten with null/empty from a failed fetch — stale
+ *     state is preserved so the progress bar doesn't disappear on a blip.
+ *   - After a job finishes we switch to a 10s "cool-down" interval so the
+ *     completed state stays visible long enough for the 15-20s hide timer
+ *     in JobProgress to fire before we slow-poll back to idle state.
+ *   - All five status keys always receive a value on every successful poll
+ *     so there are no "stuck running" states from partial responses.
  */
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { apiFetch } from '../lib/api'
@@ -30,8 +40,9 @@ const URLS = {
   download: '/api/automation/trigger/auto-download/status',
 }
 
-const INTERVAL_ACTIVE_MS = 2000   // a job is running — keep the progress bar snappy
-const INTERVAL_IDLE_MS   = 30000  // nothing running — no need to hammer the server
+const INTERVAL_ACTIVE_MS   = 2000   // a job is running — keep progress bar snappy
+const INTERVAL_COOLING_MS  = 5000   // a job just finished — keep polling so the bar stays visible
+const INTERVAL_IDLE_MS     = 30000  // nothing happening — don't hammer the server
 
 export function useJobStatus(onComplete) {
   const [indexStatus,    setIndexStatus]    = useState(null)
@@ -45,8 +56,10 @@ export function useJobStatus(onComplete) {
   const onCompleteRef   = useRef(onComplete)
   onCompleteRef.current = onComplete
 
-  // Keep a stable ref to the poll function so the setTimeout callback always
-  // calls the latest version without triggering effect re-runs.
+  // Track when each job last finished so we can stay in COOLING interval
+  const finishedAtRef = useRef({})
+
+  // Keep a stable ref to the latest poll function
   const pollRef = useRef(null)
 
   const stopPolling = useCallback(() => {
@@ -58,6 +71,8 @@ export function useJobStatus(onComplete) {
 
   const poll = useCallback(async () => {
     let anyRunning = false
+    let anyRecentlyFinished = false
+
     try {
       const results = await Promise.allSettled(
         Object.values(URLS).map(url => apiFetch(url).then(r => r.ok ? r.json() : null))
@@ -66,13 +81,34 @@ export function useJobStatus(onComplete) {
         r.status === 'fulfilled' ? r.value : null
       )
 
-      if (ir)  setIndexStatus(ir)
-      if (cr)  setCacheStatus(cr)
-      if (er)  setEnrichStatus(er)
-      if (dr)  setDiscoverStatus(dr)
-      if (dlr) setDownloadStatus(dlr)
+      // Only update state when we got a valid (non-null) response — never
+      // clobber existing state with null from a transient network error.
+      if (ir  != null) setIndexStatus(ir)
+      if (cr  != null) setCacheStatus(cr)
+      if (er  != null) setEnrichStatus(er)
+      if (dr  != null) setDiscoverStatus(dr)
+      if (dlr != null) setDownloadStatus(dlr)
 
-      anyRunning = !!(ir?.running || cr?.running || er?.running || dr?.running || dlr?.running)
+      const statuses = { index: ir, cache: cr, enrich: er, discover: dr, download: dlr }
+
+      // Determine scheduling cadence
+      for (const [key, s] of Object.entries(statuses)) {
+        if (!s) continue
+        if (s.running) {
+          anyRunning = true
+          finishedAtRef.current[key] = null  // reset finish tracker while running
+        } else if (s.finished_at) {
+          // Job is done — record when we first saw it finished
+          if (!finishedAtRef.current[key]) {
+            finishedAtRef.current[key] = Date.now()
+          }
+          // Stay in cooling interval for 25s after finish (longer than the 20s hide timer)
+          const age = Date.now() - finishedAtRef.current[key]
+          if (age < 25_000) {
+            anyRecentlyFinished = true
+          }
+        }
+      }
 
       // Fire onComplete when index transitions running → idle
       if (ir?.running) {
@@ -83,8 +119,13 @@ export function useJobStatus(onComplete) {
       }
     } catch { /* network blip — reschedule anyway */ }
 
-    // Schedule the next poll at the appropriate cadence
-    const ms = anyRunning ? INTERVAL_ACTIVE_MS : INTERVAL_IDLE_MS
+    // Pick the tightest interval that applies
+    const ms = anyRunning
+      ? INTERVAL_ACTIVE_MS
+      : anyRecentlyFinished
+        ? INTERVAL_COOLING_MS
+        : INTERVAL_IDLE_MS
+
     timerRef.current = setTimeout(() => pollRef.current?.(), ms)
   }, []) // no deps — state setters and refs are stable
 
@@ -99,6 +140,7 @@ export function useJobStatus(onComplete) {
   // Snap back to fast polling immediately after manually triggering a job
   const startPolling = useCallback(() => {
     indexWasRunning.current = false
+    finishedAtRef.current = {}
     stopPolling()
     poll()
   }, [poll, stopPolling])

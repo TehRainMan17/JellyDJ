@@ -127,6 +127,11 @@ def _run_migrations():
         ("managed_users", "has_activated",   "BOOLEAN",  "0"),
         # Phase 3: playlist template system — new column on playlist_run_items
         ("playlist_run_items", "user_playlist_id", "INTEGER", "NULL"),
+        # v8: public_url on connection_settings — browser-only Jellyfin deep-link base URL
+        ("connection_settings", "public_url", "TEXT", "NULL"),
+        # v8: jellyfin_playlist_id on user_playlists — already in DB for most installs
+        # but missing from the ORM model declaration; adding here for clean new installs
+        ("user_playlists", "jellyfin_playlist_id", "TEXT", "''"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:

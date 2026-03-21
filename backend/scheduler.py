@@ -99,8 +99,19 @@ def _sync_wrap(async_fn, *args, **kwargs):
 
 def _job_run_index():
     import asyncio
-    from services.indexer import run_full_index
-    asyncio.run(run_full_index())
+    from services.indexer import run_full_index, _index_lock
+    import logging as _log
+    # Acquire the lock in the sync wrapper — before creating an event loop —
+    # so two scheduler threads can never both enter run_full_index concurrently.
+    if not _index_lock.acquire(blocking=False):
+        _log.getLogger(__name__).warning(
+            "Index already running (lock held) — skipping duplicate scheduler trigger."
+        )
+        return
+    try:
+        asyncio.run(run_full_index(_lock_already_held=True))
+    finally:
+        _index_lock.release()
 
 
 def _job_discovery_refresh():
@@ -134,6 +145,20 @@ def _job_enrichment():
     which was causing 499s on every other request while it ran.
     """
     import threading
+
+    # ── Duplicate-run guard ───────────────────────────────────────────────────
+    # Enrichment can run for 37+ minutes on a large library. If the scheduler
+    # interval is shorter than the actual run time, or if a manual trigger fires
+    # while the scheduled run is still in progress, we would spin up a second
+    # thread writing to the same TrackEnrichment/ArtistEnrichment rows concurrently.
+    # Reading from the DB state (not an in-memory flag) means all 4 workers agree.
+    try:
+        from routers.automation import _get_job_state
+        if _get_job_state("enrichment").get("running"):
+            log.warning("Enrichment already running — skipping scheduled trigger")
+            return
+    except Exception as e:
+        log.warning(f"Enrichment guard check failed ({e}) — proceeding anyway")
 
     def _run():
         from database import SessionLocal
@@ -509,14 +534,26 @@ def reschedule_index_job(db):
     Called when the user changes index_interval_hours in the Automation settings.
     """
     s = _get_settings(db)
+    from datetime import timedelta as _td
+    _ix_interval = _td(hours=s.index_interval_hours)
+    _ix_last     = getattr(s, "last_index", None)
+    _now         = datetime.now(timezone.utc)
+    if _ix_last is None:
+        _ix_next = _now + _td(minutes=2)   # never run — fire soon after startup
+    else:
+        if _ix_last.tzinfo is None:
+            _ix_last = _ix_last.replace(tzinfo=timezone.utc)
+        _ix_next = _ix_last + _ix_interval
+        if _ix_next < _now:
+            _ix_next = _now + _td(minutes=2)  # overdue — run soon but not instantly
     scheduler.reschedule_job(
         INDEX_JOB_ID,
         trigger=IntervalTrigger(
             hours=s.index_interval_hours,
-            start_date=datetime.now(timezone.utc),  # always schedule forward from now
+            start_date=_ix_next,
         ),
     )
-    log.info(f"Index job rescheduled: every {s.index_interval_hours}h")
+    log.info(f"Index job rescheduled: every {s.index_interval_hours}h, next run {_ix_next.strftime('%H:%M UTC')}")
 
 
 def reschedule_automation_jobs(db):
@@ -533,12 +570,26 @@ def reschedule_automation_jobs(db):
     """
     s = _get_settings(db)
 
-    # Indexer always runs — only the interval changes
+    # Indexer always runs — only the interval changes.
+    # Use last_index to compute start_date so container restarts and settings saves
+    # don't reset the clock and fire the index immediately every time.
+    from datetime import timedelta as _td
+    _ix_interval = _td(hours=s.index_interval_hours)
+    _ix_last     = getattr(s, "last_index", None)
+    _now_ix      = datetime.now(timezone.utc)
+    if _ix_last is None:
+        _ix_next = _now_ix + _td(minutes=2)
+    else:
+        if _ix_last.tzinfo is None:
+            _ix_last = _ix_last.replace(tzinfo=timezone.utc)
+        _ix_next = _ix_last + _ix_interval
+        if _ix_next < _now_ix:
+            _ix_next = _now_ix + _td(minutes=2)  # overdue — run soon but not instantly
     scheduler.reschedule_job(
         INDEX_JOB_ID,
         trigger=IntervalTrigger(
             hours=s.index_interval_hours,
-            start_date=datetime.now(timezone.utc),
+            start_date=_ix_next,
         ),
     )
 

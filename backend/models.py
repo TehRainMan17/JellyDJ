@@ -30,6 +30,9 @@ class ConnectionSettings(Base):
     is_connected = Column(Boolean, default=False)
     last_tested = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # v8: optional public URL returned to the browser for deep-links only.
+    # Never used for server-side requests — no SSRF validation needed.
+    public_url = Column(String, nullable=True, default="")
 
 
 class ManagedUser(Base):
@@ -582,6 +585,7 @@ class UserPlaylist(Base):
     schedule_interval_h  = Column(Integer, default=24)
     last_generated_at    = Column(DateTime, nullable=True)
     last_track_count     = Column(Integer, nullable=True)
+    jellyfin_playlist_id = Column(String, nullable=False, default="")
     created_at           = Column(DateTime, default=datetime.utcnow)
     updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

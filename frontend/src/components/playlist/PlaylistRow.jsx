@@ -1,13 +1,16 @@
 /**
  * PlaylistRow.jsx — Single row in the My Playlists panel.
  * Handles: push, preview modal, schedule toggle, rename, delete.
+ * + Jellyfin deep-link button when the playlist has been pushed at least once.
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Play, Eye, Trash2, Loader2, CheckCircle2, XCircle,
-  Clock, ChevronDown, Calendar, Edit2
+  Clock, ChevronDown, Calendar, Edit2,
 } from 'lucide-react'
 import { api } from '../../lib/api.js'
+import { useJellyfinUrl } from '../../hooks/useJellyfinUrl.js'
+import JellyfinIcon from '../JellyfinIcon.jsx'
 
 const SCHEDULE_OPTIONS = [
   { value: 6,    label: '6 hours' },
@@ -18,22 +21,12 @@ const SCHEDULE_OPTIONS = [
 ]
 
 /**
- * Compute the next scheduled push time.
- *
- * We base this on last_generated_at (the last time the playlist was actually
- * pushed) rather than updated_at (the last time the row was edited).
- * Using updated_at caused the "Next" time to always appear in the past because
- * updated_at changes on every schedule save but is never refreshed by a push.
- *
- * Fallback: if the playlist has never been pushed (last_generated_at is null)
- * we use created_at + interval so the display is still meaningful.
+ * Compute the next scheduled push time from last_generated_at (or created_at).
  */
 function nextRunTime(playlist, intervalH) {
   if (!intervalH) return null
-
   const baseStr = playlist.last_generated_at ?? playlist.created_at
   if (!baseStr) return null
-
   const base = new Date(
     baseStr.endsWith('Z') || baseStr.includes('+') ? baseStr : baseStr + 'Z'
   )
@@ -48,7 +41,7 @@ export default function PlaylistRow({
 }) {
   // ── Push state ──────────────────────────────────────────────────────────
   const [pushing, setPushing]     = useState(false)
-  const [pushMsg, setPushMsg]     = useState(null)  // { ok, text }
+  const [pushMsg, setPushMsg]     = useState(null)
   const pushTimerRef              = useRef(null)
 
   // ── Preview state ───────────────────────────────────────────────────────
@@ -71,9 +64,11 @@ export default function PlaylistRow({
   const [confirmDel, setConfirm]  = useState(false)
   const [deleting, setDeleting]   = useState(false)
 
+  // ── Jellyfin URL ─────────────────────────────────────────────────────────
+  const { buildItemUrl } = useJellyfinUrl()
+
   useEffect(() => () => { if (pushTimerRef.current) clearTimeout(pushTimerRef.current) }, [])
 
-  // Focus rename input
   useEffect(() => {
     if (renaming && renameRef.current) renameRef.current.focus()
   }, [renaming])
@@ -129,7 +124,7 @@ export default function PlaylistRow({
     try {
       const updated = await api.put(`/api/user-playlists/${playlist.id}`, { base_name: trimmed })
       onUpdate(updated)
-    } catch (e) {
+    } catch {
       setNameInput(playlist.base_name)
     }
     setRenaming(false)
@@ -177,14 +172,17 @@ export default function PlaylistRow({
     }
   }
 
-  // Use last_generated_at as the base for next-run calculation.
-  // Falls back to created_at for playlists that have never been pushed.
   const nextRun = schedEnabled ? nextRunTime(playlist, schedInterval) : null
   const isPastDue = nextRun && nextRun < new Date()
 
   const lastGenFmt = playlist.last_generated_at
     ? new Date(playlist.last_generated_at.endsWith('Z') || playlist.last_generated_at.includes('+')
         ? playlist.last_generated_at : playlist.last_generated_at + 'Z').toLocaleString()
+    : null
+
+  // Build the Jellyfin playlist deep-link (only available after at least one push)
+  const jellyfinPlaylistUrl = playlist.jellyfin_playlist_id
+    ? buildItemUrl(playlist.jellyfin_playlist_id)
     : null
 
   return (
@@ -207,16 +205,36 @@ export default function PlaylistRow({
                 className="input py-0.5 text-sm font-semibold w-full mb-0.5"
               />
             ) : (
-              <button
-                onClick={() => { setRenaming(true); setNameInput(playlist.base_name) }}
-                className="flex items-center gap-1 group text-left"
-                title="Click to rename"
-              >
-                <span className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
-                  {playlist.jellyfin_name}
-                </span>
-                <Edit2 size={10} className="flex-shrink-0 opacity-0 group-hover:opacity-60 transition-opacity" style={{ color: 'var(--text-muted)' }} />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setRenaming(true); setNameInput(playlist.base_name) }}
+                  className="flex items-center gap-1 group text-left"
+                  title="Click to rename"
+                >
+                  <span className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                    {playlist.jellyfin_name}
+                  </span>
+                  <Edit2 size={10} className="flex-shrink-0 opacity-0 group-hover:opacity-60 transition-opacity" style={{ color: 'var(--text-muted)' }} />
+                </button>
+
+                {/* ── Jellyfin open link — shown once the playlist has been pushed ── */}
+                {jellyfinPlaylistUrl && (
+                  <a
+                    href={jellyfinPlaylistUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Open in Jellyfin"
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold flex-shrink-0
+                               border border-[var(--border)] bg-[var(--bg-overlay)]
+                               hover:border-[var(--accent)]/50 hover:bg-[var(--accent)]/10
+                               transition-all duration-150"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <JellyfinIcon size={14} />
+                    <span className="hidden sm:inline text-white">Jellyfin</span>
+                  </a>
+                )}
+              </div>
             )}
 
             {/* Template link */}
@@ -309,6 +327,20 @@ export default function PlaylistRow({
             <span className="text-xs" style={{ color: pushMsg.ok ? 'var(--accent)' : 'var(--danger)' }}>
               {pushMsg.text}
             </span>
+            {/* Shortcut: open in Jellyfin right after a successful push */}
+            {pushMsg.ok && jellyfinPlaylistUrl && (
+              <a
+                href={jellyfinPlaylistUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="ml-auto flex items-center gap-1.5 text-[10px] font-medium flex-shrink-0
+                           text-[var(--accent)]/70 hover:text-[var(--accent)] transition-colors"
+                onClick={e => e.stopPropagation()}
+              >
+                <JellyfinIcon size={11} />
+                Open in Jellyfin
+              </a>
+            )}
           </div>
         )}
 
@@ -382,8 +414,24 @@ export default function PlaylistRow({
             style={{ background: 'var(--bg-surface)', border: '1px solid var(--border)' }}
           >
             <div className="px-5 py-4" style={{ borderBottom: '1px solid var(--border)' }}>
-              <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-                Preview: {playlist.jellyfin_name}
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  Preview: {playlist.jellyfin_name}
+                </div>
+                {jellyfinPlaylistUrl && (
+                  <a
+                    href={jellyfinPlaylistUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1.5 text-[10px] font-medium
+                               text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
+                    onClick={e => e.stopPropagation()}
+                    title="Open this playlist in Jellyfin"
+                  >
+                    <JellyfinIcon size={12} />
+                    Open in Jellyfin
+                  </a>
+                )}
               </div>
             </div>
             <div className="px-5 py-4">
@@ -395,10 +443,6 @@ export default function PlaylistRow({
               ) : previewData?.error ? (
                 <div className="text-sm" style={{ color: 'var(--danger)' }}>{previewData.error}</div>
               ) : previewData ? (() => {
-                // Normalise field names — the API may return any of these shapes:
-                //   { estimated_tracks, sample: [{track, artist}] }       ← template engine
-                //   { estimated_count, sample_tracks: [{track_name, artist_name}] }
-                //   { track_count, tracks: [{name, artist}] }
                 const count = previewData.estimated_tracks
                   ?? previewData.estimated_count
                   ?? previewData.track_count

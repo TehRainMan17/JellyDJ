@@ -2,7 +2,6 @@ import { useEffect } from 'react'
 import AutomationPanel from '../components/AutomationPanel.jsx'
 import JobProgress from '../components/JobProgress.jsx'
 import { useJobStatus } from '../hooks/useJobStatus.js'
-import { api } from '../lib/api.js'
 
 export default function Settings() {
   const {
@@ -25,6 +24,7 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Live job progress — appears when any task is running or just finished */}
       <JobProgress
         indexStatus={indexStatus}
         cacheStatus={cacheStatus}

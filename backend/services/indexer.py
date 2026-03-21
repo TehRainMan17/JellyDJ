@@ -84,33 +84,26 @@ from datetime import datetime as _dt
 # Module-level lock — plain threading lock, works across all event loops
 _index_lock = _threading.Lock()
 
-_job_state: dict = {
-    "running":    False,
-    "phase":      "",
-    "detail":     "",
-    "percent":    0,
-    "started_at": None,
-    "finished_at": None,
-    "error":      None,
-}
 
 def get_job_state() -> dict:
-    """Safe to call from any context — just a dict copy, no lock needed."""
-    return dict(_job_state)
+    """
+    Read index job state from the shared DB table.
+    Safe to call from any worker process — always returns current state.
+    """
+    from routers.automation import _get_job_state
+    return _get_job_state("index")
+
 
 def _set_job(running: bool, phase: str = "", detail: str = "",
              percent: int = 0, error: str = None):
-    _job_state["running"]  = running
-    _job_state["phase"]    = phase
-    _job_state["detail"]   = detail
-    _job_state["percent"]  = percent
-    _job_state["error"]    = error
-    if running and not _job_state["started_at"]:
-        _job_state["started_at"]  = _dt.utcnow().isoformat()
-        _job_state["finished_at"] = None
-    if not running:
-        _job_state["finished_at"] = _dt.utcnow().isoformat()
-        _job_state["started_at"]  = None
+    """
+    Write index job state to the shared DB table.
+    All 4 uvicorn workers can read the state that any worker writes.
+    Uses threading-safe SessionLocal() — no event loop dependency.
+    """
+    from routers.automation import _set_job_state
+    _set_job_state("index", running=running, phase=phase,
+                   detail=detail, percent=percent, error=error)
 
 
 
@@ -503,19 +496,32 @@ async def _sync_usernames(base_url: str, api_key: str, db: Session):
         log.info(f"  Updated {updated} username(s)")
 
 
-async def run_full_index():
+async def run_full_index(_lock_already_held: bool = False):
     """
     Entry point called by APScheduler.
     Opens its own DB session (scheduler runs in a thread pool).
     Runs library scan first, then per-user play history + scoring.
     """
-    # Atomic acquire — only one coroutine can pass this at a time.
-    # asyncio.Lock.acquire() is a coroutine: it yields to the event loop
-    # while waiting, so other requests stay responsive. Once acquired,
-    # no other call to run_full_index() can enter until we release below.
-    if not _index_lock.acquire(blocking=False):
-        log.warning("Index already running — skipping duplicate trigger.")
-        return
+    # ── Cross-process duplicate guard (DB-level) ────────────────────────────
+    # With 4 uvicorn workers, two different processes could both receive a
+    # "run index" request and each acquire their own threading.Lock. Check the
+    # shared DB state first — if another worker has already set running=True,
+    # bail out immediately without touching the lock.
+    try:
+        if get_job_state().get("running"):
+            log.warning("Index already running (DB state) — skipping duplicate trigger.")
+            return
+    except Exception:
+        pass  # DB unavailable at this exact moment — let the lock handle it
+
+    # ── Within-process duplicate guard (threading lock) ──────────────────────
+    # Prevents re-entrant calls within the same worker process.
+    # _lock_already_held=True is passed by the scheduler wrapper which acquires
+    # the lock before calling asyncio.run() so we don't double-acquire here.
+    if not _lock_already_held:
+        if not _index_lock.acquire(blocking=False):
+            log.warning("Index already running (lock held) — skipping duplicate trigger.")
+            return
     db = None
     try:
         _set_job(True, "Connecting", "Reaching Jellyfin server…", 2)
@@ -600,25 +606,25 @@ async def run_full_index():
     finally:
         if db is not None:
             db.close()
-        _index_lock.release()  # always release so the next run can proceed
+        if not _lock_already_held:
+            _index_lock.release()  # only release if we acquired it
 
 
 # ── Global cache refresh state (for progress polling) ─────────────────────────
-_cache_refresh_state: dict = {
-    "running": False,
-    "phase": "",
-    "done": 0,
-    "total": 0,
-    "started_at": None,
-    "finished_at": None,
-    "error": None,
-}
+# Previously an in-memory dict — now DB-backed so all 4 uvicorn workers
+# can see the state written by whichever worker is running the refresh.
 
 def get_cache_refresh_state() -> dict:
-    return dict(_cache_refresh_state)
+    """Read cache refresh state from the shared DB table."""
+    from routers.automation import _get_job_state
+    return _get_job_state("cache")
+
 
 def _set_cache_state(**kwargs):
-    _cache_refresh_state.update(kwargs)
+    """Write cache refresh state to the shared DB table."""
+    from routers.automation import _set_job_state
+    _set_job_state("cache", **kwargs)
+
 
 
 async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):
@@ -627,7 +633,7 @@ async def warm_popularity_cache(user_id: str, db: Session, top_n: int = 20):
     Fires the full library cache refresh as a non-blocking background thread.
     Returns immediately — index continues, dashboard stays responsive.
     """
-    if _cache_refresh_state.get("running"):
+    if get_cache_refresh_state().get("running"):
         log.info("  Cache refresh already running — skipping duplicate trigger")
         return
     # Fire and forget — don't await, don't block
@@ -647,7 +653,7 @@ async def refresh_library_popularity_cache(db: Session):
     Async entry point for the manual trigger endpoint.
     Fires the refresh in a background thread and returns immediately.
     """
-    if _cache_refresh_state.get("running"):
+    if get_cache_refresh_state().get("running"):
         log.info("  Cache refresh already running")
         return
     import threading
@@ -672,7 +678,7 @@ def _run_cache_refresh_sync(caller_db: Session):
       not the 32 that pylast lazy-evaluation makes per artist)
     - Pass 2 capped at top 5 similar per library artist, deduplicated
       → bounds the total to ~1,000-2,000 similar artists max
-    - Progress state written to _cache_refresh_state for UI polling
+    - Progress state written to the DB job_state table for UI polling
     """
     import math
     import time
