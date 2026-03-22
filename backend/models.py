@@ -247,11 +247,9 @@ class LibraryTrack(Base):
     # v4: holiday tagging
     holiday_tag     = Column(String,  nullable=True)
     holiday_exclude = Column(Boolean, nullable=False, default=False)
-    # v5: Jellyfin album container ID — enables reliable album exclusion matching
-    # regardless of how album_name is tagged in the audio file metadata.
+    # v5: Jellyfin album container ID
     jellyfin_album_id = Column(String, nullable=True, index=True)
-    # v6: Jellyfin artist item ID — enables direct deep-links to the artist
-    # profile page in the Jellyfin web client instead of falling back to search.
+    # v6: Jellyfin artist item ID
     jellyfin_artist_id = Column(String, nullable=True, index=True)
 
 
@@ -322,7 +320,7 @@ class TrackScore(Base):
     replay_boost = Column(Float, nullable=True, default=0.0)
     global_popularity = Column(Float, nullable=True)
     skip_streak = Column(Integer, nullable=True, default=0)
-    # v4: holiday tagging (denormalised from LibraryTrack for fast filtering)
+    # v4: holiday tagging
     holiday_tag     = Column(String,  nullable=True)
     holiday_exclude = Column(Boolean, nullable=False, default=False)
 
@@ -353,7 +351,7 @@ class AutomationSettings(Base):
     last_popularity_cache_refresh = Column(DateTime, nullable=True)
 
 
-# ── v2: new tables (created by create_all, never existed before) ──────────────
+# ── v2: new tables ────────────────────────────────────────────────────────────
 
 class TrackEnrichment(Base):
     """Per-track Last.fm / MusicBrainz metadata. One row per library track."""
@@ -366,13 +364,9 @@ class TrackEnrichment(Base):
     lastfm_url = Column(String, nullable=True)
     global_playcount = Column(Integer, nullable=True)
     global_listeners = Column(Integer, nullable=True)
-    tags = Column(Text, nullable=True)            # JSON list of tag strings
-    similar_tracks = Column(Text, nullable=True)  # JSON list of {title, artist}
-    popularity_score = Column(Float, nullable=True)  # 0–100 log-normalised
-    # These three were missing from the original model but written by enrichment.py --
-    # their absence caused TrackEnrichment.expires_at to raise AttributeError on the
-    # staleness-check query, crashing enrich_tracks() before any track was processed,
-    # which meant global_popularity was never written to TrackScore.
+    tags = Column(Text, nullable=True)
+    similar_tracks = Column(Text, nullable=True)
+    popularity_score = Column(Float, nullable=True)
     album_name = Column(String, nullable=True, default="")
     source = Column(String, nullable=True)
     expires_at = Column(DateTime, nullable=True)
@@ -392,31 +386,25 @@ class ArtistEnrichment(Base):
     image_url = Column(String, nullable=True)
     global_listeners = Column(Integer, nullable=True)
     global_playcount = Column(Integer, nullable=True)
-    tags = Column(Text, nullable=True)            # JSON list
-    similar_artists = Column(Text, nullable=True) # JSON list of {name, match}
+    tags = Column(Text, nullable=True)
+    similar_artists = Column(Text, nullable=True)
     popularity_score = Column(Float, nullable=True)
-    trend_direction = Column(String, nullable=True)  # "rising"|"falling"|"stable"
+    trend_direction = Column(String, nullable=True)
     trend_pct = Column(Float, nullable=True)
     enriched_at = Column(DateTime, nullable=True)
-    # Missing columns written by enrich_artists() — same bug class as TrackEnrichment.
-    # Without expires_at, ArtistEnrichment.expires_at > now raises AttributeError,
-    # crashing enrich_artists() before any artist is processed.
     expires_at = Column(DateTime, nullable=True)
     source = Column(String, nullable=True)
     listeners_previous = Column(Integer, nullable=True)
-    top_tracks = Column(Text, nullable=True)      # JSON list of {name, listeners, rank}
+    top_tracks = Column(Text, nullable=True)
 
 
 class ArtistRelation(Base):
-    """
-    Edge table for the artist similarity network graph.
-    One row per (artist_a → artist_b) pair from Last.fm similar-artists.
-    """
+    """Edge table for the artist similarity network graph."""
     __tablename__ = "artist_relations"
     id = Column(Integer, primary_key=True, index=True)
     artist_a = Column(String, nullable=False, index=True)
     artist_b = Column(String, nullable=False, index=True)
-    match_score = Column(Float, nullable=False, default=0.0)  # 0–1 Last.fm similarity
+    match_score = Column(Float, nullable=False, default=0.0)
     source = Column(String, nullable=False, default="lastfm")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -426,18 +414,13 @@ class ArtistRelation(Base):
 
 
 class UserReplaySignal(Base):
-    """
-    Materialized voluntary replays within 7 days — high-value preference signal.
-    One row per detected replay event. Small table: only fires when a user
-    genuinely seeks out a track or artist within a week of a previous play.
-    """
     __tablename__ = "user_replay_signals"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, nullable=False, index=True)
     jellyfin_item_id = Column(String, nullable=False, index=True)
     artist_name = Column(String, nullable=False, default="")
-    signal_type = Column(String, nullable=False)  # "track_replay"|"artist_return"|"same_session_return"
-    first_play_at = Column(DateTime, nullable=True)   # timestamp of the triggering prior play
+    signal_type = Column(String, nullable=False)
+    first_play_at = Column(DateTime, nullable=True)
     days_between = Column(Float, nullable=True)
     seed_was_playlist = Column(Boolean, default=False)
     boost_applied = Column(Float, nullable=False, default=0.0)
@@ -445,10 +428,6 @@ class UserReplaySignal(Base):
 
 
 class TrackCooldown(Base):
-    """
-    Per-user per-track cooldown state. Created when a skip streak exceeds 3.
-    Status: "active" | "expired" | "permanent"
-    """
     __tablename__ = "track_cooldowns"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, nullable=False, index=True)
@@ -470,21 +449,16 @@ class TrackCooldown(Base):
 # ── v3: new tables ────────────────────────────────────────────────────────────
 
 class BillboardChartEntry(Base):
-    """
-    Snapshot of the Billboard Hot 100. Always exactly 100 rows — replaced
-    wholesale on each weekly refresh. No historical rows accumulate.
-    Shared across all users (the chart is global).
-    """
     __tablename__ = "billboard_chart_entries"
     id = Column(Integer, primary_key=True, index=True)
     rank = Column(Integer, nullable=False, index=True)
     title = Column(String, nullable=False)
     artist = Column(String, nullable=False)
-    chart_score = Column(Float, nullable=False, default=0.0)  # rank 1→100, rank 100→1
+    chart_score = Column(Float, nullable=False, default=0.0)
     weeks_on_chart = Column(Integer, nullable=True)
     peak_position = Column(Integer, nullable=True)
     last_week_position = Column(Integer, nullable=True)
-    jellyfin_item_id = Column(String, nullable=True, index=True)  # null if not in library
+    jellyfin_item_id = Column(String, nullable=True, index=True)
     fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     chart_date = Column(String, nullable=True)
 
@@ -496,20 +470,11 @@ class BillboardChartEntry(Base):
 # ── Auth Phase 1: refresh token store ────────────────────────────────────────
 
 class RefreshToken(Base):
-    """
-    Server-side refresh token store.
-
-    Only the SHA-256 hash of the token is persisted — the plaintext is
-    returned to the client exactly once (at issuance) and never stored.
-
-    The Jellyfin access token is encrypted at rest with crypto.encrypt()
-    so that a DB breach does not expose live Jellyfin sessions.
-    """
     __tablename__ = "refresh_tokens"
     id             = Column(Integer, primary_key=True, index=True)
     token_hash     = Column(String, unique=True, nullable=False, index=True)
     user_id        = Column(String, nullable=False, index=True)
-    jellyfin_token = Column(Text, nullable=False)   # encrypted via crypto.encrypt()
+    jellyfin_token = Column(Text, nullable=False)
     expires_at     = Column(DateTime, nullable=False)
     created_at     = Column(DateTime, default=datetime.utcnow)
     last_used_at   = Column(DateTime, nullable=True)
@@ -518,10 +483,6 @@ class RefreshToken(Base):
 # ── v4: manual album exclusions ───────────────────────────────────────────────
 
 class ExcludedAlbum(Base):
-    """
-    Manually excluded albums — kept out of all playlist generation regardless
-    of score.  One row per album.  User-managed via the Exclusions UI.
-    """
     __tablename__ = "excluded_albums"
     id                = Column(Integer, primary_key=True, index=True)
     jellyfin_album_id = Column(String, unique=True, nullable=False, index=True)
@@ -536,20 +497,14 @@ class ExcludedAlbum(Base):
 # ── Phase 3: playlist template system ────────────────────────────────────────
 
 class PlaylistTemplate(Base):
-    """
-    A reusable playlist recipe — either a system prefab (is_system=True,
-    owner_user_id=None) or a user-created template.  Templates are composed
-    of one or more PlaylistBlock rows that describe how tracks are sourced
-    and weighted.
-    """
     __tablename__ = "playlist_templates"
     id             = Column(Integer, primary_key=True, index=True)
     name           = Column(Text, nullable=False)
     description    = Column(Text, nullable=True)
-    owner_user_id  = Column(Text, nullable=True)   # NULL = system/prefab template
+    owner_user_id  = Column(Text, nullable=True)
     is_public      = Column(Boolean, default=True)
     is_system      = Column(Boolean, default=False)
-    forked_from_id = Column(Integer, nullable=True)  # references PlaylistTemplate.id
+    forked_from_id = Column(Integer, nullable=True)
     total_tracks   = Column(Integer, default=50)
     blend_mode     = Column(Text, default="weighted_shuffle")
     created_at     = Column(DateTime, default=datetime.utcnow)
@@ -557,32 +512,22 @@ class PlaylistTemplate(Base):
 
 
 class PlaylistBlock(Base):
-    """
-    One scoring/selection block within a PlaylistTemplate.  Multiple blocks
-    are blended together according to their weights and the template's
-    blend_mode.  params is a JSON blob serialised/deserialised at the
-    service layer — never interpreted by the model itself.
-    """
     __tablename__ = "playlist_blocks"
     id          = Column(Integer, primary_key=True, index=True)
-    template_id = Column(Integer, nullable=False)   # references PlaylistTemplate.id
+    template_id = Column(Integer, nullable=False)
     block_type  = Column(Text, nullable=False)
     weight      = Column(Integer, nullable=False)
     position    = Column(Integer, nullable=False)
-    params      = Column(Text, nullable=False)       # JSON blob — use json.dumps/loads
+    params      = Column(Text, nullable=False)
     created_at  = Column(DateTime, default=datetime.utcnow)
     updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class UserPlaylist(Base):
-    """
-    A user-owned playlist instance, optionally backed by a PlaylistTemplate.
-    Tracks schedule settings and generation history.
-    """
     __tablename__ = "user_playlists"
     id                   = Column(Integer, primary_key=True, index=True)
     owner_user_id        = Column(Text, nullable=False)
-    template_id          = Column(Integer, nullable=True)  # references PlaylistTemplate.id
+    template_id          = Column(Integer, nullable=True)
     base_name            = Column(Text, nullable=False)
     schedule_enabled     = Column(Boolean, default=False)
     schedule_interval_h  = Column(Integer, default=24)
@@ -594,28 +539,6 @@ class UserPlaylist(Base):
 
 
 class LoginRateLimit(Base):
-    """
-    Persistent login rate-limit state, keyed by client IP.
-
-    Replaces the in-memory defaultdict in routers/auth.py, which reset on
-    every restart and was not shared across uvicorn workers.
-
-    Schema
-    ──────
-    ip            — client IP address (primary key)
-    window_start  — UTC timestamp when the current counting window opened
-    attempt_count — number of attempts recorded in the current window
-
-    Logic (in _check_rate_limit):
-      - If no row exists for this IP, create one with attempt_count=1.
-      - If a row exists and now - window_start >= WINDOW seconds, reset it
-        (new window, attempt_count=1).
-      - If a row exists within the window and attempt_count >= MAX, reject 429.
-      - Otherwise increment attempt_count.
-
-    The table is tiny (one row per distinct IP that has ever tried to log in)
-    and rows are cheap to upsert. SQLite handles this comfortably.
-    """
     __tablename__ = "login_rate_limits"
     ip            = Column(Text, primary_key=True)
     window_start  = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -623,19 +546,10 @@ class LoginRateLimit(Base):
 
 
 class DefaultPlaylistConfig(Base):
-    """
-    Admin-configured default playlists provisioned to every user automatically:
-    on first login, on first push, or on-demand via the admin Users panel.
-
-    One row per default playlist slot. When a user is provisioned, a UserPlaylist
-    is created for each active row the user doesn't already have (deduped by
-    template_id). Users can rename, reschedule, or delete their provisioned
-    playlists without affecting this config table.
-    """
     __tablename__ = "default_playlist_configs"
     id                  = Column(Integer, primary_key=True, index=True)
-    template_id         = Column(Integer, nullable=False)      # references PlaylistTemplate.id
-    base_name           = Column(Text, nullable=False)         # playlist display name for users
+    template_id         = Column(Integer, nullable=False)
+    base_name           = Column(Text, nullable=False)
     schedule_enabled    = Column(Boolean, default=True,  nullable=False)
     schedule_interval_h = Column(Integer, default=24,    nullable=False)
     position            = Column(Integer, default=0,     nullable=False)
@@ -644,17 +558,110 @@ class DefaultPlaylistConfig(Base):
 
 
 class JobState(Base):
-    """
-    Shared job state for background tasks — readable by all uvicorn workers.
-    Replaces the per-process in-memory dicts that broke with multiple workers.
-    One row per job_id (e.g. "enrichment", "discovery").
-    """
     __tablename__ = "job_state"
     id         = Column(Integer, primary_key=True, index=True)
     job_id     = Column(String, unique=True, nullable=False, index=True)
     running    = Column(Boolean, default=False, nullable=False)
     phase      = Column(String, nullable=True)
-    payload    = Column(Text, nullable=True)   # JSON: progress counters etc.
+    payload    = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at= Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ── Playlist Backup feature ───────────────────────────────────────────────────
+
+class PlaylistBackup(Base):
+    """
+    One row per tracked playlist — the stable parent record.
+
+    Stores metadata about the playlist and user preferences (display_name,
+    exclude_from_auto). The actual track data lives in PlaylistBackupRevision
+    and PlaylistBackupTrack, keeping up to max_revisions rolling snapshots.
+
+    Fields
+    ──────
+    jellyfin_playlist_id   — Jellyfin item ID of the source playlist
+    jellyfin_playlist_name — most recent name seen in Jellyfin
+    display_name           — optional override name used on restore;
+                             defaults to jellyfin_playlist_name when None
+    exclude_from_auto      — when True, the scheduler skips this playlist;
+                             only a manual "Re-backup now" press updates it
+    max_revisions          — how many rolling revisions to keep (default 6)
+    created_at             — when this backup record was first created
+    """
+    __tablename__ = "playlist_backups"
+    id                     = Column(Integer, primary_key=True, index=True)
+    jellyfin_playlist_id   = Column(String, unique=True, nullable=False, index=True)
+    jellyfin_playlist_name = Column(String, nullable=False, default="")
+    display_name           = Column(String, nullable=True)
+    exclude_from_auto      = Column(Boolean, nullable=False, default=False)
+    max_revisions          = Column(Integer, nullable=False, default=6)
+    created_at             = Column(DateTime, default=datetime.utcnow)
+
+
+class PlaylistBackupRevision(Base):
+    """
+    One snapshot of a playlist's track list at a point in time.
+
+    Multiple revisions exist per PlaylistBackup, up to backup.max_revisions.
+    When a new backup is written and the limit is exceeded, the oldest
+    revision (lowest revision_number) is deleted along with its tracks.
+
+    Fields
+    ──────
+    backup_id       — parent PlaylistBackup.id
+    revision_number — 1-based counter, increments with each new snapshot;
+                      the highest number is always the most recent
+    track_count     — cached count of tracks in this revision
+    backed_up_at    — UTC timestamp when this snapshot was taken
+    label           — optional human label (e.g. "before holiday shuffle");
+                      labeled revisions are never auto-pruned
+    """
+    __tablename__ = "playlist_backup_revisions"
+    id              = Column(Integer, primary_key=True, index=True)
+    backup_id       = Column(Integer, nullable=False, index=True)   # → PlaylistBackup.id
+    revision_number = Column(Integer, nullable=False)
+    track_count     = Column(Integer, nullable=False, default=0)
+    backed_up_at    = Column(DateTime, nullable=False, default=datetime.utcnow)
+    label           = Column(String, nullable=True)   # None = auto-generated label
+
+    __table_args__ = (
+        Index("ix_backup_revisions_backup_rev", "backup_id", "revision_number"),
+    )
+
+
+class PlaylistBackupTrack(Base):
+    """
+    One row per track within a PlaylistBackupRevision.
+
+    Indexed by revision_id (not backup_id) so each revision's track list
+    is fully independent — restoring an old revision doesn't touch newer ones.
+    """
+    __tablename__ = "playlist_backup_tracks"
+    id               = Column(Integer, primary_key=True, index=True)
+    # backup_id is the original column (NOT NULL in old installs). We keep writing
+    # it so the old constraint is always satisfied regardless of install age.
+    # On fresh installs the migration adds it nullable; old installs have NOT NULL.
+    backup_id        = Column(Integer, nullable=True, index=True)   # → PlaylistBackup.id (legacy compat)
+    revision_id      = Column(Integer, nullable=True, index=True)   # → PlaylistBackupRevision.id
+    position         = Column(Integer, nullable=False, default=0)
+    jellyfin_item_id = Column(String, nullable=False)
+    track_name       = Column(String, nullable=False, default="")
+    artist_name      = Column(String, nullable=False, default="")
+    album_name       = Column(String, nullable=False, default="")
+
+
+class PlaylistBackupSettings(Base):
+    """
+    Singleton settings row (id=1) for the playlist backup scheduler.
+
+    auto_backup_enabled          — master switch for the scheduled job
+    auto_backup_interval_hours   — how often the job runs (default: 24 h)
+    last_auto_backup_at          — UTC timestamp of the most recent auto-run
+    """
+    __tablename__ = "playlist_backup_settings"
+    id                         = Column(Integer, primary_key=True)
+    auto_backup_enabled        = Column(Boolean, nullable=False, default=True)
+    auto_backup_interval_hours = Column(Integer, nullable=False, default=24)
+    last_auto_backup_at        = Column(DateTime, nullable=True)

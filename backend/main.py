@@ -28,6 +28,7 @@ from routers.auth import router as auth_router
 from routers.playlist_templates import router as playlist_templates_router
 from routers.user_playlists import router as user_playlists_router
 from routers.admin_defaults import router as admin_defaults_router
+from routers.playlist_backups import router as playlist_backups_router
 
 
 def _run_migrations():
@@ -134,6 +135,13 @@ def _run_migrations():
         # v8: jellyfin_playlist_id on user_playlists — already in DB for most installs
         # but missing from the ORM model declaration; adding here for clean new installs
         ("user_playlists", "jellyfin_playlist_id", "TEXT", "''"),
+        # Playlist backup feature — new tables are created by create_all() automatically;
+        # no ALTER TABLE migrations needed for brand-new tables.
+        # Revision schema upgrade: add max_revisions to playlist_backups and
+        # revision_id to playlist_backup_tracks (the old backup_id column is kept
+        # so existing rows aren't broken; it's just no longer written by new code).
+        ("playlist_backups",       "max_revisions", "INTEGER", "6"),
+        ("playlist_backup_tracks", "revision_id",   "INTEGER", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -156,6 +164,70 @@ def _run_migrations():
             conn.commit()
         except Exception:
             pass
+
+    # ── Playlist backup revision migration ────────────────────────────────────
+    # Earlier versions stored tracks directly against playlist_backups via
+    # playlist_backup_tracks.backup_id.  The new schema uses an intermediate
+    # playlist_backup_revisions table so we can keep multiple snapshots.
+    #
+    # Migration (idempotent):
+    #   For every PlaylistBackup row that has no child PlaylistBackupRevision yet,
+    #   create revision #1 using the existing track rows (matched via backup_id).
+    #   Then stamp each migrated track row with the new revision_id so the old
+    #   backup_id column becomes redundant (but is kept for zero-downtime).
+    with engine.connect() as conn:
+        try:
+            # Find backup IDs that have tracks but no revision yet
+            orphan_backups = conn.execute(text(
+                "SELECT DISTINCT pbt.backup_id FROM playlist_backup_tracks pbt "
+                "WHERE pbt.backup_id IS NOT NULL "
+                "  AND pbt.revision_id IS NULL "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM playlist_backup_revisions pbr "
+                "    WHERE pbr.backup_id = pbt.backup_id"
+                "  )"
+            )).fetchall()
+
+            for (backup_id,) in orphan_backups:
+                # Read the parent backup's metadata
+                backup_row = conn.execute(text(
+                    "SELECT jellyfin_playlist_name, created_at FROM playlist_backups WHERE id = :id"
+                ), {"id": backup_id}).fetchone()
+                if not backup_row:
+                    continue
+
+                track_count = conn.execute(text(
+                    "SELECT COUNT(*) FROM playlist_backup_tracks WHERE backup_id = :bid"
+                ), {"bid": backup_id}).scalar()
+
+                backed_up_at = backup_row[1] or "1970-01-01 00:00:00"
+
+                # Create revision #1
+                conn.execute(text(
+                    "INSERT INTO playlist_backup_revisions "
+                    "(backup_id, revision_number, track_count, backed_up_at, label) "
+                    "VALUES (:bid, 1, :tc, :bat, 'Migrated from previous version')"
+                ), {"bid": backup_id, "tc": track_count, "bat": backed_up_at})
+                conn.commit()
+
+                # Fetch the new revision id
+                rev_id = conn.execute(text(
+                    "SELECT id FROM playlist_backup_revisions "
+                    "WHERE backup_id = :bid AND revision_number = 1"
+                ), {"bid": backup_id}).scalar()
+
+                if rev_id:
+                    conn.execute(text(
+                        "UPDATE playlist_backup_tracks SET revision_id = :rid "
+                        "WHERE backup_id = :bid AND revision_id IS NULL"
+                    ), {"rid": rev_id, "bid": backup_id})
+                    conn.commit()
+
+        except Exception as exc:
+            import logging as _ml
+            _ml.getLogger(__name__).warning(
+                "Playlist backup revision migration skipped (may not be needed): %s", exc
+            )
 
 
 def _fix_various_artists_enrichment():
@@ -444,6 +516,7 @@ app.include_router(auth_router)           # /api/auth           — Jellyfin log
 app.include_router(playlist_templates_router)  # /api/playlist-templates — template + block CRUD
 app.include_router(user_playlists_router)      # /api/user-playlists     — user playlist CRUD + push
 app.include_router(admin_defaults_router)      # /api/admin/default-playlists — admin default playlist config
+app.include_router(playlist_backups_router)    # /api/playlist-backups   — playlist backup + restore
 
 
 @app.get("/api/health")

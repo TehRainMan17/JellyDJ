@@ -25,6 +25,9 @@ Registered jobs
                           tags, similar artists) from Last.fm and other adapters.
                           Default: every 24 hours. Configurable in Automation settings.
 
+  playlist_backup         Automatically back up all non-excluded Jellyfin playlists.
+                          Default: every 24 hours. Configurable in Playlist Backups settings.
+
 All intervals are re-read from the AutomationSettings database row on startup
 via reschedule_automation_jobs(), so changes made in the UI take effect after
 the next container restart (or immediately if the user saves settings, which
@@ -50,6 +53,7 @@ AUTO_DOWNLOAD_JOB_ID       = "auto_download"
 BILLBOARD_JOB_ID           = "billboard_refresh"
 ENRICHMENT_JOB_ID          = "enrichment"
 POPULARITY_CACHE_JOB_ID    = "popularity_cache_refresh"
+PLAYLIST_BACKUP_JOB_ID     = "playlist_backup"
 
 
 def _get_settings(db):
@@ -193,6 +197,13 @@ def _job_holiday_flags():
         log.error(f"Holiday flags refresh failed: {e}")
     finally:
         db.close()
+
+
+def _job_playlist_backup():
+    """Periodic job: back up all non-excluded Jellyfin playlists."""
+    from playlist_backup_scheduler import _run_auto_backup
+    from database import SessionLocal
+    asyncio.run(_run_auto_backup(SessionLocal))
 
 
 async def _run_user_playlist_autopush():
@@ -509,12 +520,22 @@ def start_scheduler(db_session_factory):
         replace_existing=True,
     )
 
+    # Playlist backup job — registered last; interval corrected from DB below
+    scheduler.add_job(
+        _job_playlist_backup,
+        trigger=IntervalTrigger(hours=24),
+        id=PLAYLIST_BACKUP_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+        name="Playlist auto-backup",
+    )
+
     scheduler.start()
 
     # Auto-download starts paused — reschedule_automation_jobs will enable it
     # only if auto_download_enabled=True is saved in the database
     scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (8 jobs registered, including user_playlist_autopush).")
+    log.info("Scheduler started (9 jobs registered, including user_playlist_autopush and playlist_backup).")
 
     # Run billboard sync immediately on first start if table is empty
     _run_billboard_if_empty()
@@ -524,6 +545,9 @@ def start_scheduler(db_session_factory):
     db = SessionLocal()
     try:
         reschedule_automation_jobs(db)
+        # Apply playlist backup settings from DB
+        from playlist_backup_scheduler import reschedule_backup_job
+        reschedule_backup_job(db)
     finally:
         db.close()
 

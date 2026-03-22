@@ -5,16 +5,17 @@
  * and the topbar. The Outlet inside Layout renders the active page.
  *
  * Route map:
- *   /login          → Login page (public)
- *   /               → redirect to /dashboard
- *   /dashboard      → system overview, user sync status, activity feed
- *   /playlists      → playlist generation controls and run history
- *   /discovery      → new album recommendation queue
- *   /settings       → indexer intervals, external API keys, webhook setup
- *   /connections    → Jellyfin + Lidarr connection credentials
- *   /insights       → listening statistics and charts
- *   /exclusions     → manual album exclusions
- *   /admin/users    → user management and default playlist configuration (admin only)
+ *   /login                    → Login page (public)
+ *   /                         → redirect to /dashboard
+ *   /dashboard                → system overview, user sync status, activity feed
+ *   /playlists                → playlist generation controls and run history
+ *   /discovery                → new album recommendation queue
+ *   /settings                 → indexer intervals, external API keys, webhook setup
+ *   /connections              → Jellyfin + Lidarr connection credentials
+ *   /insights                 → listening statistics and charts
+ *   /exclusions               → manual album exclusions
+ *   /admin/users              → user management and default playlist configuration (admin only)
+ *   /admin/playlist-backups   → playlist backup and restore (admin only)
  */
 
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
@@ -28,6 +29,7 @@ import Connections from './pages/Connections.jsx'
 import Insights from './pages/Insights.jsx'
 import AlbumExclusions from './pages/AlbumExclusions.jsx'
 import AdminUsers from './pages/AdminUsers.jsx'
+import PlaylistBackups from './pages/PlaylistBackups.jsx'
 import Login from './pages/Login.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
 import { _wireAuth } from './lib/api.js'
@@ -94,6 +96,7 @@ export default function App() {
           <Route path="connections" element={<RequireAdmin><Connections /></RequireAdmin>} />
           <Route path="settings"    element={<RequireAdmin><Settings /></RequireAdmin>} />
           <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
+          <Route path="admin/playlist-backups" element={<RequireAdmin><PlaylistBackups /></RequireAdmin>} />
         </Route>
       </Routes>
     </BrowserRouter>
