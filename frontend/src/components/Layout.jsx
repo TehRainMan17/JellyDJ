@@ -1,9 +1,10 @@
+
 import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, ListMusic, Telescope, Settings,
   Plug, BarChart2, Menu, X, ChevronRight, Ban, LogOut, User, UserCog,
-  DatabaseBackup,
+  DatabaseBackup, ArrowDownToLine,
 } from 'lucide-react'
 import logoUrl from '/logo-64.png'
 import { useAuth } from '../contexts/AuthContext.jsx'
@@ -14,6 +15,7 @@ const NAV = [
   { to: '/playlists',                icon: ListMusic,        label: 'Playlists'                          },
   { to: '/discovery',                icon: Telescope,        label: 'Discovery'                          },
   { to: '/insights',                 icon: BarChart2,        label: 'Insights'                           },
+  { to: '/import',                   icon: ArrowDownToLine,  label: 'Import'                               },
   { to: '/exclusions',               icon: Ban,              label: 'Exclusions',      adminOnly: true   },
   { to: '/admin/users',              icon: UserCog,          label: 'Users',           adminOnly: true   },
   { to: '/admin/playlist-backups',   icon: DatabaseBackup,   label: 'PL Backups',      adminOnly: true   },
@@ -25,6 +27,7 @@ const PAGE_LABELS = {
   dashboard: 'Dashboard', playlists: 'Playlists',
   discovery: 'Discovery', insights: 'Insights',
   connections: 'Connections', settings: 'Settings', exclusions: 'Exclusions',
+  import: 'Import',
   admin: 'Admin', users: 'User Management', 'playlist-backups': 'Playlist Backups',
 }
 

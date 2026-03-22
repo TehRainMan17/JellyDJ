@@ -1,3 +1,4 @@
+
 fastapi>=0.111.0,<0.112.0
 uvicorn[standard]>=0.30.0
 sqlalchemy>=2.0.0
@@ -20,3 +21,5 @@ numpy>=1.26.0
 pytest>=8.0.0
 # Auth Phase 1 — JWT issuance and verification
 python-jose[cryptography]>=3.3.0
+# Playlist Import — metadata fetch from Spotify/Tidal/YouTube Music without API keys
+yt-dlp>=2024.1.0

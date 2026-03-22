@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile backend/models.py backend/routers/playlist_import.py 2>&1 | head -20)",
+      "Bash(cd frontend:*)",
+      "Bash(cd F:/Docker/JellyDJ && docker compose up -d 2>&1 | head -50)",
+      "Bash(cd F:/Docker/JellyDJ && docker compose logs backend 2>&1 | tail -20)",
+      "Bash(cd F:/Docker/JellyDJ && docker compose exec backend python -c \"\nfrom database import SessionLocal\nfrom models import ImportAPIKey\ndb = SessionLocal\\(\\)\nkeys = db.query\\(ImportAPIKey\\).all\\(\\)\nprint\\(f'ImportAPIKey table exists with {len\\(keys\\)} records'\\)\nprint\\(f'Columns: {[c.name for c in ImportAPIKey.__table__.columns]}'\\)\ndb.close\\(\\)\n\")",
+      "Bash(cd F:/Docker/JellyDJ && docker compose restart backend && sleep 3)",
+      "Bash(cd F:/Docker/JellyDJ && sleep 3 && docker compose exec backend python -c \"\nfrom database import SessionLocal\nfrom models import ImportAPIKey\ndb = SessionLocal\\(\\)\nkeys = db.query\\(ImportAPIKey\\).all\\(\\)\nprint\\(f'✓ ImportAPIKey table exists'\\)\nprint\\(f'✓ Columns: {[c.name for c in ImportAPIKey.__table__.columns]}'\\)\ndb.close\\(\\)\n\")",
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:7879/api/health | python -m json.tool)",
+      "Bash(curl -s http://localhost:7879/ | grep -o \"PlaylistImport\\\\|/import\" | head -5)"
+    ]
+  }
+}

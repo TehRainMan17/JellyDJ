@@ -1,3 +1,4 @@
+
 /**
  * App — root router component.
  *
@@ -16,6 +17,7 @@
  *   /exclusions               → manual album exclusions
  *   /admin/users              → user management and default playlist configuration (admin only)
  *   /admin/playlist-backups   → playlist backup and restore (admin only)
+ *   /import                   → import playlists from Spotify / Tidal / YouTube Music
  */
 
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
@@ -31,6 +33,7 @@ import AlbumExclusions from './pages/AlbumExclusions.jsx'
 import AdminUsers from './pages/AdminUsers.jsx'
 import PlaylistBackups from './pages/PlaylistBackups.jsx'
 import Login from './pages/Login.jsx'
+import PlaylistImport from './pages/PlaylistImport.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
 import { _wireAuth } from './lib/api.js'
 
@@ -97,6 +100,7 @@ export default function App() {
           <Route path="settings"    element={<RequireAdmin><Settings /></RequireAdmin>} />
           <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
           <Route path="admin/playlist-backups" element={<RequireAdmin><PlaylistBackups /></RequireAdmin>} />
+          <Route path="import" element={<PlaylistImport />} />
         </Route>
       </Routes>
     </BrowserRouter>

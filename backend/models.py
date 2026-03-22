@@ -252,6 +252,15 @@ class LibraryTrack(Base):
     # v6: Jellyfin artist item ID
     jellyfin_artist_id = Column(String, nullable=True, index=True)
 
+    # Aliases used by playlist_import service
+    @property
+    def name(self):
+        return self.track_name
+
+    @property
+    def artist(self):
+        return self.artist_name
+
 
 class ArtistProfile(Base):
     """
@@ -665,3 +674,101 @@ class PlaylistBackupSettings(Base):
     auto_backup_enabled        = Column(Boolean, nullable=False, default=True)
     auto_backup_interval_hours = Column(Integer, nullable=False, default=24)
     last_auto_backup_at        = Column(DateTime, nullable=True)
+
+
+# ── Playlist Import feature ───────────────────────────────────────────────────
+
+class ImportedPlaylist(Base):
+    """
+    One row per playlist imported from an external platform (Spotify/Tidal/YT Music).
+
+    source_platform:  'spotify' | 'tidal' | 'youtube_music' | 'unknown'
+    source_url:       original URL stored for display; never used for outbound requests
+    name:             playlist title as returned by the scrape / yt-dlp
+    track_count:      total tracks in the source playlist
+    matched_count:    tracks found in local Jellyfin library
+    jellyfin_playlist_id: the Jellyfin playlist this maps to (set once created)
+    status:           'pending' | 'active' | 'error' | 'archived'
+    """
+    __tablename__ = "imported_playlists"
+    id                    = Column(Integer, primary_key=True, index=True)
+    owner_user_id         = Column(String, nullable=False, index=True)
+    source_platform       = Column(String, nullable=False, default="unknown")
+    source_url            = Column(String, nullable=False, default="")
+    source_id             = Column(String, nullable=False, default="", index=True)
+    name                  = Column(String, nullable=False, default="Imported Playlist")
+    description           = Column(Text, nullable=True)
+    track_count           = Column(Integer, nullable=False, default=0)
+    matched_count         = Column(Integer, nullable=False, default=0)
+    jellyfin_playlist_id  = Column(String, nullable=True)
+    status                = Column(String, nullable=False, default="pending")
+    created_at            = Column(DateTime, default=datetime.utcnow)
+    last_sync_at          = Column(DateTime, nullable=True)
+
+
+class ImportedPlaylistTrack(Base):
+    """
+    One row per track in an imported playlist.
+
+    match_status: 'matched' | 'missing' | 'skipped'
+    matched_item_id: LibraryTrack.jellyfin_item_id when matched
+    suggested_album / suggested_artist: best guess for Lidarr fetch
+    lidarr_requested: True once user has sent the album to Lidarr
+    added_to_playlist: True once the track exists in the Jellyfin playlist
+    """
+    __tablename__ = "imported_playlist_tracks"
+    id                  = Column(Integer, primary_key=True, index=True)
+    playlist_id         = Column(Integer, nullable=False, index=True)
+    position            = Column(Integer, nullable=False, default=0)
+    track_name          = Column(String, nullable=False, default="")
+    artist_name         = Column(String, nullable=False, default="")
+    album_name          = Column(String, nullable=False, default="")
+    duration_ms         = Column(Integer, nullable=True)
+    match_status        = Column(String, nullable=False, default="missing")
+    match_score         = Column(Float, nullable=True)
+    matched_item_id     = Column(String, nullable=True)
+    suggested_album     = Column(String, nullable=True)
+    suggested_artist    = Column(String, nullable=True)
+    lidarr_requested    = Column(Boolean, default=False)
+    added_to_playlist   = Column(Boolean, default=False)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    resolved_at         = Column(DateTime, nullable=True)
+
+
+class ImportAlbumSuggestion(Base):
+    """
+    Groups missing ImportedPlaylistTrack rows by the best single album to fetch
+    so that one Lidarr request fills as many gaps as possible.
+
+    coverage_count: how many tracks this album would resolve
+    lidarr_status: 'pending' | 'approved' | 'rejected' | 'downloading' | 'complete'
+    """
+    __tablename__ = "import_album_suggestions"
+    id               = Column(Integer, primary_key=True, index=True)
+    playlist_id      = Column(Integer, nullable=False, index=True)
+    artist_name      = Column(String, nullable=False, default="")
+    album_name       = Column(String, nullable=False, default="")
+    coverage_count   = Column(Integer, nullable=False, default=1)
+    lidarr_status    = Column(String, nullable=False, default="pending")
+    lidarr_queued_at = Column(DateTime, nullable=True)
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+
+class ImportAPIKey(Base):
+    """
+    Per-user API keys for the browser extension.
+
+    The full key is never stored — only a SHA-256 hash.
+    key_prefix stores the first 8 chars for masked display ("jdj_a3f2…").
+    One active key per user is the expected UX; the table allows multiple
+    so that reroll is atomic (new key created before old one is deactivated).
+    """
+    __tablename__ = "import_api_keys"
+    id           = Column(Integer, primary_key=True, index=True)
+    user_id      = Column(String, nullable=False, index=True)
+    key_hash     = Column(String, unique=True, nullable=False, index=True)
+    key_prefix   = Column(String, nullable=False, default="")
+    label        = Column(String, nullable=True)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    is_active    = Column(Boolean, nullable=False, default=True)

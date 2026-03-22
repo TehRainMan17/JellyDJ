@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "JellyDJ Playlist Importer",
+  "version": "1.0.0",
+  "description": "Send playlists from Spotify, Tidal, or YouTube Music directly to JellyDJ.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://open.spotify.com/*",
+    "https://tidal.com/*",
+    "https://listen.tidal.com/*",
+    "https://music.youtube.com/*",
+    "https://www.youtube.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://open.spotify.com/playlist/*",
+        "https://tidal.com/browse/playlist/*",
+        "https://listen.tidal.com/playlist/*",
+        "https://music.youtube.com/playlist*",
+        "https://www.youtube.com/playlist*"
+      ],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

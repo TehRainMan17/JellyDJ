@@ -1,3 +1,4 @@
+
 """
 JellyDJ Webhook receiver — v2.1
 
@@ -659,6 +660,22 @@ async def jellyfin_webhook(request: Request, db: Session = Depends(get_db)):
         elif "playbackstop" in raw_type:
             handle_stop(body, db)
             return {"ok": True, "event": "stop"}
+        elif "item" in raw_type and ("added" in raw_type or "new" in raw_type):
+            # New item indexed in Jellyfin — check if any imported playlists need updating
+            item_id = (
+                body.get("ItemId") or
+                body.get("Id") or
+                (body.get("Item") or {}).get("Id")
+            )
+            if item_id:
+                try:
+                    from services.playlist_import import on_jellyfin_item_added
+                    updated = await on_jellyfin_item_added(item_id, db)
+                    if updated:
+                        log.info("item.added: updated %d imported playlist(s) with new item %s", updated, item_id[:8])
+                except Exception as imp_exc:
+                    log.debug("item.added import handler skipped: %s", imp_exc)
+            return {"ok": True, "processed": True, "event": "item_added"}
         else:
             return {"ok": True, "processed": False, "reason": f"'{raw_type}' ignored"}
     except Exception as e:

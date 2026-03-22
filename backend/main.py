@@ -1,3 +1,4 @@
+
 """
 JellyDJ — FastAPI application entry point.
 
@@ -29,6 +30,7 @@ from routers.playlist_templates import router as playlist_templates_router
 from routers.user_playlists import router as user_playlists_router
 from routers.admin_defaults import router as admin_defaults_router
 from routers.playlist_backups import router as playlist_backups_router
+from routers.playlist_import import router as playlist_import_router
 
 
 def _run_migrations():
@@ -142,6 +144,15 @@ def _run_migrations():
         # so existing rows aren't broken; it's just no longer written by new code).
         ("playlist_backups",       "max_revisions", "INTEGER", "6"),
         ("playlist_backup_tracks", "revision_id",   "INTEGER", "NULL"),
+        # Playlist Import feature — new tables created by create_all(); no ALTER needed.
+        # New nullable columns on existing tables listed below:
+        ("imported_playlists",        "description",         "TEXT",     "NULL"),
+        ("imported_playlists",        "last_sync_at",        "DATETIME", "NULL"),
+        ("imported_playlist_tracks",  "match_score",         "REAL",     "NULL"),
+        ("imported_playlist_tracks",  "suggested_album",     "TEXT",     "NULL"),
+        ("imported_playlist_tracks",  "suggested_artist",    "TEXT",     "NULL"),
+        ("imported_playlist_tracks",  "resolved_at",         "DATETIME", "NULL"),
+        ("import_album_suggestions",  "lidarr_queued_at",    "DATETIME", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -517,6 +528,7 @@ app.include_router(playlist_templates_router)  # /api/playlist-templates — tem
 app.include_router(user_playlists_router)      # /api/user-playlists     — user playlist CRUD + push
 app.include_router(admin_defaults_router)      # /api/admin/default-playlists — admin default playlist config
 app.include_router(playlist_backups_router)    # /api/playlist-backups   — playlist backup + restore
+app.include_router(playlist_import_router)     # /api/import             — external playlist import
 
 
 @app.get("/api/health")
@@ -562,3 +574,4 @@ def _backfill_top_album_cache():
         pass
     finally:
         db.close()
+

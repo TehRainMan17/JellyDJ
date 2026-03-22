@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JellyDJ Importer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 300px;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    background: #0f0f11;
+    color: #e2e2e6;
+    padding: 16px;
+  }
+  h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  h1 span { font-size: 20px; }
+  label {
+    display: block;
+    font-size: 11px;
+    color: #a0a0aa;
+    margin-bottom: 4px;
+    margin-top: 12px;
+  }
+  input {
+    width: 100%;
+    padding: 8px 10px;
+    background: #1c1c20;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #e2e2e6;
+    font-size: 13px;
+    outline: none;
+  }
+  input:focus { border-color: #6366f1; }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    padding: 9px;
+    background: #6366f1;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: #4f46e5; }
+  .status {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #a0a0aa;
+    min-height: 18px;
+  }
+  .status.ok  { color: #4ade80; }
+  .status.err { color: #f87171; }
+  .divider {
+    margin: 14px 0 2px;
+    border-top: 1px solid #222;
+    font-size: 11px;
+    color: #555;
+    padding-top: 10px;
+  }
+  .hint {
+    font-size: 11px;
+    color: #666;
+    line-height: 1.5;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+<h1><span>🎵</span> JellyDJ Importer</h1>
+
+<label>JellyDJ URL</label>
+<input id="url" type="url" placeholder="http://192.168.1.x:7359" />
+
+<label>Access token <span style="color:#555">(from JellyDJ → Settings → API)</span></label>
+<input id="token" type="password" placeholder="paste your token here" />
+
+<button id="save">Save settings</button>
+<div class="status" id="status"></div>
+
+<div class="divider">How to use</div>
+<p class="hint">
+  Once saved, browse to any Spotify, Tidal, or YouTube Music playlist.
+  A <strong style="color:#6366f1">Send to JellyDJ</strong> button appears in the
+  bottom-right corner of the page. Click it to import.
+</p>
+
+<script>
+const urlInput   = document.getElementById('url');
+const tokenInput = document.getElementById('token');
+const saveBtn    = document.getElementById('save');
+const statusEl   = document.getElementById('status');
+
+// Load saved config
+chrome.runtime.sendMessage({ action: 'getConfig' }, (result) => {
+  if (result?.jellydjUrl)   urlInput.value   = result.jellydjUrl;
+  if (result?.jellydjToken) tokenInput.value = result.jellydjToken;
+});
+
+saveBtn.addEventListener('click', async () => {
+  const url   = urlInput.value.trim();
+  const token = tokenInput.value.trim();
+
+  if (!url) {
+    showStatus('URL is required.', 'err');
+    return;
+  }
+
+  // Validate by hitting the health endpoint
+  try {
+    const resp = await fetch(url.replace(/\/$/, '') + '/api/connections/jellyfin', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch (err) {
+    showStatus('Could not reach JellyDJ: ' + err.message, 'err');
+    return;
+  }
+
+  chrome.runtime.sendMessage({ action: 'saveConfig', url, token }, () => {
+    showStatus('Saved! Browse to a playlist to import it.', 'ok');
+  });
+});
+
+function showStatus(msg, type) {
+  statusEl.textContent = msg;
+  statusEl.className = 'status ' + (type || '');
+}
+</script>
+</body>
+</html>
