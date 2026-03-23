@@ -344,6 +344,7 @@ def get_artists(
     username: Optional[str] = Query(None),
     sort_by: str = Query("affinity_score"),
     order: str = Query("desc"),
+    search_filter: Optional[str] = Query(None, description="Filter by artist name (partial match)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
     db: Session = Depends(get_db),
@@ -352,139 +353,149 @@ def get_artists(
     uid = _resolve_user(user_id, username, db)
     _assert_can_view_user(uid, current_user)
 
-    q = db.query(ArtistProfile).filter_by(user_id=uid)
+    from sqlalchemy import func as sqlfunc
+    from models import LibraryTrack
+    import json as _json
 
-    from sqlalchemy import cast, Float as SAFloat, func as sqlfunc, text as satext
-
-    live_skips_q = (
-        db.query(
-            SkipPenalty.artist_name,
-            sqlfunc.sum(SkipPenalty.skip_count).label("skip_count"),
-            sqlfunc.sum(SkipPenalty.total_events).label("total_events"),
-        )
-        .filter(SkipPenalty.user_id == uid)
-        .filter(SkipPenalty.artist_name.isnot(None))
-        .group_by(SkipPenalty.artist_name)
-        .all()
+    # ── Base: every distinct artist in the library ───────────────────────────
+    # Pull artist_name + one jellyfin_artist_id per artist in a single pass.
+    lib_q = (
+        db.query(LibraryTrack.artist_name, LibraryTrack.jellyfin_artist_id)
+        .filter(LibraryTrack.artist_name.isnot(None))
+        .filter(LibraryTrack.artist_name != "")
     )
-    live_skip_map = {
+    if search_filter:
+        lib_q = lib_q.filter(LibraryTrack.artist_name.ilike(f"%{search_filter}%"))
+
+    artist_id_by_name: dict[str, str] = {}
+    all_artist_names: set[str] = set()
+    for r in lib_q.all():
+        all_artist_names.add(r.artist_name)
+        if r.jellyfin_artist_id and r.artist_name not in artist_id_by_name:
+            artist_id_by_name[r.artist_name] = r.jellyfin_artist_id
+
+    # ── ArtistProfile map for this user ─────────────────────────────────────
+    profile_rows = db.query(ArtistProfile).filter_by(user_id=uid).all()
+    profile_map: dict[str, ArtistProfile] = {r.artist_name: r for r in profile_rows}
+    profile_map_lower: dict[str, ArtistProfile] = {k.lower(): v for k, v in profile_map.items()}
+
+    # ── Live skip totals from SkipPenalty ───────────────────────────────────
+    live_skip_map: dict[str, dict] = {
         r.artist_name: {
-            "skip_count": int(r.skip_count or 0),
+            "skip_count":   int(r.skip_count or 0),
             "total_events": int(r.total_events or 0),
-            "skip_rate": (r.skip_count / r.total_events) if r.total_events else 0.0,
+            "skip_rate":    (r.skip_count / r.total_events) if r.total_events else 0.0,
         }
-        for r in live_skips_q
+        for r in (
+            db.query(
+                SkipPenalty.artist_name,
+                sqlfunc.sum(SkipPenalty.skip_count).label("skip_count"),
+                sqlfunc.sum(SkipPenalty.total_events).label("total_events"),
+            )
+            .filter(SkipPenalty.user_id == uid)
+            .filter(SkipPenalty.artist_name.isnot(None))
+            .filter(SkipPenalty.artist_name != "")
+            .group_by(SkipPenalty.artist_name)
+            .all()
+        )
     }
 
-    # Load enrichment data (ArtistEnrichment)
+    # ── Enrichment data ──────────────────────────────────────────────────────
     try:
         from models import ArtistEnrichment
-        import json as _json
-        enc_map = {
-            row.artist_name_lower: row
-            for row in db.query(ArtistEnrichment).all()
-        }
+        enc_map = {row.artist_name_lower: row for row in db.query(ArtistEnrichment).all()}
     except Exception:
         enc_map = {}
 
-    def _aord(raw_sql):
-        return satext(f"{raw_sql} DESC" if order == "desc" else f"{raw_sql} ASC")
-
-    if sort_by == "skip_rate":
-        total = q.count()
-        all_rows = q.order_by(satext("CAST(affinity_score AS REAL) DESC")).all()
-        all_rows.sort(
-            key=lambda r: live_skip_map.get(r.artist_name, {}).get("skip_rate", 0.0),
-            reverse=(order == "desc")
-        )
-        rows = all_rows[(page - 1) * page_size: page * page_size]
-    elif sort_by == "popularity_score":
-        # popularity lives in ArtistEnrichment — sort in Python
-        total = q.count()
-        all_rows = q.order_by(satext("CAST(affinity_score AS REAL) DESC")).all()
-        all_rows.sort(
-            key=lambda r: (enc_map.get(r.artist_name.lower()) and enc_map[r.artist_name.lower()].popularity_score) or 0.0,
-            reverse=(order == "desc")
-        )
-        rows = all_rows[(page - 1) * page_size: page * page_size]
-    else:
-        sql_map = {
-            "affinity_score": "CAST(affinity_score AS REAL)",
-            "total_plays":    "total_plays",
-            "artist_name":    "artist_name",
-            "replay_boost":   "replay_boost",
-        }
-        raw = sql_map.get(sort_by, "CAST(affinity_score AS REAL)")
-        q = q.order_by(_aord(raw))
-        total = q.count()
-        rows = q.offset((page - 1) * page_size).limit(page_size).all()
-
-    import json as _json
-
-    # Build artist_name → jellyfin_artist_id map from LibraryTrack so we can
-    # provide a direct deep-link to the Jellyfin artist profile page.
+    # ── Artist cooldowns ─────────────────────────────────────────────────────
     try:
-        from models import LibraryTrack
-        _artist_id_rows = (
-            db.query(LibraryTrack.artist_name, LibraryTrack.jellyfin_artist_id)
-            .filter(LibraryTrack.jellyfin_artist_id.isnot(None))
-            .distinct(LibraryTrack.artist_name)
-            .all()
-        )
-        artist_id_by_name: dict[str, str] = {
-            r.artist_name: r.jellyfin_artist_id
-            for r in _artist_id_rows
+        from models import ArtistCooldown as _ArtistCooldown
+        _now = datetime.utcnow()
+        artist_cooldown_map: dict[str, _ArtistCooldown] = {
+            acd.artist_name: acd
+            for acd in db.query(_ArtistCooldown).filter(
+                _ArtistCooldown.user_id == uid,
+                _ArtistCooldown.status == "active",
+                _ArtistCooldown.cooldown_until > _now,
+            ).all()
         }
     except Exception:
-        artist_id_by_name = {}
+        artist_cooldown_map = {}
 
     def _parse_related(raw):
-        """Return list of {name, match} dicts regardless of stored format."""
         if not raw:
             return []
         try:
             parsed = _json.loads(raw)
             if not parsed:
                 return []
-            # Already list of dicts
             if isinstance(parsed[0], dict):
                 return [{"name": item.get("name", ""), "match": item.get("match")} for item in parsed[:15]]
-            # List of strings
             return [{"name": str(item), "match": None} for item in parsed[:15]]
         except Exception:
             return []
 
+    # ── Merge: one dict per library artist ──────────────────────────────────
+    def _build_row(artist_name: str) -> dict:
+        p   = profile_map.get(artist_name) or profile_map_lower.get(artist_name.lower())
+        sk  = live_skip_map.get(artist_name) or live_skip_map.get(artist_name.lower(), {})
+        enc = enc_map.get(artist_name.lower())
+        acd = artist_cooldown_map.get(artist_name)
+        return {
+            "artist_name":         artist_name,
+            "jellyfin_artist_id":  artist_id_by_name.get(artist_name, ""),
+            "affinity_score":      float(p.affinity_score) if p else 0.0,
+            "total_plays":         p.total_plays         if p else 0,
+            "total_tracks_played": p.total_tracks_played if p else 0,
+            "total_skips":         sk.get("skip_count", 0),
+            "total_events":        sk.get("total_events", 0),
+            "skip_rate":           round(sk.get("skip_rate", 0.0), 4),
+            "has_favorite":        p.has_favorite   if p else False,
+            "primary_genre":       p.primary_genre  if p else "",
+            "replay_boost":        round(p.replay_boost or 0.0, 2) if p else 0.0,
+            "related_artists":     _parse_related(p.related_artists) if p else [],
+            "tags":                _json.loads(p.tags) if (p and p.tags) else [],
+            "popularity_score":    enc.popularity_score  if enc else None,
+            "trend_direction":     enc.trend_direction   if enc else None,
+            "global_listeners":    enc.global_listeners  if enc else None,
+            "on_cooldown":         acd is not None,
+            "cooldown_until":      acd.cooldown_until.isoformat() if acd else None,
+            "cooldown_count":      acd.cooldown_count if acd else 0,
+            # True = in library but no listen history / profile built yet
+            "_no_profile":         p is None,
+        }
+
+    all_artists = [_build_row(n) for n in all_artist_names]
+    total = len(all_artists)
+
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    rev = (order == "desc")
+    if sort_by == "artist_name":
+        all_artists.sort(key=lambda a: a["artist_name"].lower(), reverse=rev)
+    elif sort_by == "total_plays":
+        all_artists.sort(key=lambda a: a["total_plays"], reverse=rev)
+    elif sort_by == "replay_boost":
+        all_artists.sort(key=lambda a: a["replay_boost"], reverse=rev)
+    elif sort_by == "skip_rate":
+        all_artists.sort(key=lambda a: a["skip_rate"], reverse=rev)
+    elif sort_by == "popularity_score":
+        all_artists.sort(key=lambda a: a["popularity_score"] or 0.0, reverse=rev)
+    else:
+        # affinity_score default: artists with play data float to the top,
+        # untracked artists (affinity=0) sink to the bottom.
+        all_artists.sort(
+            key=lambda a: (a["total_plays"] > 0, a["affinity_score"]),
+            reverse=True,
+        )
+
+    # ── Paginate ─────────────────────────────────────────────────────────────
+    start = (page - 1) * page_size
     return {
-        "total": total,
-        "page": page,
+        "total":     total,
+        "page":      page,
         "page_size": page_size,
-        "pages": max(1, (total + page_size - 1) // page_size),
-        "artists": [
-            {
-                "artist_name":          r.artist_name,
-                "jellyfin_artist_id":   artist_id_by_name.get(r.artist_name, ""),
-                "affinity_score":       float(r.affinity_score),
-                "total_plays":          r.total_plays,
-                "total_tracks_played":  r.total_tracks_played,
-                "total_skips":          live_skip_map.get(r.artist_name, {}).get("skip_count", 0),
-                "total_events":         live_skip_map.get(r.artist_name, {}).get("total_events", 0),
-                "skip_rate":            live_skip_map.get(r.artist_name, {}).get("skip_rate", 0.0),
-                "has_favorite":         r.has_favorite,
-                "primary_genre":        r.primary_genre,
-                # Replay signal
-                "replay_boost":         round(r.replay_boost or 0.0, 2),
-                # Enrichment
-                "related_artists":      _parse_related(r.related_artists),
-                "tags":                 _json.loads(r.tags) if r.tags else [],
-                "popularity_score":     (enc_map.get(r.artist_name.lower()) and
-                                         enc_map[r.artist_name.lower()].popularity_score),
-                "trend_direction":      (enc_map.get(r.artist_name.lower()) and
-                                         enc_map[r.artist_name.lower()].trend_direction),
-                "global_listeners":     (enc_map.get(r.artist_name.lower()) and
-                                         enc_map[r.artist_name.lower()].global_listeners),
-            }
-            for r in rows
-        ],
+        "pages":     max(1, (total + page_size - 1) // page_size),
+        "artists":   all_artists[start: start + page_size],
     }
 
 
@@ -557,6 +568,90 @@ def get_cooldowns(
             "permanent": db.query(TrackCooldown).filter_by(user_id=uid, status="permanent").count(),
         }
     }
+
+
+@router.get("/artist-cooldowns")
+def get_artist_cooldowns(
+    user_id: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
+    status: str = Query("active", description="all|active|expired"),
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    List artist-level skip timeouts for a user.
+
+    When a user skips enough distinct tracks by an artist within a short window,
+    the artist is timed out and excluded from all playlist generation until
+    cooldown_until.  This endpoint shows current and past timeouts.
+    """
+    from models import ArtistCooldown
+
+    uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
+    now = datetime.utcnow()
+
+    q = db.query(ArtistCooldown).filter_by(user_id=uid)
+    if status != "all":
+        q = q.filter(ArtistCooldown.status == status)
+
+    rows = q.order_by(ArtistCooldown.triggered_at.desc()).limit(200).all()
+
+    return {
+        "cooldowns": [
+            {
+                "artist_name":           r.artist_name,
+                "status":                r.status,
+                "cooldown_count":        r.cooldown_count,
+                "skip_count_at_trigger": r.skip_count_at_trigger,
+                "cooldown_until":        r.cooldown_until.isoformat() if r.cooldown_until else None,
+                "days_remaining":        max(0, round((r.cooldown_until - now).total_seconds() / 86400, 1))
+                    if r.cooldown_until and r.status == "active" and r.cooldown_until > now else 0,
+                "triggered_at":          r.triggered_at.isoformat() if r.triggered_at else None,
+                "expired_at":            r.expired_at.isoformat() if r.expired_at else None,
+            }
+            for r in rows
+        ],
+        "summary": {
+            "active":  db.query(ArtistCooldown).filter_by(user_id=uid, status="active").count(),
+            "expired": db.query(ArtistCooldown).filter_by(user_id=uid, status="expired").count(),
+        }
+    }
+
+
+@router.delete("/artist-cooldowns/{artist_name}")
+def clear_artist_cooldown(
+    artist_name: str,
+    user_id: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually lift an active artist timeout.  Use this if the timeout was
+    triggered incorrectly or you want to re-enable an artist immediately.
+    """
+    from models import ArtistCooldown
+
+    uid = _resolve_user(user_id, username, db)
+    _assert_can_view_user(uid, current_user)
+    now = datetime.utcnow()
+
+    rows = db.query(ArtistCooldown).filter_by(
+        user_id=uid,
+        artist_name=artist_name,
+        status="active",
+    ).all()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No active cooldown found for '{artist_name}'")
+
+    for r in rows:
+        r.status = "expired"
+        r.expired_at = now
+
+    db.commit()
+    return {"ok": True, "artist_name": artist_name, "cooldowns_cleared": len(rows)}
 
 
 @router.get("/replay-signals")

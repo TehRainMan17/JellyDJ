@@ -470,13 +470,13 @@ function UserRow({ user, onDeleted }) {
       {/* Avatar */}
       <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
         style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
-        {user.username[0]?.toUpperCase()}
+        {(user.jellyfin_username || user.jellydj_username || '?')[0]?.toUpperCase()}
       </div>
 
       {/* Name + meta */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
-          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{user.username}</span>
+          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{user.jellyfin_username || user.jellydj_username || 'Unknown'}</span>
           {user.is_admin && (
             <span className="flex items-center gap-0.5 text-[10px] font-semibold" style={{ color: 'var(--accent)' }}>
               <ShieldCheck size={10} /> Admin

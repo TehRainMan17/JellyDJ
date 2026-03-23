@@ -85,6 +85,51 @@ def get_excluded_item_ids(db: Session) -> frozenset:
         return frozenset()
 
 
+def get_artist_cooled_down_ids(db: Session, user_id: str) -> frozenset:
+    """
+    Return a frozenset of jellyfin_item_ids whose artist has an active
+    artist-level cooldown for this user.
+
+    Called once per playlist generation so that all block executors share the
+    same pre-computed exclusion set, avoiding repeated queries per block.
+    """
+    try:
+        from models import ArtistCooldown, LibraryTrack
+        from datetime import datetime as _dt
+
+        now = _dt.utcnow()
+        cooled = (
+            db.query(ArtistCooldown.artist_name)
+            .filter(
+                ArtistCooldown.user_id == user_id,
+                ArtistCooldown.status == "active",
+                ArtistCooldown.cooldown_until > now,
+            )
+            .all()
+        )
+        if not cooled:
+            return frozenset()
+
+        artist_names = [r.artist_name for r in cooled]
+        rows = (
+            db.query(LibraryTrack.jellyfin_item_id)
+            .filter(
+                LibraryTrack.artist_name.in_(artist_names),
+                LibraryTrack.missing_since.is_(None),
+            )
+            .all()
+        )
+        frozen = frozenset(r.jellyfin_item_id for r in rows)
+        log.debug(
+            f"Artist cooldown filter: {len(artist_names)} artist(s) on timeout → "
+            f"{len(frozen)} track IDs blocked for user {user_id[:8]}"
+        )
+        return frozen
+    except Exception as _e:
+        log.warning(f"Failed to load artist-cooldown item IDs: {_e}")
+        return frozenset()
+
+
 def get_holiday_excluded_ids(db: Session) -> frozenset:
     """
     Return the frozenset of jellyfin_item_ids that are currently out-of-season

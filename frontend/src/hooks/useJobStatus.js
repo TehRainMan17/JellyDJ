@@ -30,7 +30,7 @@
  *     so there are no "stuck running" states from partial responses.
  */
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { apiFetch } from '../lib/api'
+import { apiFetch, hasToken } from '../lib/api'
 
 const URLS = {
   index:    '/api/indexer/job-status',
@@ -72,6 +72,13 @@ export function useJobStatus(onComplete) {
   const poll = useCallback(async () => {
     let anyRunning = false
     let anyRecentlyFinished = false
+
+    // Skip the poll entirely when there's no auth token — avoids 403 log
+    // spam on the backend from unauthenticated requests.
+    if (!hasToken()) {
+      timerRef.current = setTimeout(() => pollRef.current?.(), INTERVAL_IDLE_MS)
+      return
+    }
 
     try {
       const results = await Promise.allSettled(

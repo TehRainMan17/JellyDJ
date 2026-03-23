@@ -203,7 +203,7 @@ def _job_playlist_backup():
     """Periodic job: back up all non-excluded Jellyfin playlists."""
     from playlist_backup_scheduler import _run_auto_backup
     from database import SessionLocal
-    asyncio.run(_run_auto_backup(SessionLocal))
+    _run_auto_backup(SessionLocal)
 
 
 async def _run_user_playlist_autopush():

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/release-v1.0.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.0.0" /></a>
+  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/release-v1.2.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.2.0" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/stargazers"><img src="https://img.shields.io/github/stars/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=5be6f5&labelColor=090b22&logoColor=5be6f5" alt="Stars" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/network/members"><img src="https://img.shields.io/github/forks/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=a28ffb&labelColor=090b22&logoColor=a28ffb" alt="Forks" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/issues"><img src="https://img.shields.io/github/issues/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=f87171&labelColor=090b22&logoColor=f87171" alt="Issues" /></a>
@@ -14,7 +14,7 @@
 
 <p align="center">
   <strong>A self-hosted music recommendation engine that turns your static Jellyfin library into a living, breathing music ecosystem.</strong><br/>
-  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration
+  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration &nbsp;·&nbsp; Playlist import &nbsp;·&nbsp; Playlist backups
 </p>
 
 <br/>
@@ -155,6 +155,10 @@ This is early days on this project and, as such, large portions are unfinished, 
 | 📊 | **Insights** | Full score breakdowns, genre affinities, top artists, skip analysis, and listening stats per user |
 | 🌌 | **Music Universe Map** | Interactive zoom-driven graph of your taste — genres, artists, connections, skip signals, drift, and track orbits |
 | 🎸 | **Multi-Source Enrichment** | Spotify, Last.fm, MusicBrainz, Billboard — layered signals, no single point of failure |
+| 📥 | **Playlist Import** | Import any Spotify, Tidal, or YouTube Music playlist — JellyDJ matches tracks to your library and flags missing ones for Lidarr |
+| 💾 | **Playlist Backups** | Rolling revision history for every JellyDJ playlist — browse, diff, and restore any prior version with one click |
+| 🧩 | **Browser Extension** | Clip a Spotify or YouTube Music playlist URL directly from your browser and send it to JellyDJ for import |
+| ⏱️ | **Artist Timeouts** | Skip 5+ songs from the same artist in 2 days and they're benched for a week — escalating to 14d and 30d on repeat offences |
 | 🏠 | **Truly Self-Hosted** | No cloud, no accounts, no tracking. Your data stays on your hardware |
 
 ---
@@ -194,6 +198,27 @@ This is early days on this project and, as such, large portions are unfinished, 
 
 <p align="center">
   <img src=".github/images/shot-settings.png" alt="Settings" width="50%" />
+</p>
+
+### Playlist Import
+*Paste a Spotify, Tidal, or YouTube Music playlist URL — JellyDJ matches tracks to your library and surfaces missing ones*
+
+<p align="center">
+  <img src=".github/images/screenshot-ImportPlaylist.PNG" alt="Playlist Import" width="100%" />
+</p>
+
+### Playlist Backups
+*Every playlist change is versioned — browse the full revision history and restore any prior snapshot*
+
+<p align="center">
+  <img src=".github/images/screenshot-PlaylistBackup.PNG" alt="Playlist Backups" width="100%" />
+</p>
+
+### Browser Extension
+*Clip a playlist URL from Spotify or YouTube Music and send it straight to JellyDJ for import*
+
+<p align="center">
+  <img src=".github/images/screenshot-ChromeExtension.PNG" alt="JellyDJ Browser Extension" width="40%" />
 </p>
 
 ---
@@ -272,6 +297,38 @@ Which would translate to: "Give me songs I love that I haven't been hammering la
 ### Playlist Templates
 
 Pre-built playlist templates are available for common use cases (*For You*, *New For You*, *Most Played*, *Recently Played*, *I Remember That Song*). You can use these as-is or clone and customize them as a starting point.
+
+---
+
+## 📥 Playlist Import
+
+JellyDJ can import playlists from **Spotify**, **Tidal**, and **YouTube Music** directly into your Jellyfin library. Paste a playlist URL on the **Import** page and JellyDJ will:
+
+1. Fetch the playlist tracks from the source service
+2. Match each track against your local library by title and artist
+3. Create a Jellyfin playlist with the matched songs
+4. Flag any missing tracks so you can send them to Lidarr for download
+
+### Browser Extension
+
+The **JellyDJ Browser Extension** lets you clip a playlist from Spotify or YouTube Music without leaving your browser — hit the extension button on any playlist page, confirm the import, and JellyDJ handles the rest. No copy-pasting URLs required.
+
+The extension communicates with your self-hosted JellyDJ instance directly. You configure your server URL and a personal API key (generated in **Settings → API Keys**) once, and it works from then on.
+
+---
+
+## 💾 Playlist Backups
+
+JellyDJ automatically keeps a rolling revision history for every playlist it manages. Every time a playlist is regenerated, a snapshot of its track list is saved.
+
+From the **PL Backups** page you can:
+
+- **Browse** the full version history for any playlist
+- **View** exactly which tracks were in each revision and when it was generated
+- **Restore** any prior version to Jellyfin with one click
+- **Delete** all stored backups for a playlist to free up space
+
+Each backup entry shows the track count and timestamp, making it easy to spot when a playlist changed and roll back if a regeneration produced unexpected results.
 
 ---
 

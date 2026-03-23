@@ -359,6 +359,18 @@ def _write_event(db: Session, p: dict, completion: float, method: str, is_skip: 
             except Exception as ce:
                 log.warning(f"  Cooldown check failed: {ce}")
 
+            # Artist-level timeout: if the user skips enough distinct tracks
+            # by the same artist within a short window, mute the whole artist.
+            try:
+                from services.enrichment import check_and_apply_artist_cooldown
+                check_and_apply_artist_cooldown(
+                    db=db,
+                    user_id=p["user_id"],
+                    artist_name=p["artist_name"],
+                )
+            except Exception as ae:
+                log.warning(f"  Artist cooldown check failed: {ae}")
+
         db.commit()
 
         outcome = "SKIP" if is_skip else "PLAYED"

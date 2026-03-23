@@ -384,6 +384,13 @@ function RevisionHistory({ backup, onUpdated }) {
     finally { setLoading(false) }
   }
 
+  // Reload the revision list whenever a new backup is created for this playlist
+  // (detected via revision_count changing). Only fires if the panel is already
+  // open and has previously loaded — avoids a double-fetch on initial expand.
+  useEffect(() => {
+    if (open && revisions !== null) load()
+  }, [backup.revision_count]) // eslint-disable-line react-hooks/exhaustive-deps
+
   function handleToggle() {
     const next = !open
     setOpen(next)

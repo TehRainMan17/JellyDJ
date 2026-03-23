@@ -38,16 +38,74 @@ _VARIOUS_ARTISTS = {
     "multiple artists", "assorted artists", "unknown artist", "unknown",
 }
 
+import re as _re
+
+# Separators that indicate AlbumArtist is "Artist1 [sep] Artist2" rather than
+# a single artist whose name contains the separator (e.g. "Earth, Wind & Fire").
+# We only consider AlbumArtist a collaboration when Artists[0] is a clean prefix.
+_COLLAB_SEP_RE = _re.compile(
+    r'^\s*(?:[,+&/]|\s+(?:feat\.?|ft\.?|featuring|with|x|vs\.?|and)\s+)',
+    _re.IGNORECASE,
+)
+
+
+def _is_collab_suffix(album_artist: str, primary: str) -> bool:
+    """
+    Return True if album_artist looks like "primary [separator] someone_else".
+
+    Differentiates:
+      "Lady Gaga & Bradley Cooper"  (primary="Lady Gaga")  → True
+      "Simon & Garfunkel"           (primary="Simon & Garfunkel") → False
+      "Earth, Wind & Fire"          (primary="Earth, Wind & Fire") → False
+
+    The trick: if primary == album_artist (same band name stored in both fields)
+    the suffix is empty → False.  Collaboration tracks have a shorter primary.
+    """
+    if not primary or not album_artist:
+        return False
+    la, lp = album_artist.lower(), primary.lower()
+    if not la.startswith(lp):
+        return False
+    suffix = album_artist[len(primary):]
+    if not suffix:
+        return False  # identical — single artist
+    return bool(_COLLAB_SEP_RE.match(suffix))
+
+
 def _resolve_track_artist(item: dict) -> str:
-    """Return the specific track artist, not the compilation album artist."""
+    """
+    Return the primary track artist, avoiding compilation and collaboration strings.
+
+    Priority:
+    1. If AlbumArtist is "Various Artists", use the first real entry in Artists[].
+    2. If AlbumArtist is "Artist1 & Artist2" style (collaboration) and Artists[0]
+       is the primary participant, return Artists[0] so tracks group under the
+       main artist rather than the collaboration credit.
+       Example: AlbumArtist="Lady Gaga & Bradley Cooper", Artists=["Lady Gaga",
+       "Bradley Cooper"] → returns "Lady Gaga".
+    3. Otherwise return AlbumArtist (the normal case for solo and band albums).
+    """
     album_artist = (item.get("AlbumArtist") or "").strip()
     track_artists = item.get("Artists") or []
-    if album_artist and album_artist.lower() not in _VARIOUS_ARTISTS:
-        return album_artist
-    real = [a for a in track_artists if a.strip().lower() not in _VARIOUS_ARTISTS]
-    if real:
-        return real[0]
-    return track_artists[0] if track_artists else album_artist
+
+    # Step 1: Various Artists compilation fallback
+    if album_artist.lower() in _VARIOUS_ARTISTS:
+        real = [a for a in track_artists if a.strip().lower() not in _VARIOUS_ARTISTS]
+        if real:
+            return real[0]
+        return track_artists[0] if track_artists else album_artist
+
+    if not album_artist:
+        return track_artists[0].strip() if track_artists else ""
+
+    # Step 2: Collaboration detection — prefer Artists[0] when AlbumArtist is
+    # clearly "Primary + Other" and Artists[0] is the primary participant.
+    if track_artists:
+        primary = track_artists[0].strip()
+        if primary and _is_collab_suffix(album_artist, primary):
+            return primary
+
+    return album_artist
 
 
 log = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ import {
   ChevronUp, ChevronDown, ChevronsUpDown, Star, Loader2,
   AlertCircle, Play, SkipForward, Heart, Snowflake, Zap,
   Clock, Globe, RefreshCw, ThumbsDown, Info, Flame, Activity,
-  ExternalLink,
+  ExternalLink, Search, X,
 } from 'lucide-react'
 import MusicUniverseMap from '../components/MusicUniverseMap.jsx'
 import { useJellyfinUrl } from '../hooks/useJellyfinUrl.js'
@@ -1097,13 +1097,14 @@ const ARTIST_COLUMNS = [
   { key: 'primary_genre',    label: 'Genre',        default: true,  hint: 'Primary genre tag for this artist.' },
   { key: 'trend_direction',  label: 'Trend',        default: true,  hint: 'Whether your listening of this artist is rising, stable, or falling.' },
   { key: 'has_favorite',     label: 'Fav',          default: true,  hint: 'Whether you have a favorited track by this artist.' },
+  { key: 'on_cooldown',      label: 'Timeout',      default: true,  hint: 'Artist is on a skip-triggered timeout and excluded from all playlists until the date shown.' },
 ]
 
 const ARTIST_DEFAULT_VISIBLE = new Set(
   ARTIST_COLUMNS.filter(c => c.always || c.default).map(c => c.key)
 )
 
-const ARTIST_COLS_STORAGE_KEY = 'jellydj_insights_artist_cols_v1'
+const ARTIST_COLS_STORAGE_KEY = 'jellydj_insights_artist_cols_v2'
 
 function loadSavedArtistCols() {
   try {
@@ -1186,23 +1187,38 @@ function ArtistTable({ userId }) {
   const [page, setPage] = useState(1)
   const [expandedRow, setExpandedRow] = useState(null)
   const [visibleCols, setVisibleCols] = useState(() => loadSavedArtistCols())
+  const [searchInput, setSearchInput] = useState('')
+  const [searchFilter, setSearchFilter] = useState('')
 
   const { buildItemUrl, buildSearchUrl } = useJellyfinUrl()
 
   const acol = (key) => visibleCols.has(key)
 
-  const doFetch = (uid, sb, ord, pg) => {
+  const doFetch = (uid, sb, ord, pg, sf) => {
     if (!uid) return
     setLoading(true)
     const params = new URLSearchParams({ user_id: uid, sort_by: sb, order: ord, page: pg, page_size: 50 })
+    if (sf) params.set('search_filter', sf)
     api.get(`/api/insights/artists?${params}`)
       .then(d => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
   }
 
   useEffect(() => {
-    doFetch(userId, sort, order, page)
-  }, [userId, sort, order, page])
+    doFetch(userId, sort, order, page, searchFilter)
+  }, [userId, sort, order, page, searchFilter])
+
+  const handleSearch = (e) => {
+    e.preventDefault()
+    setSearchFilter(searchInput)
+    setPage(1)
+  }
+
+  const clearSearch = () => {
+    setSearchFilter('')
+    setSearchInput('')
+    setPage(1)
+  }
 
   const handleSort = (field) => {
     const newOrder = sort === field ? (order === 'desc' ? 'asc' : 'desc') : 'desc'
@@ -1213,12 +1229,44 @@ function ArtistTable({ userId }) {
 
   return (
     <div>
-      <div className="flex justify-between items-center mb-4">
-        {data && <span className="text-xs text-[var(--text-secondary)]">{data.total} artists tracked</span>}
-        <div className="ml-auto">
+      <div className="flex flex-wrap justify-between items-center gap-2 mb-4">
+        {data && <span className="text-xs text-[var(--text-secondary)]">{data.total} artists in library</span>}
+        <div className="flex items-center gap-2 ml-auto flex-wrap">
+          {/* Artist search */}
+          <form onSubmit={handleSearch} className="flex items-center gap-1">
+            <div className="relative">
+              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" />
+              <input
+                type="text"
+                value={searchInput}
+                onChange={e => setSearchInput(e.target.value)}
+                placeholder="Search artist…"
+                className="pl-6 pr-2 py-1.5 text-xs bg-[var(--bg-overlay)] border border-[var(--border)]
+                           rounded-lg text-[var(--text-primary)] placeholder-[var(--text-secondary)]
+                           focus:outline-none focus:border-[var(--accent)] w-36"
+              />
+            </div>
+            <button type="submit"
+              className="px-2 py-1.5 text-xs bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-opacity">
+              Find
+            </button>
+            {searchFilter && (
+              <button type="button" onClick={clearSearch}
+                className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                title="Clear search">
+                <X size={12} />
+              </button>
+            )}
+          </form>
           <ArtistColumnPicker visible={visibleCols} onChange={cols => { setVisibleCols(cols); saveArtistCols(cols) }} />
         </div>
       </div>
+      {searchFilter && (
+        <div className="mb-3 text-xs text-[var(--text-secondary)]">
+          Showing results for <span className="text-[var(--text-primary)] font-medium">"{searchFilter}"</span>
+          {data && ` — ${data.total} match${data.total !== 1 ? 'es' : ''}`}
+        </div>
+      )}
       <div className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left">
@@ -1268,6 +1316,12 @@ function ArtistTable({ userId }) {
                 {acol('has_favorite') && (
                   <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Fav</th>
                 )}
+                {acol('on_cooldown') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider"
+                    title="Artist skip timeout — excluded from all playlists while active">
+                    Timeout
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -1281,7 +1335,7 @@ function ArtistTable({ userId }) {
                   <tr
                     key={a.artist_name}
                     onClick={() => setExpandedRow(expandedRow === a.artist_name ? null : a.artist_name)}
-                    className="border-b border-[var(--bg-overlay)] hover:bg-[var(--bg-surface)] cursor-pointer transition-colors"
+                    className={`border-b border-[var(--bg-overlay)] hover:bg-[var(--bg-surface)] cursor-pointer transition-colors${a._no_profile ? ' opacity-75' : ''}`}
                   >
                     <td className="px-4 py-2.5 text-[10px] text-[var(--text-secondary)]">{(page - 1) * 50 + i + 1}</td>
                     <td className="px-2 py-2.5">
@@ -1289,6 +1343,7 @@ function ArtistTable({ userId }) {
                         {a.has_favorite && <Heart size={10} className="text-[var(--danger)] flex-shrink-0" />}
                         <span className="text-xs font-medium text-[var(--text-primary)]">{a.artist_name}</span>
                         {(a.replay_boost || 0) > 0 && <Zap size={9} className="text-yellow-400 flex-shrink-0" title="Replay boost active" />}
+                        {a._no_profile && <span className="text-[9px] px-1 py-0.5 rounded bg-yellow-900/40 text-yellow-400 font-medium leading-none flex-shrink-0" title="No listen history — affinity score will build after plays are recorded.">not tracked</span>}
                       </div>
                     </td>
                     <td className="px-2 py-2.5">
@@ -1350,6 +1405,17 @@ function ArtistTable({ userId }) {
                         {a.has_favorite ? <Heart size={11} className="text-[var(--danger)]" /> : <span className="text-[var(--border)]">—</span>}
                       </td>
                     )}
+                    {acol('on_cooldown') && (
+                      <td className="px-2 py-2.5 hidden md:table-cell text-xs">
+                        {a.on_cooldown
+                          ? <span className="flex items-center gap-1 text-orange-400"
+                              title={`Timed out until ${fmtDate(a.cooldown_until)} — skipped too many songs recently`}>
+                              <Clock size={10} />
+                              {a.cooldown_until ? new Date(a.cooldown_until + 'Z').toLocaleDateString() : 'Active'}
+                            </span>
+                          : <span className="text-[var(--border)]">—</span>}
+                      </td>
+                    )}
                   </tr>
 
                   {/* Artist expanded row */}
@@ -1378,7 +1444,32 @@ function ArtistTable({ userId }) {
                               value={a.trend_direction || 'Unknown'}
                               color={a.trend_direction === 'rising' ? 'text-green-400' : a.trend_direction === 'falling' ? 'text-[var(--danger)]' : 'text-[var(--text-secondary)]'} />
                             <StatPill label="Primary genre" value={a.primary_genre || '—'} />
+                            {a.on_cooldown && (
+                              <StatPill label="Skip timeout"
+                                value={`Until ${a.cooldown_until ? new Date(a.cooldown_until + 'Z').toLocaleDateString() : '?'} (cycle #${a.cooldown_count})`}
+                                color="text-orange-400" />
+                            )}
                           </div>
+                          {a._no_profile && (
+                            <div className="flex items-start gap-2 p-2.5 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-xs text-yellow-300">
+                              <span className="flex-shrink-0 mt-0.5">⚠</span>
+                              <div>
+                                <span className="font-medium">Not yet tracked</span> — no listen history recorded for this artist.
+                                Their affinity score will build automatically as you play or skip their songs.
+                                {a.total_skips > 0 && " Skip penalties from this session are already active."}
+                              </div>
+                            </div>
+                          )}
+                          {a.on_cooldown && (
+                            <div className="flex items-start gap-2 p-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-xs text-orange-300">
+                              <Clock size={13} className="flex-shrink-0 mt-0.5" />
+                              <div>
+                                <span className="font-medium">Artist timed out</span> — excluded from all playlists until {fmtDate(a.cooldown_until)}.
+                                This was triggered by skipping too many songs by this artist in a short period.
+                                Timeout cycle #{a.cooldown_count} (escalating: 7d → 14d → 30d).
+                              </div>
+                            </div>
+                          )}
 
                           {a.tags && a.tags.length > 0 && (
                             <div>

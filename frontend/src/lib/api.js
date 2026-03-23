@@ -86,6 +86,11 @@ export function setApiToken(token) {
   // Exported for interface compatibility only.
 }
 
+/** Returns true when an access token is available for API calls. */
+export function hasToken() {
+  return !!_getToken()
+}
+
 /**
  * Drop-in fetch replacement that injects Authorization: Bearer.
  * Use for raw fetch calls that need auth but don't use the api.get/post helpers.

@@ -289,17 +289,17 @@ def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Dep
     # Get JellyDJ-managed users
     managed = {u.jellyfin_user_id: u for u in db.query(ManagedUser).all()}
 
-    # Return all Jellyfin users with their JellyDJ status
+    # Return only activated JellyDJ users (those with a ManagedUser record)
     result = []
-    for jf_id, jf_name in jellyfin_users.items():
-        managed_user = managed.get(jf_id)
+    for jf_id, mu in managed.items():
+        jf_name = jellyfin_users.get(jf_id, mu.username or jf_id)
         result.append({
             "jellyfin_user_id": jf_id,
             "jellyfin_username": jf_name,
-            "jellydj_username": managed_user.username if managed_user else None,
-            "has_activated": managed_user.has_activated if managed_user else False,
-            "is_admin": managed_user.is_admin if managed_user else False,
-            "last_login_at": managed_user.last_login_at if managed_user else None,
+            "jellydj_username": mu.username,
+            "has_activated": mu.has_activated,
+            "is_admin": mu.is_admin,
+            "last_login_at": mu.last_login_at,
         })
 
     return sorted(result, key=lambda x: x["jellyfin_username"])

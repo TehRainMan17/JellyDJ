@@ -455,6 +455,34 @@ class TrackCooldown(Base):
     )
 
 
+class ArtistCooldown(Base):
+    """
+    Artist-level skip timeout.
+
+    Triggered when a user skips ARTIST_COOLDOWN_SKIP_THRESHOLD or more distinct
+    tracks by the same artist within a rolling ARTIST_COOLDOWN_WINDOW_DAYS window.
+
+    While status='active' and cooldown_until is in the future, all tracks by
+    this artist are excluded from playlist generation for this user.
+
+    Cooldown durations escalate across cycles: 7d → 14d → 30d (then stays at 30d).
+    """
+    __tablename__ = "artist_cooldowns"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    artist_name = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="active", index=True)  # active | expired
+    cooldown_until = Column(DateTime, nullable=True)
+    cooldown_count = Column(Integer, nullable=False, default=1)
+    skip_count_at_trigger = Column(Integer, nullable=False, default=0)
+    triggered_at = Column(DateTime, default=datetime.utcnow)
+    expired_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_artist_cooldowns_user_artist_status", "user_id", "artist_name", "status"),
+    )
+
+
 # ── v3: new tables ────────────────────────────────────────────────────────────
 
 class BillboardChartEntry(Base):

@@ -65,7 +65,11 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from services.playlist_blocks import BLOCK_REGISTRY
-from services.playlist_utils import get_excluded_item_ids, get_holiday_excluded_ids
+from services.playlist_utils import (
+    get_excluded_item_ids,
+    get_holiday_excluded_ids,
+    get_artist_cooled_down_ids,
+)
 
 log = logging.getLogger(__name__)
 
@@ -262,8 +266,12 @@ async def generate_from_template(
         )
 
     # ── Exclusions ────────────────────────────────────────────────────────────
+    # Combines: manually excluded albums, out-of-season holiday tracks, and
+    # any artist currently on a skip-triggered timeout for this user.
     excluded_item_ids: frozenset = (
-        get_excluded_item_ids(db) | get_holiday_excluded_ids(db)
+        get_excluded_item_ids(db)
+        | get_holiday_excluded_ids(db)
+        | get_artist_cooled_down_ids(db, user_id)
     )
 
     # ── Evaluate each block chain ─────────────────────────────────────────────

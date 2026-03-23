@@ -71,6 +71,23 @@ Changes from v6:
     90–100    heavy listener with favorited tracks
 
 Changes from v5/v6 (unplayed scoring) are preserved unchanged.
+
+Changes in v8 (skip penalty overhaul):
+
+  5. ARTIST SKIP PENALTY DOUBLE-HALVING BUG — non-favorited artists had their
+     skip penalty halved twice.  The formula was:
+       effective = skip_rate * 1.0  (non-favorited)
+       affinity  = affinity * (1.0 - effective * 0.5)
+     The extra * 0.5 meant a 100% skip rate only reduced affinity by 50%.
+     Fixed: removed the * 0.5 multiplier on the penalty application.
+     A floor of 1.0 prevents affinity from dropping to absolute zero.
+
+  6. UNPLAYED TRACKS IGNORE ARTIST SKIP HISTORY — an unplayed track scored at
+     full novelty bonus even when its artist had a 90% skip rate across all
+     their other tracks.  Fixed by building an artist-level skip rate map and
+     applying a proportional discount to unplayed scores when skip_rate > 0.2.
+     This ensures that new tracks by a heavily-skipped artist start at a lower
+     score rather than appearing as equally attractive as a loved artist.
 """
 from __future__ import annotations
 
@@ -175,8 +192,11 @@ def _breadth_bonus(tracks_played: int) -> float:
     if tracks_played <= 0:
         return 0.0
     return round(
-        (math.log1p(tracks_played) / math.log1p(ARTIST_BREADTH_MAX_TRACKS))
-        * ARTIST_BREADTH_BONUS_MAX,
+        min(
+            (math.log1p(tracks_played) / math.log1p(ARTIST_BREADTH_MAX_TRACKS))
+            * ARTIST_BREADTH_BONUS_MAX,
+            ARTIST_BREADTH_BONUS_MAX,
+        ),
         2,
     )
 
@@ -200,16 +220,20 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
     """
     now = datetime.utcnow()
     plays = db.query(Play).filter_by(user_id=user_id).all()
-    if not plays:
-        return {}
 
-    artist_agg: dict[str, dict] = {}
+    # v8: group by lowercase key so "Cage the Elephant" and "Cage The Elephant"
+    # (different capitalisation in Jellyfin metadata) merge into one profile.
+    # The canonical display name is the form with the highest play count.
+    artist_agg: dict[str, dict] = {}  # key = artist_name.lower()
     for p in plays:
-        key = p.artist_name
-        if not key:
+        raw_name = p.artist_name
+        if not raw_name:
             continue
+        key = raw_name.lower().strip()
         if key not in artist_agg:
             artist_agg[key] = {
+                "canonical_name": raw_name,
+                "canonical_play_count": p.play_count,
                 "total_plays": 0,
                 "tracks_played": 0,
                 "best_last_played": None,   # v7: best recency instead of average
@@ -217,6 +241,11 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
                 "genres": {},
             }
         agg = artist_agg[key]
+        # Keep the name form with the most plays as the display name
+        if p.play_count > agg["canonical_play_count"]:
+            agg["canonical_name"] = raw_name
+            agg["canonical_play_count"] = p.play_count
+
         agg["total_plays"] += p.play_count
         agg["tracks_played"] += 1
 
@@ -240,15 +269,17 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
     ) or 1
 
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
+    # v8: also key artist_skips by lowercase so they match the normalised artist_agg keys
     artist_skips: dict[str, dict] = {}
     for sk in skip_rows:
         a = sk.artist_name
         if not a:
             continue
-        if a not in artist_skips:
-            artist_skips[a] = {"total_events": 0, "skip_count": 0}
-        artist_skips[a]["total_events"] += sk.total_events
-        artist_skips[a]["skip_count"] += sk.skip_count
+        key = a.lower().strip()
+        if key not in artist_skips:
+            artist_skips[key] = {"total_events": 0, "skip_count": 0, "display_name": a}
+        artist_skips[key]["total_events"] += sk.total_events
+        artist_skips[key]["skip_count"] += sk.skip_count
 
     # v2: load replay boosts for this user
     from services.enrichment import compute_replay_boosts
@@ -268,7 +299,11 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
 
     affinity_map: dict[str, float] = {}
 
-    for artist, agg in artist_agg.items():
+    for artist_key, agg in artist_agg.items():
+        # v8: use the canonical display name (most-played form) rather than
+        # the raw key, so the profile reflects the correct capitalisation.
+        artist = agg["canonical_name"]
+
         # v7: total-play score — how much has the user played this artist overall?
         total_play_score = _play_score(agg["total_plays"], max_artist_plays)
 
@@ -287,20 +322,32 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         )
         affinity = round(min(100.0, raw_score + fav_boost), 2)
 
-        # Skip penalty — reduces affinity proportionally
-        sk_data = artist_skips.get(artist, {})
+        # Skip penalty — reduces affinity proportionally.
+        # v8 fix: previously the formula was (1.0 - effective_skip_rate * 0.5),
+        # which halved the penalty a second time after already halving it for
+        # favorites — meaning a 100% skip rate on a non-favorited artist only
+        # reduced affinity by 50%.  Now uses the full effective rate so heavily-
+        # skipped artists fall proportionally further.  A floor of 1.0 ensures
+        # the artist still surfaces if the user changes their mind later.
+        # v8: look up by lowercase key since artist_skips is now normalised.
+        sk_data = artist_skips.get(artist_key, {})
         total_ev = sk_data.get("total_events", 0)
         skip_ct = sk_data.get("skip_count", 0)
         skip_rate = round(skip_ct / total_ev, 4) if total_ev >= SKIP_MIN_EVENTS else 0.0
         if skip_rate > 0:
             effective_skip_rate = skip_rate * (0.5 if agg["has_favorite"] else 1.0)
-            affinity = round(affinity * (1.0 - effective_skip_rate * 0.5), 2)
+            affinity = round(max(1.0, affinity * (1.0 - effective_skip_rate)), 2)
 
         primary_genre = (
             max(agg["genres"].items(), key=lambda x: x[1])[0]
             if agg["genres"] else ""
         )
+        # Store both the canonical name and the lowercase key so downstream
+        # lookups (e.g. rebuild_track_scores) find the right affinity regardless
+        # of capitalisation differences between LibraryTrack and Play rows.
         affinity_map[artist] = affinity
+        if artist_key != artist.lower():
+            affinity_map[artist_key] = affinity  # lowercase alias
 
         # v2: replay boost at artist level
         artist_replay_boost = replay_boosts.get(f"artist:{artist.lower()}", 0.0)
@@ -324,6 +371,38 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             replay_boost=artist_replay_boost,
             related_artists=related,
             tags=tags,
+        ))
+
+    # v8: create stub profiles for skip-only artists — artists the user has
+    # skipped but never completed a full listen of (so they have SkipPenalty
+    # rows but no Play rows).  These stubs make them visible in insights and
+    # ensure their skip signal is applied during track scoring.
+    for skip_key, sk_data in artist_skips.items():
+        if skip_key in artist_agg:
+            continue  # Already handled above
+        total_ev = sk_data.get("total_events", 0)
+        skip_ct = sk_data.get("skip_count", 0)
+        if total_ev < 3:
+            continue  # Not enough data to be meaningful
+        skip_rate = round(skip_ct / total_ev, 4)
+        # Stub affinity: very low (0–5), inversely proportional to skip rate
+        stub_affinity = round(max(1.0, 5.0 * (1.0 - skip_rate)), 2)
+        display_name = sk_data.get("display_name", skip_key)
+        affinity_map[display_name] = stub_affinity
+        affinity_map[skip_key] = stub_affinity  # lowercase alias
+
+        db.add(ArtistProfile(
+            user_id=user_id,
+            artist_name=display_name,
+            total_plays=0,
+            total_tracks_played=0,
+            total_skips=skip_ct,
+            skip_rate=str(skip_rate),
+            has_favorite=False,
+            primary_genre="",
+            affinity_score=str(stub_affinity),
+            updated_at=now,
+            replay_boost=0.0,
         ))
 
     db.flush()
@@ -481,6 +560,26 @@ def rebuild_track_scores(
             skip_map[sk.jellyfin_item_id] = float(sk.penalty)
         streak_map[sk.jellyfin_item_id] = sk.consecutive_skips or 0
 
+    # Build per-artist aggregated skip rate for penalising unplayed tracks.
+    # Unplayed tracks normally inherit only the artist's affinity score; this
+    # map lets us also apply the artist's skip signal so that tracks by a
+    # heavily-skipped artist score lower even before they've been heard.
+    _artist_skip_agg: dict[str, dict] = {}
+    for sk in skip_rows:
+        a = sk.artist_name
+        if not a:
+            continue
+        key = a.lower().strip()  # normalise so lookups are case-insensitive
+        if key not in _artist_skip_agg:
+            _artist_skip_agg[key] = {"total_events": 0, "skip_count": 0}
+        _artist_skip_agg[key]["total_events"] += sk.total_events
+        _artist_skip_agg[key]["skip_count"] += sk.skip_count
+    artist_skip_rate_map: dict[str, float] = {
+        a: d["skip_count"] / d["total_events"]
+        for a, d in _artist_skip_agg.items()
+        if d["total_events"] >= SKIP_MIN_EVENTS
+    }
+
     max_plays = max((p.play_count for p in plays.values() if p.play_count), default=1) or 1
 
     max_artist_aff = max(artist_affinity.values(), default=1.0) or 1.0
@@ -524,7 +623,12 @@ def rebuild_track_scores(
         skip_pen = skip_map.get(jid, 0.0)
         skip_streak = streak_map.get(jid, 0)
 
-        raw_artist = artist_affinity.get(track.artist_name, 0.0)
+        # v8: fall back to lowercase key in case LibraryTrack and Play rows
+        # have different capitalisations for the same artist name.
+        raw_artist = (
+            artist_affinity.get(track.artist_name)
+            or artist_affinity.get(track.artist_name.lower(), 0.0)
+        )
         raw_genre = genre_affinity.get(track.genre, 0.0)
         a_aff = round((raw_artist / max_artist_aff) * 100, 2)
         g_aff = round((raw_genre / max_genre_aff) * 100, 2)
@@ -641,6 +745,17 @@ def rebuild_track_scores(
 
             if skip_pen > 0.3:
                 unplayed_score *= (1.0 - skip_pen * 0.3)
+
+            # v8: apply artist-level skip rate to unplayed tracks.
+            # Prevents new unheard tracks by a heavily-skipped artist from
+            # scoring at full novelty just because they haven't been heard yet.
+            # v8: case-insensitive fallback for capitalisation mismatches.
+            artist_skip_rate = (
+                artist_skip_rate_map.get(track.artist_name)
+                or artist_skip_rate_map.get(track.artist_name.lower(), 0.0)
+            )
+            if artist_skip_rate > 0.2:
+                unplayed_score *= (1.0 - artist_skip_rate * 0.5)
 
             final = round(min(UNPLAYED_CAP, unplayed_score), 2)
 

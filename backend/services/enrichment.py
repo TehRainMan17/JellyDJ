@@ -117,6 +117,13 @@ COOLDOWN_DAYS_SECOND = 14           # second cooldown: 2 weeks
 COOLDOWN_DAYS_THIRD  = 30           # third cooldown: 1 month before permanent
 COOLDOWN_CYCLES_PERMANENT = 3       # after this many cycles → permanent penalty
 
+# Artist-level cooldown (separate from per-track cooldowns)
+ARTIST_COOLDOWN_SKIP_THRESHOLD = 5  # distinct track skips in window to trigger timeout
+ARTIST_COOLDOWN_WINDOW_DAYS    = 2  # rolling window in days
+ARTIST_COOLDOWN_DAYS_FIRST     = 7  # first timeout: 1 week
+ARTIST_COOLDOWN_DAYS_SECOND    = 14 # second timeout: 2 weeks
+ARTIST_COOLDOWN_DAYS_THIRD     = 30 # third+ timeout: 1 month
+
 # ── Replay signal ─────────────────────────────────────────────────────────────
 REPLAY_WINDOW_DAYS   = 7    # voluntary replay within this window → high signal
 REPLAY_BOOST_TRACK   = 8.0  # score pts added for same-track replay
@@ -965,6 +972,102 @@ def check_and_apply_cooldown(
     return "triggered"
 
 
+def check_and_apply_artist_cooldown(
+    db: Session,
+    user_id: str,
+    artist_name: str,
+) -> Optional[str]:
+    """
+    Check if an artist should be timed out based on recent skip behavior.
+
+    Counts distinct tracks by this artist that the user has skipped within the
+    last ARTIST_COOLDOWN_WINDOW_DAYS days.  If the count meets or exceeds
+    ARTIST_COOLDOWN_SKIP_THRESHOLD, an ArtistCooldown row is written (or an
+    existing stale one is replaced) and all tracks by that artist are excluded
+    from playlist generation until cooldown_until.
+
+    Cooldown durations escalate across cycles: 7d → 14d → 30d.
+
+    Returns:
+      "triggered"  — new cooldown applied
+      "extended"   — already on an active cooldown (no-op)
+      None         — threshold not met
+    """
+    from models import ArtistCooldown, PlaybackEvent
+    from sqlalchemy import func as _func
+
+    if not artist_name:
+        return None
+
+    now = datetime.utcnow()
+    window_start = now - timedelta(days=ARTIST_COOLDOWN_WINDOW_DAYS)
+
+    # Count distinct tracks skipped by this artist within the rolling window
+    recent_skip_count = (
+        db.query(_func.count(_func.distinct(PlaybackEvent.jellyfin_item_id)))
+        .filter(
+            PlaybackEvent.user_id == user_id,
+            PlaybackEvent.artist_name == artist_name,
+            PlaybackEvent.was_skip == True,   # noqa: E712
+            PlaybackEvent.received_at >= window_start,
+        )
+        .scalar()
+    ) or 0
+
+    if recent_skip_count < ARTIST_COOLDOWN_SKIP_THRESHOLD:
+        return None
+
+    # Check for an existing active cooldown that hasn't expired yet
+    existing = db.query(ArtistCooldown).filter_by(
+        user_id=user_id,
+        artist_name=artist_name,
+        status="active",
+    ).first()
+
+    if existing and existing.cooldown_until and existing.cooldown_until > now:
+        return "extended"
+
+    # Expire any stale active record before creating a new one
+    if existing:
+        existing.status = "expired"
+        existing.expired_at = now
+        db.flush()
+
+    # Determine escalating cooldown duration based on prior cycle count
+    prior_count = db.query(ArtistCooldown).filter_by(
+        user_id=user_id,
+        artist_name=artist_name,
+    ).count()
+    cooldown_count = prior_count + 1
+
+    if cooldown_count == 1:
+        duration = ARTIST_COOLDOWN_DAYS_FIRST
+    elif cooldown_count == 2:
+        duration = ARTIST_COOLDOWN_DAYS_SECOND
+    else:
+        duration = ARTIST_COOLDOWN_DAYS_THIRD
+
+    cooldown_until = now + timedelta(days=duration)
+
+    db.add(ArtistCooldown(
+        user_id=user_id,
+        artist_name=artist_name,
+        status="active",
+        cooldown_until=cooldown_until,
+        cooldown_count=cooldown_count,
+        skip_count_at_trigger=recent_skip_count,
+        triggered_at=now,
+    ))
+    db.flush()
+
+    log.info(
+        f"  Artist cooldown: '{artist_name}' [{user_id[:8]}] → TIMEOUT #{cooldown_count} "
+        f"for {duration} days (until {cooldown_until.strftime('%Y-%m-%d')}) "
+        f"[{recent_skip_count} distinct skips in {ARTIST_COOLDOWN_WINDOW_DAYS}d window]"
+    )
+    return "triggered"
+
+
 def expire_cooldowns(db: Session) -> int:
     """
     Mark expired cooldowns as 'expired' and clear TrackScore.cooldown_until.
@@ -1007,11 +1110,28 @@ def expire_cooldowns(db: Session) -> int:
 
         count += 1
 
-    if count:
-        db.commit()
-        log.info(f"Cooldowns: expired {count} active cooldowns")
+    # Also expire stale ArtistCooldown rows
+    from models import ArtistCooldown
+    artist_expired = (
+        db.query(ArtistCooldown)
+        .filter_by(status="active")
+        .filter(ArtistCooldown.cooldown_until <= now)
+        .all()
+    )
+    artist_count = 0
+    for acd in artist_expired:
+        acd.status = "expired"
+        acd.expired_at = now
+        artist_count += 1
 
-    return count
+    if count or artist_count:
+        db.commit()
+        log.info(
+            f"Cooldowns: expired {count} track cooldown(s), "
+            f"{artist_count} artist cooldown(s)"
+        )
+
+    return count + artist_count
 
 
 # ── Replay signal detection ───────────────────────────────────────────────────

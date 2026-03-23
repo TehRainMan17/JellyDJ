@@ -142,6 +142,13 @@ def provision_user_defaults(user_id: str, db: Session) -> list[int]:
         )
 
     if created_ids:
+        # Mark the user as activated — they now have playlists and should be
+        # included in indexing, discovery, and other per-user jobs.
+        managed = db.query(ManagedUser).filter_by(jellyfin_user_id=user_id).first()
+        if managed and not managed.has_activated:
+            managed.has_activated = True
+            managed.is_enabled = True  # keep legacy column in sync
+            log.info("User %s activated via provisioning", user_id)
         db.commit()
 
     return created_ids
@@ -290,12 +297,11 @@ def provision_all_users(
     db: Session = Depends(get_db),
 ):
     """
-    Provision default playlists to all active managed users (has_activated=True).
-    Deactivated / deleted users are excluded so ghost playlists are never created.
+    Provision default playlists to all managed users.
     Idempotent sweep — skips users who already have each template covered.
     Returns a summary per user.
     """
-    all_managed = db.query(ManagedUser).filter_by(has_activated=True).all()
+    all_managed = db.query(ManagedUser).all()
     results = []
     total_created = 0
 
