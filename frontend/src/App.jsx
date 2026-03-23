@@ -34,6 +34,8 @@ import AdminUsers from './pages/AdminUsers.jsx'
 import PlaylistBackups from './pages/PlaylistBackups.jsx'
 import Login from './pages/Login.jsx'
 import PlaylistImport from './pages/PlaylistImport.jsx'
+import PlaylistImportDetail from './pages/PlaylistImportDetail.jsx'
+import ImportSetup from './pages/ImportSetup.jsx'
 import { useAuth } from './contexts/AuthContext.jsx'
 import { _wireAuth } from './lib/api.js'
 
@@ -101,6 +103,8 @@ export default function App() {
           <Route path="admin/users" element={<RequireAdmin><AdminUsers /></RequireAdmin>} />
           <Route path="admin/playlist-backups" element={<RequireAdmin><PlaylistBackups /></RequireAdmin>} />
           <Route path="import" element={<PlaylistImport />} />
+          <Route path="import/setup" element={<ImportSetup />} />
+          <Route path="import/:id" element={<PlaylistImportDetail />} />
         </Route>
       </Routes>
     </BrowserRouter>

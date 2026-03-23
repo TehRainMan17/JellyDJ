@@ -67,9 +67,17 @@ _login_attempts: dict = defaultdict(list)
 _RATE_LIMIT_MAX = 10
 _RATE_LIMIT_WINDOW = 60  # seconds
 
+def _real_ip(request: Request) -> str:
+    """Get real client IP, respecting X-Forwarded-For header for proxied requests."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _check_rate_limit(request: Request) -> None:
     import time
-    ip = request.client.host if request.client else "unknown"
+    ip = _real_ip(request)
     now = time.time()
     attempts = _login_attempts[ip]
     # Purge attempts outside the window

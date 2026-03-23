@@ -15,9 +15,15 @@ a separate Nginx container) can communicate with the backend on any port.
 """
 
 import os
+import logging
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 from database import engine, Base, SessionLocal
 import models  # noqa: F401 — imported so SQLAlchemy registers all table definitions
 from routers import (
@@ -153,6 +159,11 @@ def _run_migrations():
         ("imported_playlist_tracks",  "suggested_artist",    "TEXT",     "NULL"),
         ("imported_playlist_tracks",  "resolved_at",         "DATETIME", "NULL"),
         ("import_album_suggestions",  "lidarr_queued_at",    "DATETIME", "NULL"),
+        # v2: enriched album suggestion metadata
+        ("import_album_suggestions",  "artist_mbid",         "TEXT",     "NULL"),
+        ("import_album_suggestions",  "album_mbid",          "TEXT",     "NULL"),
+        ("import_album_suggestions",  "image_url",           "TEXT",     "NULL"),
+        ("import_album_suggestions",  "missing_tracks",      "TEXT",     "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -327,6 +338,78 @@ def _cleanup_expired_refresh_tokens():
         db.close()
 
 
+def _seed_env_credentials():
+    """
+    Seed ConnectionSettings and ExternalApiSettings from .env variables.
+
+    Idempotent — only creates rows if they don't already exist.
+    Allows users to pre-configure everything via .env without manual UI setup.
+    """
+    import logging
+    from crypto import encrypt
+    from models import ConnectionSettings, ExternalApiSettings
+
+    _log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        # Jellyfin
+        jellyfin_url = os.getenv("JELLYFIN_URL", "").strip()
+        jellyfin_key = os.getenv("JELLYFIN_API_KEY", "").strip()
+        if jellyfin_url and jellyfin_key:
+            existing = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+            if not existing:
+                db.add(ConnectionSettings(
+                    service="jellyfin",
+                    base_url=jellyfin_url,
+                    api_key_encrypted=encrypt(jellyfin_key),
+                    is_connected=False,
+                ))
+                db.commit()
+                _log.info("Seeded Jellyfin connection from .env")
+
+        # Lidarr
+        lidarr_url = os.getenv("LIDARR_URL", "").strip()
+        lidarr_key = os.getenv("LIDARR_API_KEY", "").strip()
+        if lidarr_url and lidarr_key:
+            existing = db.query(ConnectionSettings).filter_by(service="lidarr").first()
+            if not existing:
+                db.add(ConnectionSettings(
+                    service="lidarr",
+                    base_url=lidarr_url,
+                    api_key_encrypted=encrypt(lidarr_key),
+                    is_connected=False,
+                ))
+                db.commit()
+                _log.info("Seeded Lidarr connection from .env")
+
+        # Spotify
+        spotify_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+        spotify_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+        if spotify_id and spotify_secret:
+            existing = db.query(ExternalApiSettings).filter_by(key="spotify_client_id").first()
+            if not existing:
+                db.add(ExternalApiSettings(key="spotify_client_id", value_encrypted=encrypt(spotify_id)))
+                db.add(ExternalApiSettings(key="spotify_client_secret", value_encrypted=encrypt(spotify_secret)))
+                db.commit()
+                _log.info("Seeded Spotify credentials from .env")
+
+        # Last.fm
+        lastfm_key = os.getenv("LASTFM_API_KEY", "").strip()
+        lastfm_secret = os.getenv("LASTFM_API_SECRET", "").strip()
+        if lastfm_key and lastfm_secret:
+            existing = db.query(ExternalApiSettings).filter_by(key="lastfm_api_key").first()
+            if not existing:
+                db.add(ExternalApiSettings(key="lastfm_api_key", value_encrypted=encrypt(lastfm_key)))
+                db.add(ExternalApiSettings(key="lastfm_api_secret", value_encrypted=encrypt(lastfm_secret)))
+                db.commit()
+                _log.info("Seeded Last.fm credentials from .env")
+
+    except Exception as exc:
+        _log.warning("Failed to seed credentials from .env: %s", exc)
+    finally:
+        db.close()
+
+
 def _warn_if_setup_backdoor_active():
     """
     Emit a WARNING at startup if SETUP_ALLOW_AFTER_CONFIGURE=true is set
@@ -436,6 +519,9 @@ async def lifespan(app: FastAPI):
 
     # Add any new columns that appeared since the user's last install
     _run_migrations()
+
+    # Seed .env credentials into the database (idempotent, only on first setup)
+    _seed_env_credentials()
 
     # Backfill any stale popularity cache entries (one-time, safe to repeat)
     _backfill_top_album_cache()

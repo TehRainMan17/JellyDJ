@@ -108,11 +108,23 @@ function TrackedUsersPanel() {
 
   useEffect(() => { fetchUsers() }, [fetchUsers])
 
+  const handleAdd = async (userId, username) => {
+    setDeleting(p => ({ ...p, [userId]: true }))
+    try {
+      await api.post(`/api/connections/jellyfin/users/add-test-user?jellyfin_user_id=${userId}&username=${username}`, {})
+      await fetchUsers()
+    } catch (err) {
+      setError(`Failed to add user: ${err.message}`)
+    } finally {
+      setDeleting(p => ({ ...p, [userId]: false }))
+    }
+  }
+
   const handleDelete = async (userId) => {
     setDeleting(p => ({ ...p, [userId]: true }))
     try {
       await api.delete(`/api/connections/jellyfin/users/${userId}`)
-      setUsers(prev => prev.filter(u => u.jellyfin_user_id !== userId))
+      await fetchUsers()
     } finally {
       setDeleting(p => ({ ...p, [userId]: false }))
       setConfirmId(null)
@@ -132,30 +144,38 @@ function TrackedUsersPanel() {
   return (
     <div className="mt-4 space-y-1">
       <p className="text-xs text-[var(--text-secondary)] mb-3">
-        Users below have activated JellyDJ by pushing their first playlist.
-        Deleting a user wipes all their JellyDJ data and pauses tracking until
-        they push another playlist.
+        <strong>Jellyfin Users:</strong> Below are all your Jellyfin users.
+        Green checkmarks indicate active JellyDJ users. Click "Add" to manually activate a user,
+        or "Remove" to delete their JellyDJ data.
       </p>
 
       {users.length === 0 ? (
         <div className="flex items-center gap-2 text-xs text-[var(--text-secondary)] py-2">
           <AlertCircle size={13} className="text-[var(--text-secondary)]" />
-          No users have activated JellyDJ yet. Users activate automatically
-          when they create and push their first playlist.
+          No Jellyfin users found. Check your Jellyfin connection.
         </div>
       ) : (
         users.map(user => (
           <div
             key={user.jellyfin_user_id}
-            className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-[var(--bg-overlay)] transition-colors"
+            className={`flex items-center justify-between py-2 px-3 rounded-lg transition-colors ${
+              user.has_activated
+                ? 'bg-[rgba(74,222,128,0.08)] border border-[rgba(74,222,128,0.3)]'
+                : 'hover:bg-[var(--bg-overlay)]'
+            }`}
           >
             <div className="flex items-center gap-2.5">
               <div className="w-7 h-7 rounded-full bg-[var(--bg-overlay)] border border-[var(--border)] flex items-center justify-center text-xs font-semibold text-[var(--text-secondary)]">
-                {user.username[0]?.toUpperCase()}
+                {user.jellyfin_username[0]?.toUpperCase()}
               </div>
               <div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-sm text-[var(--text-primary)]">{user.username}</span>
+                  <span className="text-sm text-[var(--text-primary)]">{user.jellyfin_username}</span>
+                  {user.has_activated && (
+                    <span className="flex items-center gap-0.5 text-[10px] text-[#4ade80] font-semibold">
+                      <ShieldCheck size={10} /> Active
+                    </span>
+                  )}
                   {user.is_admin && (
                     <span className="flex items-center gap-0.5 text-[10px] text-[var(--accent)] font-semibold">
                       <ShieldCheck size={10} /> Admin
@@ -191,17 +211,33 @@ function TrackedUsersPanel() {
                 </button>
               </div>
             ) : (
-              <button
-                onClick={() => setConfirmId(user.jellyfin_user_id)}
-                title="Delete all JellyDJ data for this user"
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium
-                           text-[var(--text-secondary)] hover:text-[var(--danger)]
-                           hover:bg-[var(--danger)]/8 border border-transparent
-                           hover:border-[var(--danger)]/20 transition-all"
-              >
-                <Trash2 size={12} />
-                Delete data
-              </button>
+              <div className="flex items-center gap-2">
+                {user.has_activated ? (
+                  <button
+                    onClick={() => setConfirmId(user.jellyfin_user_id)}
+                    title="Delete all JellyDJ data for this user"
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium
+                               text-[var(--text-secondary)] hover:text-[var(--danger)]
+                               hover:bg-[var(--danger)]/8 border border-transparent
+                               hover:border-[var(--danger)]/20 transition-all"
+                  >
+                    <Trash2 size={12} />
+                    Remove
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleAdd(user.jellyfin_user_id, user.jellyfin_username)}
+                    disabled={!!deleting[user.jellyfin_user_id]}
+                    title="Manually activate this user for JellyDJ"
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium
+                               bg-[#6366f1]/10 border border-[#6366f1]/25
+                               text-[#6366f1] hover:bg-[#6366f1]/20 transition-all disabled:opacity-40"
+                  >
+                    {deleting[user.jellyfin_user_id] ? <Loader2 size={10} className="animate-spin" /> : null}
+                    Add to JellyDJ
+                  </button>
+                )}
+              </div>
             )}
           </div>
         ))

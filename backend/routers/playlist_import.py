@@ -7,7 +7,7 @@ Endpoints
   GET    /api/import/playlists           List all imported playlists for current user
   GET    /api/import/playlists/{id}      Detail: tracks + album suggestions
   POST   /api/import/playlists/{id}/rematch    Re-run the match pass (after library update)
-  DELETE /api/import/playlists/{id}      Remove import (leaves Jellyfin playlist intact)
+  DELETE /api/import/playlists/{id}      Remove import + delete Jellyfin playlist
 
   GET    /api/import/playlists/{id}/suggestions     Album suggestions for missing tracks
   POST   /api/import/playlists/{id}/suggestions/{sid}/approve    Send album to Lidarr
@@ -128,8 +128,22 @@ def _get_lidarr_creds(db: Session) -> tuple[str, str]:
     return row.base_url.rstrip("/"), decrypt(row.api_key_encrypted)
 
 
-async def _send_album_to_lidarr(artist: str, album: str, db: Session) -> bool:
-    """Fire-and-forget: send an artist/album search to Lidarr."""
+async def _send_album_to_lidarr(
+    artist: str,
+    album: str,
+    db: Session,
+    artist_mbid: str | None = None,
+) -> bool:
+    """
+    Add artist to Lidarr (if not present), find the specific album,
+    monitor it, and trigger an AlbumSearch.
+
+    Uses the same pattern as discovery.py: dynamic root folder / quality
+    profile / metadata profile, monitor: "future" for new artists, then
+    album-specific search.
+    """
+    import asyncio
+
     try:
         base_url, api_key = _get_lidarr_creds(db)
     except RuntimeError as exc:
@@ -140,44 +154,202 @@ async def _send_album_to_lidarr(artist: str, album: str, db: Session) -> bool:
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Search for artist in Lidarr
+            # ── Step 1: look up artist ────────────────────────────────
+            # Prefer mbid for precise lookup when available
+            search_term = f"lidarr:{artist_mbid}" if artist_mbid else artist
             search_resp = await client.get(
                 f"{base_url}/api/v1/artist/lookup",
                 headers=headers,
-                params={"term": artist},
+                params={"term": search_term},
             )
             if search_resp.status_code != 200 or not search_resp.json():
-                log.warning("Lidarr artist lookup failed for '%s'", artist)
+                # Retry with plain name if mbid lookup returned nothing
+                if artist_mbid:
+                    search_resp = await client.get(
+                        f"{base_url}/api/v1/artist/lookup",
+                        headers=headers,
+                        params={"term": artist},
+                    )
+                if search_resp.status_code != 200 or not search_resp.json():
+                    log.warning("Lidarr artist lookup failed for '%s'", artist)
+                    return False
+
+            lidarr_artist = search_resp.json()[0]
+            foreign_artist_id = lidarr_artist.get("foreignArtistId", "")
+
+            # ── Step 2: check if artist already exists ────────────────
+            existing_resp = await client.get(
+                f"{base_url}/api/v1/artist", headers=headers
+            )
+            existing_map = {}
+            if existing_resp.status_code == 200:
+                existing_map = {
+                    a["foreignArtistId"]: a for a in existing_resp.json()
+                }
+
+            artist_already_exists = foreign_artist_id in existing_map
+            lidarr_artist_id = None
+
+            if artist_already_exists:
+                lidarr_artist_id = existing_map[foreign_artist_id].get("id")
+                log.info("Import: '%s' already in Lidarr (id=%s)", artist, lidarr_artist_id)
+            else:
+                # ── Step 3-6: add artist with dynamic profiles ────────
+                root_resp = await client.get(f"{base_url}/api/v1/rootfolder", headers=headers)
+                root_resp.raise_for_status()
+                roots = root_resp.json()
+                root_path = roots[0]["path"] if roots else "/music"
+
+                qp_resp = await client.get(f"{base_url}/api/v1/qualityprofile", headers=headers)
+                qp_resp.raise_for_status()
+                profiles = qp_resp.json()
+                quality_profile_id = next(
+                    (p["id"] for p in profiles if p.get("name", "").lower() == "jellydj"),
+                    profiles[0]["id"] if profiles else 1,
+                )
+
+                mp_resp = await client.get(f"{base_url}/api/v1/metadataprofile", headers=headers)
+                mp_resp.raise_for_status()
+                meta_profiles = mp_resp.json()
+                metadata_profile_id = meta_profiles[0]["id"] if meta_profiles else 1
+
+                # Strip all album monitoring from the lookup payload
+                safe_artist = {**lidarr_artist}
+                if "albums" in safe_artist:
+                    safe_artist["albums"] = [
+                        {**alb, "monitored": False}
+                        for alb in safe_artist["albums"]
+                    ]
+
+                add_payload = {
+                    **safe_artist,
+                    "qualityProfileId": quality_profile_id,
+                    "metadataProfileId": metadata_profile_id,
+                    "rootFolderPath": root_path,
+                    "monitored": True,
+                    "monitor": "none",
+                    "addOptions": {
+                        "monitor": "none",
+                        "searchForMissingAlbums": False,
+                    },
+                }
+                add_resp = await client.post(
+                    f"{base_url}/api/v1/artist", headers=headers, json=add_payload
+                )
+                add_resp.raise_for_status()
+                added_artist = add_resp.json()
+                lidarr_artist_id = added_artist.get("id")
+                log.info("Import: added '%s' to Lidarr (id=%s)", artist, lidarr_artist_id)
+
+            if not lidarr_artist_id:
+                log.warning("Import: no Lidarr artist ID for '%s'", artist)
                 return False
 
-            results = search_resp.json()
-            lidarr_artist = results[0]
-
-            # Check if already monitored
-            existing_resp = await client.get(
-                f"{base_url}/api/v1/artist",
-                headers=headers,
-            )
-            existing_ids = {a["foreignArtistId"] for a in existing_resp.json()} if existing_resp.status_code == 200 else set()
-
-            if lidarr_artist["foreignArtistId"] not in existing_ids:
-                # Add artist to Lidarr
-                add_payload = {
-                    **lidarr_artist,
-                    "qualityProfileId": 1,
-                    "metadataProfileId": 1,
-                    "monitored": True,
-                    "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
-                    "rootFolderPath": lidarr_artist.get("rootFolderPath", "/music"),
-                }
-                await client.post(f"{base_url}/api/v1/artist", headers=headers, json=add_payload)
-
-            # Trigger album search
+            # ── Step 7: refresh artist so Lidarr scans albums ─────────
             await client.post(
                 f"{base_url}/api/v1/command",
                 headers=headers,
-                json={"name": "ArtistSearch", "artistId": lidarr_artist.get("id", 0)},
+                json={"name": "RefreshArtist", "artistId": lidarr_artist_id},
             )
+
+            # ── Step 8: fetch albums with retry/backoff ───────────────
+            albums = []
+            max_attempts = 5 if not artist_already_exists else 2
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    await asyncio.sleep(4)
+                albums_resp = await client.get(
+                    f"{base_url}/api/v1/album",
+                    headers=headers,
+                    params={"artistId": lidarr_artist_id},
+                )
+                if albums_resp.status_code == 200:
+                    albums = albums_resp.json()
+                    if albums:
+                        break
+                log.info("Import: waiting for albums (attempt %d/%d)…", attempt + 1, max_attempts)
+
+            if not albums:
+                log.warning("Import: no albums found for '%s' — skipping (will not search entire artist)", artist)
+                return False
+
+            # ── Step 9: score albums to find best match ───────────────
+            # Strip placeholder values used when no album metadata was found
+            clean_album = album or ""
+            if clean_album in ("Unknown Album", "Artist not in Lidarr") or clean_album.endswith("(artist search)"):
+                clean_album = ""
+            target = clean_album.lower().strip()
+
+            def _album_score(alb: dict) -> float:
+                title = alb.get("title", "").lower().strip()
+                if not target:
+                    return 0.0
+                if title == target:
+                    return 1.0
+                if target in title:
+                    return 0.9 - (len(title) - len(target)) * 0.01
+                if title in target:
+                    return 0.8
+                t_words = set(target.split())
+                a_words = set(title.split())
+                overlap = len(t_words & a_words)
+                if overlap:
+                    return 0.5 + (overlap / max(len(t_words), len(a_words))) * 0.3
+                return 0.0
+
+            match = None
+            if target:
+                scored = [(alb, _album_score(alb)) for alb in albums]
+                scored.sort(key=lambda x: x[1], reverse=True)
+                best_score = scored[0][1]
+                match = scored[0][0] if best_score > 0.3 else None
+                if match:
+                    log.info("Import: album match '%s' (score=%.2f) for target '%s'",
+                             match.get("title"), best_score, album)
+                else:
+                    log.info("Import: no album matched for '%s' (best score=%.2f), available: %s",
+                             album, best_score,
+                             [a.get("title") for a in albums[:5]])
+
+            if not match:
+                log.warning("Import: no specific album match for '%s' by '%s' — skipping (will not download random album)", album, artist)
+                return False
+
+            # ── Step 10: monitor the specific album ───────────────────
+            album_id = match["id"]
+            match["monitored"] = True
+            put_resp = await client.put(
+                f"{base_url}/api/v1/album/{album_id}",
+                headers=headers,
+                json=match,
+            )
+            log.info("Import: monitor album PUT '%s' (id=%s): HTTP %d",
+                      match.get("title"), album_id, put_resp.status_code)
+
+            if put_resp.status_code not in (200, 202):
+                # If PUT failed, try updating just the monitored flag via the
+                # simpler monitor endpoint that some Lidarr versions support
+                log.warning("Import: album PUT failed, trying PATCH approach")
+                await client.put(
+                    f"{base_url}/api/v1/album/monitor",
+                    headers=headers,
+                    json={"albumIds": [album_id], "monitored": True},
+                )
+
+            # ── Step 11: trigger album-specific search ────────────────
+            cmd_resp = await client.post(
+                f"{base_url}/api/v1/command",
+                headers=headers,
+                json={"name": "AlbumSearch", "albumIds": [album_id]},
+            )
+            log.info("Import: AlbumSearch for '%s' (id=%s): HTTP %d",
+                      match.get("title"), album_id, cmd_resp.status_code)
+
+            if cmd_resp.status_code not in (200, 201):
+                log.warning("Import: AlbumSearch failed for '%s' (HTTP %d) — will not fall back to artist search",
+                            match.get("title"), cmd_resp.status_code)
+
+            log.info("Import: queued album '%s' by '%s' in Lidarr", match.get("title"), artist)
             return True
 
     except Exception as exc:
@@ -226,8 +398,9 @@ async def _run_full_import(playlist_id: int, owner_user_id: str):
     from database import SessionLocal
     db = SessionLocal()
     try:
+        log.info("Import job starting for playlist %d", playlist_id)
         run_match_pass(playlist_id, db)
-        build_album_suggestions(playlist_id, db)
+        await build_album_suggestions(playlist_id, db)
         await write_jellyfin_playlist(playlist_id, owner_user_id, db)
 
         # Mark playlist active
@@ -235,13 +408,18 @@ async def _run_full_import(playlist_id: int, owner_user_id: str):
         if pl:
             pl.status = "active"
             db.commit()
+        log.info("Import job completed for playlist %d", playlist_id)
     except Exception as exc:
-        log.error("Import job failed for playlist %d: %s", playlist_id, exc)
-        db = SessionLocal()  # fresh session for error update
-        pl = db.query(ImportedPlaylist).filter_by(id=playlist_id).first()
-        if pl:
-            pl.status = "error"
-            db.commit()
+        log.exception("Import job failed for playlist %d: %s", playlist_id, exc)
+        try:
+            db2 = SessionLocal()
+            pl = db2.query(ImportedPlaylist).filter_by(id=playlist_id).first()
+            if pl:
+                pl.status = "error"
+                db2.commit()
+            db2.close()
+        except Exception:
+            pass
     finally:
         db.close()
 
@@ -388,25 +566,48 @@ async def rematch_playlist(
     if not pl:
         raise HTTPException(404, "Playlist not found")
 
+    # Signal the frontend that work is in progress
+    pl.status = "matching"
+    db.commit()
+
     background_tasks.add_task(_run_full_import, playlist_id, current_user.user_id)
     return {"ok": True, "message": "Re-match started in background."}
 
 
 @router.delete("/playlists/{playlist_id}", status_code=204)
-def delete_imported_playlist(
+async def delete_imported_playlist(
     playlist_id: int,
     current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Remove import metadata. Does NOT delete the Jellyfin playlist — that stays
-    as a normal user playlist.
-    """
+    """Remove import metadata AND delete the Jellyfin playlist."""
     pl = db.query(ImportedPlaylist).filter_by(
         id=playlist_id, owner_user_id=current_user.user_id
     ).first()
     if not pl:
         raise HTTPException(404, "Playlist not found")
+
+    # Delete the Jellyfin playlist if one was created
+    if pl.jellyfin_playlist_id:
+        try:
+            conn = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+            if conn and conn.base_url and conn.api_key_encrypted:
+                base_url = conn.base_url.rstrip("/")
+                api_key = decrypt(conn.api_key_encrypted)
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.delete(
+                        f"{base_url}/Items/{pl.jellyfin_playlist_id}",
+                        headers={"X-Emby-Token": api_key},
+                    )
+                    if resp.status_code in (200, 204):
+                        log.info("Deleted Jellyfin playlist %s for import %d",
+                                 pl.jellyfin_playlist_id, playlist_id)
+                    else:
+                        log.warning("Jellyfin DELETE /Items/%s returned %d",
+                                    pl.jellyfin_playlist_id, resp.status_code)
+        except Exception as exc:
+            log.warning("Failed to delete Jellyfin playlist for import %d: %s",
+                        playlist_id, exc)
 
     db.query(ImportedPlaylistTrack).filter_by(playlist_id=playlist_id).delete()
     db.query(ImportAlbumSuggestion).filter_by(playlist_id=playlist_id).delete()
@@ -437,17 +638,28 @@ def get_suggestions(
         .all()
     )
 
-    return [
-        {
+    import json as _json
+
+    result = []
+    for s in suggestions:
+        # Parse missing_tracks JSON
+        try:
+            tracks_list = _json.loads(s.missing_tracks) if s.missing_tracks else []
+        except (ValueError, TypeError):
+            tracks_list = []
+
+        result.append({
             "id":             s.id,
             "artist_name":    s.artist_name,
             "album_name":     s.album_name,
             "coverage_count": s.coverage_count,
             "lidarr_status":  s.lidarr_status,
             "lidarr_queued_at": s.lidarr_queued_at,
-        }
-        for s in suggestions
-    ]
+            "artist_mbid":    s.artist_mbid,
+            "image_url":      s.image_url,
+            "missing_tracks": tracks_list,
+        })
+    return result
 
 
 @router.post("/playlists/{playlist_id}/suggestions/{suggestion_id}/approve")
@@ -474,7 +686,12 @@ async def approve_suggestion(
         return {"ok": True, "message": "Already queued or complete."}
 
     # Send to Lidarr
-    ok = await _send_album_to_lidarr(suggestion.artist_name, suggestion.album_name, db)
+    ok = await _send_album_to_lidarr(
+        suggestion.artist_name,
+        suggestion.album_name,
+        db,
+        artist_mbid=suggestion.artist_mbid,
+    )
 
     suggestion.lidarr_status   = "approved" if ok else "pending"
     suggestion.lidarr_queued_at = datetime.utcnow() if ok else None
@@ -519,6 +736,170 @@ def reject_suggestion(
     suggestion.lidarr_status = "rejected"
     db.commit()
     return None
+
+
+# ── Add missing artists to Lidarr ─────────────────────────────────────────────
+
+@router.post("/playlists/{playlist_id}/add-artists", status_code=202)
+async def add_missing_artists(
+    playlist_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Add all 'Artist not in Lidarr' artists to Lidarr (monitor: none),
+    then re-run album suggestion builder so suggestions refresh with
+    real Lidarr albums.
+    """
+    import asyncio
+
+    pl = db.query(ImportedPlaylist).filter_by(
+        id=playlist_id, owner_user_id=current_user.user_id
+    ).first()
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+
+    # Find all "Artist not in Lidarr" suggestions
+    not_in_lidarr = (
+        db.query(ImportAlbumSuggestion)
+        .filter_by(playlist_id=playlist_id, album_name="Artist not in Lidarr")
+        .all()
+    )
+
+    if not not_in_lidarr:
+        return {"ok": True, "added": 0, "message": "All artists already in Lidarr."}
+
+    artist_names = [(s.artist_name, s.artist_mbid) for s in not_in_lidarr]
+
+    async def _add_artists_and_rebuild():
+        from database import SessionLocal
+        db2 = SessionLocal()
+        try:
+            base_url, api_key = _get_lidarr_creds(db2)
+            headers = {"X-Api-Key": api_key}
+
+            # Fetch profiles once
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                root_resp = await client.get(f"{base_url}/api/v1/rootfolder", headers=headers)
+                roots = root_resp.json() if root_resp.status_code == 200 else []
+                root_path = roots[0]["path"] if roots else "/music"
+
+                qp_resp = await client.get(f"{base_url}/api/v1/qualityprofile", headers=headers)
+                profiles = qp_resp.json() if qp_resp.status_code == 200 else []
+                quality_profile_id = next(
+                    (p["id"] for p in profiles if p.get("name", "").lower() == "jellydj"),
+                    profiles[0]["id"] if profiles else 1,
+                )
+
+                mp_resp = await client.get(f"{base_url}/api/v1/metadataprofile", headers=headers)
+                meta_profiles = mp_resp.json() if mp_resp.status_code == 200 else []
+                metadata_profile_id = meta_profiles[0]["id"] if meta_profiles else 1
+
+                # Pre-fetch existing artists ONCE
+                existing_resp = await client.get(f"{base_url}/api/v1/artist", headers=headers)
+                existing_ids = set()
+                if existing_resp.status_code == 200:
+                    existing_ids = {a["foreignArtistId"] for a in existing_resp.json()}
+
+                added = 0
+                for artist_name, artist_mbid in artist_names:
+                    try:
+                        # Quick check: if we have mbid from enrichment, check directly
+                        if artist_mbid and artist_mbid in existing_ids:
+                            log.info("Import: '%s' already in Lidarr (mbid match), skipping", artist_name)
+                            continue
+
+                        # Look up artist in Lidarr's metadata
+                        search_term = f"lidarr:{artist_mbid}" if artist_mbid else artist_name
+                        search_resp = await client.get(
+                            f"{base_url}/api/v1/artist/lookup",
+                            headers=headers,
+                            params={"term": search_term},
+                        )
+                        if search_resp.status_code != 200 or not search_resp.json():
+                            if artist_mbid:
+                                search_resp = await client.get(
+                                    f"{base_url}/api/v1/artist/lookup",
+                                    headers=headers,
+                                    params={"term": artist_name},
+                                )
+                            if search_resp.status_code != 200 or not search_resp.json():
+                                log.warning("Import: artist lookup failed for '%s'", artist_name)
+                                continue
+
+                        lidarr_artist = search_resp.json()[0]
+
+                        # Check foreignArtistId against existing
+                        if lidarr_artist.get("foreignArtistId") in existing_ids:
+                            log.info("Import: '%s' already in Lidarr (foreignId match), skipping", artist_name)
+                            continue
+
+                        # Strip all album monitoring from the lookup payload
+                        safe_artist = {**lidarr_artist}
+                        if "albums" in safe_artist:
+                            safe_artist["albums"] = [
+                                {**alb, "monitored": False}
+                                for alb in safe_artist["albums"]
+                            ]
+
+                        add_payload = {
+                            **safe_artist,
+                            "qualityProfileId": quality_profile_id,
+                            "metadataProfileId": metadata_profile_id,
+                            "rootFolderPath": root_path,
+                            "monitored": True,
+                            "monitor": "none",
+                            "addOptions": {
+                                "monitor": "none",
+                                "searchForMissingAlbums": False,
+                            },
+                        }
+                        add_resp = await client.post(
+                            f"{base_url}/api/v1/artist", headers=headers, json=add_payload
+                        )
+                        if add_resp.status_code in (200, 201):
+                            added += 1
+                            log.info("Import: added '%s' to Lidarr (monitor: none)", artist_name)
+                        else:
+                            log.warning("Import: failed to add '%s': HTTP %d", artist_name, add_resp.status_code)
+
+                        # Small delay to avoid hammering Lidarr
+                        await asyncio.sleep(1)
+                    except Exception as exc:
+                        log.error("Import: error adding '%s' to Lidarr: %s", artist_name, exc)
+
+            log.info("Import: added %d/%d artists to Lidarr, rebuilding suggestions…", added, len(artist_names))
+
+            # Wait for Lidarr to index the new artists
+            if added > 0:
+                await asyncio.sleep(5)
+
+            # Rebuild suggestions with the new artists now available
+            await build_album_suggestions(playlist_id, db2)
+
+        except Exception as exc:
+            log.error("Import: add-artists job failed: %s", exc)
+        finally:
+            db2.close()
+
+    background_tasks.add_task(_add_artists_and_rebuild)
+
+    return {
+        "ok": True,
+        "adding": len(artist_names),
+        "message": f"Adding {len(artist_names)} artist(s) to Lidarr and rebuilding suggestions…",
+    }
+
+
+# ── API Key Verification (used by browser extension) ─────────────────────────
+
+@router.get("/verify")
+def verify_api_key(
+    current_user: UserContext = Depends(get_user_from_api_key_or_jwt),
+):
+    """Lightweight endpoint for the browser extension to validate its API key."""
+    return {"ok": True, "username": current_user.username}
 
 
 # ── API Key Management ────────────────────────────────────────────────────────

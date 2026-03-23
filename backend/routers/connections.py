@@ -257,16 +257,52 @@ async def test_jellyfin(_: UserContext = Depends(require_admin), db: Session = D
 
 @router.get("/jellyfin/users/tracked")
 def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
-    users = db.query(ManagedUser).filter_by(has_activated=True).all()
-    return [
-        {
-            "jellyfin_user_id": u.jellyfin_user_id,
-            "username": u.username,
-            "is_admin": u.is_admin,
-            "last_login_at": u.last_login_at,
-        }
-        for u in users
-    ]
+    """List all Jellyfin users with JellyDJ activation status for admin UI."""
+    import asyncio
+    obj = _get_or_create(db, "jellyfin")
+    if not obj.base_url or not obj.api_key_encrypted:
+        raise HTTPException(400, "Jellyfin not configured.")
+
+    api_key = decrypt(obj.api_key_encrypted)
+    jellyfin_users = {}
+
+    # Fetch all Jellyfin users
+    async def fetch_jellyfin_users():
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            try:
+                resp = await client.get(
+                    f"{obj.base_url}/Users",
+                    headers={"X-Emby-Token": api_key}
+                )
+                resp.raise_for_status()
+                return {u["Id"]: u["Name"] for u in resp.json()}
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to fetch Jellyfin users: {e}")
+                return {}
+
+    try:
+        jellyfin_users = asyncio.run(fetch_jellyfin_users())
+    except Exception:
+        jellyfin_users = {}
+
+    # Get JellyDJ-managed users
+    managed = {u.jellyfin_user_id: u for u in db.query(ManagedUser).all()}
+
+    # Return all Jellyfin users with their JellyDJ status
+    result = []
+    for jf_id, jf_name in jellyfin_users.items():
+        managed_user = managed.get(jf_id)
+        result.append({
+            "jellyfin_user_id": jf_id,
+            "jellyfin_username": jf_name,
+            "jellydj_username": managed_user.username if managed_user else None,
+            "has_activated": managed_user.has_activated if managed_user else False,
+            "is_admin": managed_user.is_admin if managed_user else False,
+            "last_login_at": managed_user.last_login_at if managed_user else None,
+        })
+
+    return sorted(result, key=lambda x: x["jellyfin_username"])
 
 
 @router.delete("/jellyfin/users/{jellyfin_user_id}")
@@ -341,6 +377,33 @@ async def sync_managed_user_names(_: UserContext = Depends(require_admin), db: S
             managed.username = jf_users[managed.jellyfin_user_id]
     db.commit()
     return {"ok": True}
+
+
+@router.post("/jellyfin/users/add-test-user")
+def add_test_user(
+    jellyfin_user_id: str,
+    username: str,
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually add/activate a test user without requiring a playlist push.
+    Useful for testing. Creates or updates the managed_users row.
+    """
+    existing = db.query(ManagedUser).filter_by(jellyfin_user_id=jellyfin_user_id).first()
+    if existing:
+        existing.username = username
+        existing.has_activated = True
+        existing.is_admin = False
+    else:
+        db.add(ManagedUser(
+            jellyfin_user_id=jellyfin_user_id,
+            username=username,
+            has_activated=True,
+            is_admin=False,
+        ))
+    db.commit()
+    return {"ok": True, "message": f"Test user {username} ({jellyfin_user_id}) activated"}
 
 
 # ── Lidarr endpoints ──────────────────────────────────────────────────────────

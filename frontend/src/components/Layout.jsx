@@ -27,7 +27,7 @@ const PAGE_LABELS = {
   dashboard: 'Dashboard', playlists: 'Playlists',
   discovery: 'Discovery', insights: 'Insights',
   connections: 'Connections', settings: 'Settings', exclusions: 'Exclusions',
-  import: 'Import',
+  import: 'Import', setup: 'Extension Setup',
   admin: 'Admin', users: 'User Management', 'playlist-backups': 'Playlist Backups',
 }
 

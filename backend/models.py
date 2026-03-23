@@ -752,6 +752,11 @@ class ImportAlbumSuggestion(Base):
     lidarr_status    = Column(String, nullable=False, default="pending")
     lidarr_queued_at = Column(DateTime, nullable=True)
     created_at       = Column(DateTime, default=datetime.utcnow)
+    # v2: enriched album suggestion metadata
+    artist_mbid      = Column(String, nullable=True)
+    album_mbid       = Column(String, nullable=True)
+    image_url        = Column(String, nullable=True)
+    missing_tracks   = Column(Text, nullable=True)   # JSON list of track names
 
 
 class ImportAPIKey(Base):

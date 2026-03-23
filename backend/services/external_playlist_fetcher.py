@@ -1,36 +1,25 @@
 """
 JellyDJ — External Playlist Fetcher
 
-Fetches playlist metadata from Spotify, Tidal, and YouTube Music URLs
-WITHOUT requiring any API keys or user accounts.
+Fetches playlist metadata from Spotify, Tidal, and YouTube Music URLs.
 
 Strategy
 ────────
-We use yt-dlp, which is already a common self-hosted tool dependency,
-to extract playlist metadata. yt-dlp supports all three platforms via
-its extractors and returns clean JSON — no authentication needed for
-public playlists.
-
-For Spotify, yt-dlp uses the open.spotify.com embed endpoint to get
-track listings from public playlists. Tidal and YouTube Music have
-native extractors.
-
-yt-dlp must be installed in the container — add it to requirements.txt:
-  yt-dlp>=2024.1.0
-
-Docker note: yt-dlp does NOT download audio here — we only call it with
---flat-playlist --dump-single-json --no-download, so there is no
-ffmpeg dependency and no network-heavy operation. A typical 50-track
-Spotify playlist fetch takes ~3-8 seconds.
+- Spotify: Fetches the public embed page and extracts track data from the
+  server-rendered HTML. No API keys or user auth required — works for any
+  public playlist. Falls back to suggesting the browser extension if the
+  embed page doesn't yield tracks.
+- Tidal / YouTube Music: Uses yt-dlp to extract playlist metadata.
+  yt-dlp is called with --flat-playlist --dump-single-json --no-download
+  (metadata only, no audio, no ffmpeg dependency).
 
 Security
 ────────
-- URL is validated against an allowlist of known platform domains before
-  being passed to yt-dlp.
+- URL is validated against an allowlist of known platform domains.
 - yt-dlp is called as a subprocess with a strict argument list (no shell=True).
 - We never pass user input into a shell command.
 - Output is captured and parsed as JSON — never eval'd.
-- Timeout is enforced at 60 seconds; after that the process is killed.
+- Timeout is enforced at 90 seconds; after that the process is killed.
 
 Supported URL patterns
 ──────────────────────
@@ -135,6 +124,158 @@ def _extract_source_id(url: str, platform: str) -> str:
     return ""
 
 
+def _find_track_list(obj, depth=0):
+    """
+    Recursively search a nested dict/list for the first list of dicts
+    that look like tracks (have a 'title' or 'name' key).
+    """
+    if depth > 10:
+        return None
+    if isinstance(obj, list) and len(obj) >= 2:
+        # Check if this looks like a track list
+        if all(isinstance(item, dict) and ("title" in item or "name" in item)
+               for item in obj[:3]):
+            return obj
+    if isinstance(obj, dict):
+        for value in obj.values():
+            result = _find_track_list(value, depth + 1)
+            if result:
+                return result
+    if isinstance(obj, list):
+        for item in obj:
+            result = _find_track_list(item, depth + 1)
+            if result:
+                return result
+    return None
+
+
+def _fetch_spotify_embed(url: str) -> dict:
+    """
+    Fetch Spotify playlist tracks from the public embed endpoint.
+
+    Spotify's embed page at /embed/playlist/{id} returns HTML containing
+    a <script id="__NEXT_DATA__"> tag with full track listings as JSON.
+    No API key, no auth, no premium account needed — just a public playlist.
+    """
+    import httpx
+
+    playlist_id = _extract_source_id(url, "spotify")
+    if not playlist_id:
+        raise FetchError("Could not extract Spotify playlist ID from URL")
+
+    embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+    log.info("Fetching Spotify embed: %s", embed_url)
+
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+            resp = client.get(embed_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            })
+            resp.raise_for_status()
+            html = resp.text
+    except Exception as exc:
+        raise FetchError(f"Failed to fetch Spotify embed page: {exc}")
+
+    # Extract __NEXT_DATA__ JSON blob from the HTML
+    match = re.search(
+        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">\s*({.+?})\s*</script>',
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        raise FetchError(
+            "Could not extract track data from Spotify embed page. "
+            "The playlist may be private. Try using the browser extension instead."
+        )
+
+    try:
+        next_data = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"Failed to parse Spotify embed data: {exc}")
+
+    # Navigate the __NEXT_DATA__ structure to find track list.
+    # The embed structure has changed over time, so we try multiple paths.
+    track_list = None
+    playlist_name = "Spotify Playlist"
+
+    # Known paths for the track list in __NEXT_DATA__
+    _PATHS = [
+        # 2024+ structure
+        lambda d: d["props"]["pageProps"]["state"]["data"]["entity"],
+        # Alternate structure
+        lambda d: d["props"]["pageProps"],
+    ]
+
+    for path_fn in _PATHS:
+        try:
+            entity = path_fn(next_data)
+            tl = entity.get("trackList") or entity.get("tracks") or entity.get("items")
+            if tl and isinstance(tl, list) and len(tl) > 0:
+                track_list = tl
+                playlist_name = entity.get("name") or entity.get("title") or playlist_name
+                break
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+    # Fallback: recursively search for any list of dicts containing "title" keys
+    if not track_list:
+        track_list = _find_track_list(next_data)
+
+    if not track_list:
+        raise FetchError(
+            "No tracks found in Spotify embed. The playlist may be empty, "
+            "private, or the embed format has changed. "
+            "Please use the browser extension to import this playlist."
+        )
+
+    tracks = []
+    for pos, item in enumerate(track_list, start=1):
+        if not isinstance(item, dict):
+            continue
+        # Try multiple field names for track title
+        track_name = (
+            item.get("title") or item.get("name") or
+            item.get("track_name") or ""
+        )
+        # Artist: could be "subtitle", "artists", "artist_name", or "artist"
+        artist_name = item.get("subtitle") or item.get("artist_name") or ""
+        if not artist_name:
+            artists = item.get("artists")
+            if isinstance(artists, list):
+                names = [a.get("name", "") for a in artists if isinstance(a, dict)]
+                artist_name = ", ".join(n for n in names if n)
+            elif isinstance(artists, str):
+                artist_name = artists
+        if not artist_name:
+            artist_name = item.get("artist") or ""
+        album_name = item.get("album") or item.get("album_name") or ""
+        if isinstance(album_name, dict):
+            album_name = album_name.get("name", "")
+        duration_ms = item.get("duration") or item.get("duration_ms") or None
+
+        if not track_name:
+            continue
+
+        tracks.append({
+            "position":    pos,
+            "track_name":  track_name.strip(),
+            "artist_name": artist_name.strip(),
+            "album_name":  album_name.strip() if isinstance(album_name, str) else "",
+            "duration_ms": duration_ms,
+        })
+
+    log.info("Spotify embed: found %d tracks in '%s'", len(tracks), playlist_name)
+
+    return {
+        "platform":    "spotify",
+        "source_id":   playlist_id,
+        "name":        playlist_name,
+        "description": None,
+        "tracks":      tracks,
+    }
+
+
 def fetch_playlist_metadata(url: str) -> dict:
     """
     Fetch playlist metadata using yt-dlp.
@@ -164,9 +305,14 @@ def fetch_playlist_metadata(url: str) -> dict:
     """
     url = _validate_url(url)
     platform = detect_platform(url)
+
+    # Spotify: use embed page scraper (yt-dlp doesn't support Spotify DRM)
+    if platform == "spotify":
+        return _fetch_spotify_embed(url)
+
     source_id = _extract_source_id(url, platform)
 
-    log.info("Fetching %s playlist: %s", platform, url)
+    log.info("Fetching %s playlist via yt-dlp: %s", platform, url)
 
     cmd = [
         "yt-dlp",

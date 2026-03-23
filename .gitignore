@@ -3,6 +3,7 @@
 *.env
 !.env.example
 repomix-output.xml
+.claude
 
 # ── Python ───────────────────────────────────────────────────
 __pycache__/

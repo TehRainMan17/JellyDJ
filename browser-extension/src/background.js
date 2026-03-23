@@ -5,7 +5,30 @@
  *  - Storing the JellyDJ instance URL and auth token (set once in popup)
  *  - Receiving importPlaylist messages from content.js
  *  - POSTing the track data to the configured JellyDJ instance
+ *  - Re-injecting content scripts into open tabs on extension reload
  */
+
+// On install/reload, re-inject content.js into any matching tabs so the
+// user doesn't need to manually refresh Spotify/Tidal/YTM pages.
+chrome.runtime.onInstalled.addListener(() => {
+  const patterns = [
+    'https://open.spotify.com/playlist/*',
+    'https://tidal.com/browse/playlist/*',
+    'https://listen.tidal.com/playlist/*',
+    'https://music.youtube.com/playlist*',
+    'https://www.youtube.com/playlist*',
+  ];
+  for (const pattern of patterns) {
+    chrome.tabs.query({ url: pattern }, (tabs) => {
+      for (const tab of tabs) {
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['src/content.js'],
+        }).catch(() => {}); // ignore tabs that can't be injected
+      }
+    });
+  }
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'importPlaylist') {
@@ -40,7 +63,7 @@ async function handleImport(data) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(jellydjToken ? { 'Authorization': `Bearer ${jellydjToken}` } : {}),
+        ...(jellydjToken ? { 'X-JellyDJ-Key': jellydjToken } : {}),
       },
       body: JSON.stringify({
         url:           data.url,

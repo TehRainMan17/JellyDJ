@@ -95,47 +95,6 @@
   bottom-right corner of the page. Click it to import.
 </p>
 
-<script>
-const urlInput   = document.getElementById('url');
-const tokenInput = document.getElementById('token');
-const saveBtn    = document.getElementById('save');
-const statusEl   = document.getElementById('status');
-
-// Load saved config
-chrome.runtime.sendMessage({ action: 'getConfig' }, (result) => {
-  if (result?.jellydjUrl)   urlInput.value   = result.jellydjUrl;
-  if (result?.jellydjToken) tokenInput.value = result.jellydjToken;
-});
-
-saveBtn.addEventListener('click', async () => {
-  const url   = urlInput.value.trim();
-  const token = tokenInput.value.trim();
-
-  if (!url) {
-    showStatus('URL is required.', 'err');
-    return;
-  }
-
-  // Validate by hitting the health endpoint
-  try {
-    const resp = await fetch(url.replace(/\/$/, '') + '/api/connections/jellyfin', {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  } catch (err) {
-    showStatus('Could not reach JellyDJ: ' + err.message, 'err');
-    return;
-  }
-
-  chrome.runtime.sendMessage({ action: 'saveConfig', url, token }, () => {
-    showStatus('Saved! Browse to a playlist to import it.', 'ok');
-  });
-});
-
-function showStatus(msg, type) {
-  statusEl.textContent = msg;
-  statusEl.className = 'status ' + (type || '');
-}
-</script>
+<script src="src/popup.js"></script>
 </body>
 </html>

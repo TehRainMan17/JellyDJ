@@ -5,14 +5,19 @@
   "description": "Send playlists from Spotify, Tidal, or YouTube Music directly to JellyDJ.",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "https://open.spotify.com/*",
     "https://tidal.com/*",
     "https://listen.tidal.com/*",
     "https://music.youtube.com/*",
-    "https://www.youtube.com/*"
+    "https://www.youtube.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "action": {
     "default_popup": "popup.html",

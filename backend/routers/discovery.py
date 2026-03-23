@@ -98,11 +98,14 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
                 return {"ok": False, "message": "No root folders configured in Lidarr"}
             root_path = roots[0]["path"]
 
-            # Step 4: get quality profile
+            # Step 4: get quality profile (prefer "JellyDJ" profile)
             qp_resp = await client.get(f"{base_url}/api/v1/qualityprofile", headers=headers)
             qp_resp.raise_for_status()
             profiles = qp_resp.json()
-            quality_profile_id = profiles[0]["id"] if profiles else 1
+            quality_profile_id = next(
+                (p["id"] for p in profiles if p.get("name", "").lower() == "jellydj"),
+                profiles[0]["id"] if profiles else 1,
+            )
 
             # Step 5: get metadata profile
             mp_resp = await client.get(f"{base_url}/api/v1/metadataprofile", headers=headers)
@@ -111,8 +114,16 @@ async def _send_to_lidarr(artist_name: str, album_name: str, base_url: str, api_
             metadata_profile_id = meta_profiles[0]["id"] if meta_profiles else 1
 
             # Step 6: add artist — monitored for FUTURE releases only
+            # Strip all album monitoring from lookup payload to prevent
+            # Lidarr from auto-downloading existing albums
+            safe_artist = {**artist}
+            if "albums" in safe_artist:
+                safe_artist["albums"] = [
+                    {**alb, "monitored": False}
+                    for alb in safe_artist["albums"]
+                ]
             add_payload = {
-                **artist,
+                **safe_artist,
                 "qualityProfileId": quality_profile_id,
                 "metadataProfileId": metadata_profile_id,
                 "rootFolderPath": root_path,

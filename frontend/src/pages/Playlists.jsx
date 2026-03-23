@@ -9,13 +9,209 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   ListMusic, Clock, Layers, Search, Plus, CheckCircle2, XCircle,
-  ChevronDown, ChevronUp, Loader2, GitFork, History
+  ChevronDown, ChevronUp, Loader2, GitFork, History, Trash2, ExternalLink, RefreshCw,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import { api } from '../lib/api.js'
 import PlaylistRow from '../components/playlist/PlaylistRow.jsx'
 import TemplateCard from '../components/playlist/TemplateCard.jsx'
 import BlockEditor from '../components/playlist/BlockEditor.jsx'
+import { useJellyfinUrl } from '../hooks/useJellyfinUrl.js'
+import JellyfinIcon from '../components/JellyfinIcon.jsx'
+import PlatformIcon from '../components/PlatformIcon.jsx'
+
+// ── Platform badge (matches PlaylistImport.jsx) ──────────────────────────────
+
+const PLATFORM_LABELS = {
+  spotify:       { label: 'Spotify',       color: '#1db954' },
+  tidal:         { label: 'Tidal',         color: '#00ffff' },
+  youtube_music: { label: 'YouTube Music', color: '#ff0000' },
+  unknown:       { label: 'Unknown',       color: '#888' },
+}
+
+function PlatformBadge({ platform }) {
+  const { label, color } = PLATFORM_LABELS[platform] || PLATFORM_LABELS.unknown
+  return (
+    <span
+      className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full"
+      style={{ background: `${color}22`, color, border: `1px solid ${color}44` }}
+    >
+      {label}
+    </span>
+  )
+}
+
+// ── Imported Playlist Row ────────────────────────────────────────────────────
+
+function ImportedPlaylistRow({ playlist, onDelete, onRematched }) {
+  const navigate = useNavigate()
+  const { buildItemUrl } = useJellyfinUrl()
+  const [confirmDel, setConfirm] = useState(false)
+  const [deleting, setDeleting]  = useState(false)
+  const [rematching, setRematching] = useState(false)
+
+  const handleDelete = async () => {
+    if (!confirmDel) { setConfirm(true); return }
+    setDeleting(true)
+    try {
+      await api.delete(`/api/import/playlists/${playlist.id}`)
+      onDelete(playlist.id)
+    } catch (e) {
+      alert(`Delete failed: ${e.message}`)
+      setDeleting(false)
+      setConfirm(false)
+    }
+  }
+
+  const handleRematch = async () => {
+    setRematching(true)
+    try {
+      await api.post(`/api/import/playlists/${playlist.id}/rematch`)
+      const poll = setInterval(async () => {
+        try {
+          const det = await api.get(`/api/import/playlists/${playlist.id}`)
+          if (det.status === 'active' || det.status === 'error') {
+            clearInterval(poll)
+            setRematching(false)
+            onRematched()
+          }
+        } catch {
+          clearInterval(poll)
+          setRematching(false)
+        }
+      }, 2000)
+    } catch (err) {
+      alert('Re-match failed: ' + err.message)
+      setRematching(false)
+    }
+  }
+
+  const jellyfinUrl = playlist.jellyfin_playlist_id
+    ? buildItemUrl(playlist.jellyfin_playlist_id)
+    : null
+
+  const matchPct = playlist.match_pct ?? (
+    playlist.track_count ? Math.round(playlist.matched_count / playlist.track_count * 100) : 0
+  )
+  const isBusy = playlist.status === 'pending' || playlist.status === 'matching'
+
+  return (
+    <div className="card space-y-3 anim-fade-up" style={{ padding: '0.875rem 1rem' }}>
+      {/* Row 1: Name + source + actions */}
+      <div className="flex items-start gap-3">
+        <PlatformIcon platform={playlist.source_platform} size={24} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => navigate(`/import/${playlist.id}`)}
+              className="text-sm font-semibold truncate hover:underline text-left"
+              style={{ color: 'var(--text-primary)' }}
+            >
+              {playlist.name}
+            </button>
+            {jellyfinUrl && (
+              <a
+                href={jellyfinUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open in Jellyfin"
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold flex-shrink-0
+                           border border-[var(--border)] bg-[var(--bg-overlay)]
+                           hover:border-[var(--accent)]/50 hover:bg-[var(--accent)]/10
+                           transition-all duration-150"
+                onClick={e => e.stopPropagation()}
+              >
+                <JellyfinIcon size={14} />
+                <span className="hidden sm:inline text-white">Jellyfin</span>
+              </a>
+            )}
+          </div>
+          <div className="flex items-center gap-2 mt-1">
+            <PlatformBadge platform={playlist.source_platform} />
+            {isBusy && (
+              <span className="flex items-center gap-1 text-[10px]" style={{ color: '#fbbf24' }}>
+                <Loader2 size={9} className="animate-spin" />
+                {playlist.status === 'matching' ? 'Re-matching…' : 'Matching…'}
+              </span>
+            )}
+            {!isBusy && (
+              <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Imported</span>
+            )}
+          </div>
+        </div>
+
+        {/* Rematch */}
+        <button
+          onClick={handleRematch}
+          disabled={rematching || isBusy}
+          className="btn-secondary text-xs py-1.5 px-2.5 flex-shrink-0"
+          title="Re-check library & push to Jellyfin"
+        >
+          {rematching ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+        </button>
+
+        {/* View detail */}
+        <button
+          onClick={() => navigate(`/import/${playlist.id}`)}
+          className="btn-secondary text-xs py-1.5 px-2.5 flex-shrink-0"
+          title="View import details"
+        >
+          <ExternalLink size={11} />
+        </button>
+
+        {/* Delete */}
+        <button
+          onClick={handleDelete}
+          disabled={deleting}
+          className="btn-secondary text-xs py-1.5 px-2.5 flex-shrink-0"
+          title={confirmDel ? 'Click again to confirm delete' : 'Delete imported playlist'}
+          style={confirmDel ? { borderColor: 'rgba(248,113,113,0.4)', color: 'var(--danger)' } : {}}
+        >
+          {deleting ? <Loader2 size={11} className="animate-spin" /> : <Trash2 size={11} />}
+        </button>
+      </div>
+
+      {/* Delete confirm */}
+      {confirmDel && !deleting && (
+        <div
+          className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg anim-scale-in text-xs"
+          style={{ background: 'rgba(248,113,113,0.06)', border: '1px solid rgba(248,113,113,0.2)' }}
+        >
+          <span style={{ color: 'var(--danger)' }}>Delete this imported playlist and its data?</span>
+          <button onClick={() => setConfirm(false)} className="font-medium flex-shrink-0" style={{ color: 'var(--text-muted)' }}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* Row 2: Stats */}
+      <div className="flex items-center gap-4 flex-wrap">
+        <div>
+          <div className="section-label">Match rate</div>
+          <div className="text-xs mt-0.5" style={{ color: matchPct >= 80 ? 'var(--accent)' : matchPct >= 50 ? '#fbbf24' : 'var(--danger)' }}>
+            {playlist.matched_count}/{playlist.track_count} tracks ({matchPct}%)
+          </div>
+        </div>
+        <div>
+          <div className="section-label">Status</div>
+          <div className="text-xs mt-0.5" style={{ color: playlist.status === 'active' ? 'var(--accent)' : 'var(--text-secondary)' }}>
+            {playlist.status}
+          </div>
+        </div>
+        {playlist.created_at && (
+          <div>
+            <div className="section-label">Imported</div>
+            <div className="text-xs mt-0.5" style={{ color: 'var(--text-primary)' }}>
+              {new Date(playlist.created_at.endsWith('Z') || playlist.created_at.includes('+')
+                ? playlist.created_at : playlist.created_at + 'Z').toLocaleDateString()}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -213,6 +409,7 @@ export default function Playlists() {
   const [tab, setTab]             = useState('playlists')
 
   const [myPlaylists, setMyPls]   = useState([])
+  const [importedPls, setImPls]   = useState([])
   const [plsLoading, setPlsLoad]  = useState(true)
   const [adminUsers, setAdminU]   = useState([])
   const [selectedUser, setSelU]   = useState(null)
@@ -236,8 +433,12 @@ export default function Playlists() {
     setPlsLoad(true)
     try {
       const url = userId ? `/api/user-playlists?user_id=${userId}` : '/api/user-playlists'
-      const data = await api.get(url)
-      setMyPls(data)
+      const [userPls, imported] = await Promise.all([
+        api.get(url),
+        api.get('/api/import/playlists'),
+      ])
+      setMyPls(userPls)
+      setImPls(imported)
     } catch {}
     setPlsLoad(false)
   }, [])
@@ -316,6 +517,10 @@ export default function Playlists() {
 
   const handlePlaylistDelete = useCallback((id) => {
     setMyPls(prev => prev.filter(p => p.id !== id))
+  }, [])
+
+  const handleImportedDelete = useCallback((id) => {
+    setImPls(prev => prev.filter(p => p.id !== id))
   }, [])
 
   const handleForkSuccess = (forked) => {
@@ -413,35 +618,68 @@ export default function Playlists() {
               <Loader2 size={16} className="animate-spin" style={{ color: 'var(--accent)' }} />
               <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>Loading playlists…</span>
             </div>
-          ) : myPlaylists.length === 0 ? (
+          ) : myPlaylists.length === 0 && importedPls.length === 0 ? (
             <div className="card flex flex-col items-center justify-center py-16 gap-4 text-center anim-scale-in">
               <ListMusic size={28} strokeWidth={1.25} style={{ color: 'var(--text-muted)' }} />
               <div>
                 <div className="text-sm font-semibold" style={{ color: 'var(--text-secondary)' }}>No playlists yet</div>
-                <div className="text-xs mt-1 max-w-xs" style={{ color: 'var(--text-muted)' }}>Go to the Template Gallery to create your first one.</div>
+                <div className="text-xs mt-1 max-w-xs" style={{ color: 'var(--text-muted)' }}>Go to the Template Gallery to create your first one, or import a playlist from Spotify, Tidal, or YouTube Music.</div>
               </div>
               <button onClick={() => setTab('gallery')} className="btn-secondary text-xs">
                 Browse Templates
               </button>
             </div>
           ) : (
-            <div className="space-y-2 stagger">
-              {myPlaylists.map(pl => (
-                <div
-                  key={pl.id}
-                  style={highlightedPlId === pl.id ? {
-                    boxShadow: '0 0 0 2px rgba(83,236,252,0.3)',
-                    borderRadius: 14,
-                  } : {}}
-                >
-                  <PlaylistRow
-                    playlist={pl}
-                    onUpdate={handlePlaylistUpdate}
-                    onDelete={handlePlaylistDelete}
-                    onTemplateClick={handleTemplateLinkClick}
-                  />
+            <div className="space-y-4">
+              {/* Template-driven playlists */}
+              {myPlaylists.length > 0 && (
+                <div className="space-y-2">
+                  {importedPls.length > 0 && (
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="section-label">Template Playlists</span>
+                      <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+                    </div>
+                  )}
+                  <div className="space-y-2 stagger">
+                    {myPlaylists.map(pl => (
+                      <div
+                        key={pl.id}
+                        style={highlightedPlId === pl.id ? {
+                          boxShadow: '0 0 0 2px rgba(83,236,252,0.3)',
+                          borderRadius: 14,
+                        } : {}}
+                      >
+                        <PlaylistRow
+                          playlist={pl}
+                          onUpdate={handlePlaylistUpdate}
+                          onDelete={handlePlaylistDelete}
+                          onTemplateClick={handleTemplateLinkClick}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))}
+              )}
+
+              {/* Imported playlists */}
+              {importedPls.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="section-label">Imported Playlists</span>
+                    <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+                  </div>
+                  <div className="space-y-2 stagger">
+                    {importedPls.map(pl => (
+                      <ImportedPlaylistRow
+                        key={`imp-${pl.id}`}
+                        playlist={pl}
+                        onDelete={handleImportedDelete}
+                        onRematched={() => fetchPlaylists(selectedUser)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -10,7 +10,15 @@
       "Bash(cd F:/Docker/JellyDJ && sleep 3 && docker compose exec backend python -c \"\nfrom database import SessionLocal\nfrom models import ImportAPIKey\ndb = SessionLocal\\(\\)\nkeys = db.query\\(ImportAPIKey\\).all\\(\\)\nprint\\(f'✓ ImportAPIKey table exists'\\)\nprint\\(f'✓ Columns: {[c.name for c in ImportAPIKey.__table__.columns]}'\\)\ndb.close\\(\\)\n\")",
       "Bash(docker compose:*)",
       "Bash(curl -s http://localhost:7879/api/health | python -m json.tool)",
-      "Bash(curl -s http://localhost:7879/ | grep -o \"PlaylistImport\\\\|/import\" | head -5)"
+      "Bash(curl -s http://localhost:7879/ | grep -o \"PlaylistImport\\\\|/import\" | head -5)",
+      "Bash(sleep 3 && curl -s http://localhost:7879/ | grep -o \"ApiKeySection\\\\|Browser Extension API Key\" | head -3)",
+      "Bash(docker exec:*)",
+      "Bash(python -c \"from PIL import Image; print\\('pillow available'\\)\" 2>/dev/null || echo \"no pillow\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"\nfrom PIL import Image\nsrc = Image.open\\('F:/Docker/JellyDJ/frontend/public/android-chrome-192x192.png'\\)\nfor size, name in [\\(16,'icon16'\\), \\(48,'icon48'\\), \\(128,'icon128'\\)]:\n    img = src.resize\\(\\(size, size\\), Image.LANCZOS\\)\n    img.save\\(f'F:/Docker/JellyDJ/browser-extension/icons/{name}.png'\\)\n    print\\(f'Saved {name}.png \\({size}x{size}\\)'\\)\n\")",
+      "Bash(python -c \"\nimport base64\nfrom PIL import Image\nimport io\n\nimg = Image.open\\('F:/Docker/JellyDJ/frontend/public/android-chrome-192x192.png'\\)\nimg = img.resize\\(\\(20, 20\\), Image.LANCZOS\\)\nbuf = io.BytesIO\\(\\)\nimg.save\\(buf, format='PNG'\\)\nb64 = base64.b64encode\\(buf.getvalue\\(\\)\\).decode\\(\\)\nprint\\(f'data:image/png;base64,{b64}'\\)\n\" 2>&1)",
+      "Bash(find /f/Docker/JellyDJ -name \"*.db\" -o -name \"*.sqlite\" 2>/dev/null | head -5)",
+      "Bash(docker ps:*)"
     ]
   }
 }
