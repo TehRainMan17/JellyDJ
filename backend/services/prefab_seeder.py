@@ -19,39 +19,39 @@ Responsibilities
 Both are called from main.py lifespan on every boot; they no-op instantly
 after the first successful run.
 
-v7 change — "New For You" philosophy inversion:
-  Previous designs (v5, v6) both had a large block that pulled from
-  high-affinity artists (artists you already listen to a lot).  The result
-  was a playlist dominated by deep cuts from your heavy-rotation artists —
-  exactly the opposite of what "New For You" should do.
+v8 change — "New For You" affinity-first rework:
+  v7 used global_popularity as the primary filter, which caused rap and mainstream
+  pop to dominate discovery regardless of the user's actual taste.  Globally
+  popular ≠ personally relevant.
 
   The correct intent is:
-    - Prioritise globally popular unheard tracks from artists you don't
-      already know well (strangers + acquaintances ranked by global_popularity).
-    - Allow a familiar artist's song in only if it is overwhelmingly globally
-      popular (popularity >= 80) — i.e. you'd be embarrassed not to know it.
+    - Build a candidate pool from genres and artists the user actually likes
+      (affinity-first), then rank by popularity within that pool.
+    - Surface unknown artists whose best songs fall inside the user's taste
+      footprint — this is the most desirable discovery outcome.
+    - Branch into adjacent genres (e.g. Pop Rock → Rock → Alt Rock) to gently
+      expand the user's taste without jumping to unrelated genres.
     - Keep a small buffer of high-score played tracks as anchors so the
-      playlist isn't 100% unfamiliar.
+      playlist stays listenable.
 
-  New three-block design:
+  New three-block design (v8):
 
-    Block 0 — "Popular Strangers & Acquaintances" (weight 60)
-      Unplayed tracks from artists you have NOT listened to much
-      (stranger + acquaintance tiers only, familiar_pct = 0), hard-filtered
-      to global_popularity >= 60.  This surfaces the best new-to-you music
-      with a real quality signal behind it.
+    Block 0 — "Liked Genre Discovery" (weight 55)
+      Unplayed tracks in genres where the user has affinity >= 40, restricted
+      to stranger and acquaintance artists only (familiar_pct = 0).  Ranked by
+      final_score (which folds in genre/artist affinity + popularity nudge),
+      1 track per artist for maximum breadth.
 
-    Block 1 — "Mega-Hits from Familiar Artists" (weight 25)
-      Unplayed tracks from artists you DO know well, but only those with
-      global_popularity >= 80.  The high floor is intentional — if you
-      listen to Imagine Dragons constantly and there's a song you haven't
-      heard, it should only surface here if it's genuinely one of their
-      biggest tracks, not a B-side.
+    Block 1 — "Adjacent Genre Discovery" (weight 30)
+      Unplayed tracks in genres adjacent to the user's high-affinity genres,
+      again restricted to strangers and acquaintances.  Uses the hardcoded
+      GENRE_ADJACENCY map to branch into related genres (e.g. if you like
+      Folk, this surfaces Americana, Singer-Songwriter, Indie Folk).  Slightly
+      higher jitter than Block 0 so genre branching stays varied.
 
     Block 2 — "Familiar Anchors" (weight 15)
-      A small slice of recently played, high-scoring tracks.  Keeps the
-      playlist listenable and prevents cold-start overwhelm.  This is the
-      only place where your heavy-rotation artists appear without restriction.
+      Unchanged from v7: a small slice of recently played, high-scoring tracks
+      to keep the playlist listenable and prevent cold-start overwhelm.
 """
 
 from __future__ import annotations
@@ -114,61 +114,64 @@ def _blocks_for_you() -> list[dict]:
 
 def _blocks_new_for_you() -> list[dict]:
     """
-    Popularity-first discovery: best globally popular unheard tracks,
-    familiar artists only when overwhelmingly popular.
+    Affinity-first discovery: pool from genres/artists the user likes,
+    ranked by score within that pool, with a genre-branching slot.
 
-      60% — Popular Strangers & Acquaintances
-        Unplayed tracks from artists you don't know well yet, filtered to
-        global_popularity >= 60.  Uses the discovery block with familiar_pct=0
-        so your heavy-rotation artists are completely excluded from this slot.
-        Ranked by popularity (jitter keeps it from being identical every run).
+      55% — Liked Genre Discovery
+        Unplayed tracks in genres the user has affinity >= 40 for, from
+        artists they don't know well yet (stranger + acquaintance tiers,
+        familiar_pct=0).  Ranked by final_score (genre/artist affinity +
+        popularity nudge baked in), 1 track per artist for breadth.
 
-      25% — Mega-Hits from Familiar Artists
-        Unplayed tracks from well-known artists (artists you play often), but
-        only those scoring >= 80 global popularity.  This is the "you love
-        Imagine Dragons but somehow missed this massive song" slot.  The high
-        floor prevents deep cuts from heavy-rotation artists leaking in.
+      30% — Adjacent Genre Discovery
+        Unplayed tracks in genres adjacent to the user's high-affinity
+        genres, sourced via the GENRE_ADJACENCY map.  Same familiarity
+        constraint as Block 0.  Slightly higher jitter for variety.
+        Source genres (already liked) are excluded so this block branches
+        outward, not backward.
 
       15% — Familiar Anchors
-        Small slice of recently played high-scoring tracks so the playlist
-        stays listenable.
+        Small slice of recently played, high-scoring tracks so the
+        playlist stays listenable.
     """
     return [
-        # Block 0: Popular strangers & acquaintances — the main discovery engine
-        dict(block_type="discovery", weight=60, position=0,
+        # Block 0: Liked genre discovery — affinity-first main engine
+        dict(block_type="genre", weight=55, position=0,
              params=_tree([
-                 _node("discovery", {
-                     # familiar_pct = 0: completely exclude artists you listen to a lot.
-                     # All slots go to strangers and acquaintances.
-                     "familiar_pct": 0,
-                     "acquaintance_pct": 55,
-                     "stranger_pct": 45,
+                 _node("genre", {
+                     # No genre list = all genres; affinity_min narrows to only
+                     # genres the user has meaningfully engaged with.
+                     "genre_affinity_min": 40,
+                     "played_filter": "unplayed",
                  }, children=[
-                     # Hard floor of 60 so only genuinely popular tracks surface.
-                     # The discovery block's NULL-safe path keeps un-enriched tracks
-                     # out when a floor > 0 is set — intentional; we want a real
-                     # quality signal here, not a random un-scored track.
-                     _node("global_popularity", {"popularity_min": 60, "popularity_max": 100}),
-                     # 1 per artist max — maximise breadth of new artists heard.
+                     # Familiarity gate: strangers and acquaintances only.
+                     # familiar_pct=0 keeps heavy-rotation artists out entirely.
+                     _node("discovery", {
+                         "stranger_pct": 55,
+                         "acquaintance_pct": 45,
+                         "familiar_pct": 0,
+                     }),
                      _artist_cap(1),
-                     _jitter(0.18),
+                     _jitter(0.15),
                  ]),
              ])),
 
-        # Block 1: Mega-hits from familiar artists — high bar, tight filter
-        dict(block_type="global_popularity", weight=25, position=1,
+        # Block 1: Adjacent genre discovery — genre branching slot
+        dict(block_type="genre_adjacent", weight=30, position=1,
              params=_tree([
-                 _node("global_popularity", {"popularity_min": 80, "popularity_max": 100,
-                                             "played_filter": "unplayed"}, children=[
-                     # affinity_min=70 targets artists you genuinely listen to a lot.
-                     # Combined with popularity >= 80 this is a very tight filter:
-                     # only the biggest songs from your most-played artists.
-                     _node("affinity", {"affinity_min": 70, "affinity_max": 100,
-                                        "played_filter": "unplayed"}),
-                     _cooldown(),
-                     # 1 per artist so one beloved artist can't dominate.
+                 _node("genre_adjacent", {
+                     # Finds genres adjacent to those with affinity >= 40,
+                     # automatically excluding the source genres themselves.
+                     "genre_affinity_min": 40,
+                     "played_filter": "unplayed",
+                 }, children=[
+                     _node("discovery", {
+                         "stranger_pct": 60,
+                         "acquaintance_pct": 40,
+                         "familiar_pct": 0,
+                     }),
                      _artist_cap(1),
-                     _jitter(0.10),
+                     _jitter(0.18),
                  ]),
              ])),
 
@@ -225,7 +228,7 @@ _PREFABS = [
     ),
     (
         dict(name="New For You",
-             description="Globally popular tracks from artists you don't know yet, plus the biggest hits from artists you love that you've somehow missed.",
+             description="Unheard tracks in genres you love, plus a branch into adjacent genres you might not have explored yet.",
              owner_user_id=None, is_public=True, is_system=True,
              total_tracks=50, blend_mode="weighted_shuffle"),
         _blocks_new_for_you(),
@@ -331,23 +334,23 @@ def migrate_system_templates(db) -> None:
             PlaylistBlock.template_id == template.id
         ).all()
 
-        # v7 sentinel: the new "New For You" design is identified by having a
-        # global_popularity block at position 1.  Any prior design used
-        # discovery (v5 original), novelty (v6), or final_score at position 1.
+        # v8 sentinel: the new "New For You" design is identified by having a
+        # genre_adjacent block at position 1.  Prior designs used:
+        #   discovery (v5), novelty (v6), global_popularity (v7).
         if name == "New For You":
-            has_v7_design = any(
-                b.block_type == "global_popularity" and b.position == 1
+            has_v8_design = any(
+                b.block_type == "genre_adjacent" and b.position == 1
                 for b in existing_blocks
             )
-            if has_v7_design:
+            if has_v8_design:
                 log.debug(
-                    "migrate_system_templates: '%s' already on v7 design — skipping.", name
+                    "migrate_system_templates: '%s' already on v8 design — skipping.", name
                 )
                 skipped += 1
                 continue
             log.info(
-                "migrate_system_templates: '%s' (id=%d) — upgrading to v7 "
-                "popularity-first design.", name, template.id,
+                "migrate_system_templates: '%s' (id=%d) — upgrading to v8 "
+                "affinity-first design.", name, template.id,
             )
         else:
             already_migrated = any(

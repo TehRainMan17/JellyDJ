@@ -722,6 +722,84 @@ def execute_skip_streak_block(
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 
+def execute_genre_adjacent_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Unplayed tracks in genres adjacent to the user's high-affinity genres.
+
+    Uses the hardcoded GENRE_ADJACENCY map.  Source genres (those already at or
+    above the affinity threshold) are excluded from the result so this block
+    complements — rather than duplicates — a genre block set at the same threshold.
+
+    Params:
+      genre_affinity_min : float 0-100 (default 40) — minimum affinity for a genre
+                           to be considered a 'source' genre whose neighbours are
+                           surfaced.
+      played_filter      : 'all' | 'played' | 'unplayed' (default 'unplayed')
+    """
+    from models import TrackScore, GenreProfile
+    from services.genre_adjacency import GENRE_ADJACENCY, norm_genre
+
+    genre_affinity_min = float(params.get("genre_affinity_min", 40))
+    played_filter      = params.get("played_filter", "unplayed")
+
+    # 1. Load user's high-affinity genres — these are the 'source' genres.
+    source_rows = (
+        db.query(GenreProfile)
+        .filter(
+            GenreProfile.user_id == user_id,
+            _cast_float(GenreProfile.affinity_score) >= genre_affinity_min,
+        )
+        .all()
+    )
+    if not source_rows:
+        return set()
+
+    source_normalized = {norm_genre(r.genre) for r in source_rows if r.genre}
+
+    # 2. Expand to adjacent genres, excluding source genres themselves.
+    adjacent_normalized: set[str] = set()
+    for genre in source_normalized:
+        for adj in GENRE_ADJACENCY.get(genre, []):
+            if adj not in source_normalized:
+                adjacent_normalized.add(adj)
+
+    if not adjacent_normalized:
+        return set()
+
+    # 3. Map normalized adjacent names back to raw Jellyfin genre strings.
+    #    TrackScore.genre stores the original Jellyfin value ("Pop Rock", "Hip-Hop",
+    #    etc.) which may differ in casing or punctuation from our normalised keys.
+    #    We load all distinct genre values for this user and match via norm_genre().
+    library_genres = (
+        db.query(TrackScore.genre)
+        .filter(TrackScore.user_id == user_id, TrackScore.genre.isnot(None))
+        .distinct()
+        .all()
+    )
+    matching_raw: list[str] = [
+        row.genre for row in library_genres
+        if norm_genre(row.genre) in adjacent_normalized
+    ]
+    if not matching_raw:
+        return set()
+
+    # 4. Fetch tracks in those matching raw genres, ordered by final_score so
+    #    the engine surfaces the best candidates first after artist-cap + jitter.
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.genre.in_(matching_raw))
+        .order_by(satext("CAST(final_score AS REAL) DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 BLOCK_REGISTRY: dict = {
@@ -739,6 +817,8 @@ BLOCK_REGISTRY: dict = {
     "artist_cap":        execute_artist_cap_block,
     "jitter":            execute_jitter_block,
     "cooldown":          execute_cooldown_block,
+    # Discovery helper — uses genre adjacency map
+    "genre_adjacent":    execute_genre_adjacent_block,
     # New blocks (data already present — add to frontend FILTER_TYPES to expose)
     "skip_rate":         execute_skip_rate_block,
     "replay_boost":      execute_replay_boost_block,

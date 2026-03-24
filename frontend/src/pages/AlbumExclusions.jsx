@@ -229,7 +229,6 @@ export default function AlbumExclusions() {
     setSearching(true)
     setSearchErr(null)
     api.get(`/api/exclusions/search?q=${encodeURIComponent(debouncedQ.trim())}`)
-      .then(r => { if (!r.ok) throw new Error('Search failed'); return r.json() })
       .then(d => { setResults(d.results || []); setSearching(false) })
       .catch(e => { setSearchErr(e.message); setSearching(false) })
   }, [debouncedQ])
@@ -264,8 +263,7 @@ export default function AlbumExclusions() {
     setRemoving(id)
     const album = exclusions.find(e => e.id === id)
     try {
-      const r = await api.delete(`/api/exclusions/albums/${id}`)
-      if (!r.ok) throw new Error('Failed to remove')
+      await api.delete(`/api/exclusions/albums/${id}`)
       showToast(`"${album?.album_name ?? 'Album'}" removed — will appear in playlists again`)
       loadList()
       if (album && results) {

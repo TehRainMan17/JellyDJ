@@ -32,11 +32,20 @@ router = APIRouter(prefix="/api/exclusions", tags=["exclusions"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _jellyfin_creds(db: Session) -> tuple[str, str]:
+def _jellyfin_creds(db: Session) -> tuple[str, str, str]:
+    """Return (base_url, api_key, image_base_url).
+
+    base_url       — internal URL used for server-side API calls
+    api_key        — decrypted API key
+    image_base_url — browser-reachable URL for <img> src attributes;
+                     uses public_url when configured, otherwise base_url
+    """
     row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
     if not row or not row.base_url or not row.api_key_encrypted:
         raise RuntimeError("Jellyfin not configured")
-    return row.base_url.rstrip("/"), decrypt(row.api_key_encrypted)
+    base_url = row.base_url.rstrip("/")
+    image_base = (row.public_url or "").strip().rstrip("/") or base_url
+    return base_url, decrypt(row.api_key_encrypted), image_base
 
 
 async def _get_admin_id(base_url: str, api_key: str) -> str:
@@ -137,9 +146,19 @@ async def search_albums(
     _: UserContext = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Search your Jellyfin library for albums by name or artist."""
+    """Search for albums by name or artist.
+
+    Queries both the Jellyfin API and the local JellyDJ library database.
+    The local search catches albums that Jellyfin's search misses — short
+    or generic names (e.g. 'Other'), special characters, or albums whose
+    metadata doesn't survive Jellyfin's full-text search indexing.
+    Results are merged and deduplicated by jellyfin_album_id.
+    """
+    from models import LibraryTrack
+    from sqlalchemy import func
+
     try:
-        base_url, api_key = _jellyfin_creds(db)
+        base_url, api_key, image_base = _jellyfin_creds(db)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
@@ -150,6 +169,13 @@ async def search_albums(
     except Exception as e:
         raise HTTPException(503, f"Jellyfin unreachable: {e}")
 
+    excluded_ids = {
+        row.jellyfin_album_id
+        for row in db.query(ExcludedAlbum.jellyfin_album_id).all()
+    }
+
+    # ── Pass 1: Jellyfin API search ───────────────────────────────────────────
+    results_by_id: dict[str, dict] = {}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
@@ -164,32 +190,68 @@ async def search_albums(
                 },
             )
             r.raise_for_status()
-            items = r.json().get("Items", [])
+            for item in r.json().get("Items", []):
+                jid = item.get("Id", "")
+                if not jid:
+                    continue
+                cover = None
+                if item.get("ImageTags", {}).get("Primary"):
+                    cover = (
+                        f"{image_base}/Items/{jid}/Images/Primary"
+                        f"?maxWidth=120&quality=80&api_key={api_key}"
+                    )
+                results_by_id[jid] = {
+                    "jellyfin_album_id": jid,
+                    "album_name":        item.get("Name", ""),
+                    "artist_name":       item.get("AlbumArtist", ""),
+                    "year":              item.get("ProductionYear"),
+                    "track_count":       item.get("ChildCount", 0),
+                    "cover_image_url":   cover,
+                    "already_excluded":  jid in excluded_ids,
+                }
     except Exception as e:
-        raise HTTPException(503, f"Jellyfin search failed: {e}")
+        log.warning("Jellyfin album search failed (local-only fallback): %s", e)
 
-    excluded_ids = {
-        row.jellyfin_album_id
-        for row in db.query(ExcludedAlbum.jellyfin_album_id).all()
-    }
-
-    results = []
-    for item in items:
-        jid = item.get("Id", "")
-        cover = None
-        if item.get("ImageTags", {}).get("Primary"):
-            cover = (
-                f"{base_url}/Items/{jid}/Images/Primary"
-                f"?maxWidth=120&quality=80&api_key={api_key}"
-            )
-        results.append({
+    # ── Pass 2: local LibraryTrack search — catches what Jellyfin misses ──────
+    # Jellyfin's full-text search skips generic/short terms and albums whose
+    # names don't survive its indexer.  Our DB has everything we've scanned.
+    q_like = f"%{q.lower()}%"
+    local_rows = (
+        db.query(
+            LibraryTrack.jellyfin_album_id,
+            LibraryTrack.album_name,
+            LibraryTrack.album_artist,
+            func.count(LibraryTrack.id).label("track_count"),
+        )
+        .filter(
+            func.lower(LibraryTrack.album_name).like(q_like),
+            LibraryTrack.missing_since.is_(None),
+            LibraryTrack.jellyfin_album_id.isnot(None),
+        )
+        .group_by(
+            LibraryTrack.jellyfin_album_id,
+            LibraryTrack.album_name,
+            LibraryTrack.album_artist,
+        )
+        .limit(30)
+        .all()
+    )
+    for row in local_rows:
+        jid = row.jellyfin_album_id
+        if not jid or jid in results_by_id:
+            continue  # already present from Jellyfin pass
+        results_by_id[jid] = {
             "jellyfin_album_id": jid,
-            "album_name":        item.get("Name", ""),
-            "artist_name":       item.get("AlbumArtist", ""),
-            "year":              item.get("ProductionYear"),
-            "track_count":       item.get("ChildCount", 0),
-            "cover_image_url":   cover,
+            "album_name":        row.album_name or "",
+            "artist_name":       row.album_artist or "",
+            "year":              None,
+            "track_count":       row.track_count,
+            # Cover URL is stable for any Jellyfin item ID — album art included
+            "cover_image_url": (
+                f"{image_base}/Items/{jid}/Images/Primary"
+                f"?maxWidth=120&quality=80&api_key={api_key}"
+            ),
             "already_excluded":  jid in excluded_ids,
-        })
+        }
 
-    return {"results": results}
+    return {"results": list(results_by_id.values())}
