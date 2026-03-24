@@ -150,6 +150,11 @@ def _run_migrations():
         # so existing rows aren't broken; it's just no longer written by new code).
         ("playlist_backups",       "max_revisions", "INTEGER", "6"),
         ("playlist_backup_tracks", "revision_id",   "INTEGER", "NULL"),
+        # v9: canonical genre system — weighted Last.fm multi-genre profile per artist.
+        # primary_genre is repurposed (still the same column) to store the dominant
+        # canonical genre (normalized, Last.fm-sourced) instead of the Jellyfin file-tag.
+        # canonical_genres stores the full weighted list as JSON.
+        ("artist_profiles", "canonical_genres", "TEXT", "NULL"),
         # Playlist Import feature — new tables created by create_all(); no ALTER needed.
         # New nullable columns on existing tables listed below:
         ("imported_playlists",        "description",         "TEXT",     "NULL"),

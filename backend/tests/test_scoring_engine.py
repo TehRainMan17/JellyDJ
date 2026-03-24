@@ -19,6 +19,14 @@ v7 additions:
     track lifts the whole artist even if other tracks are old
   - Ordering: correctly ranked real-world analogs
     (many-track heavy listener > one-song listener)
+
+v9 additions:
+  - _derive_canonical_genres(): Last.fm tags → weighted multi-genre list
+  - _dominant_genre(): picks best GENRE_ADJACENCY-validated genre
+  - Canonical genre pipeline: ArtistProfile.canonical_genres drives
+    GenreProfile and TrackScore.genre instead of Jellyfin file-tag genres
+  - Genre profile keys are normalized (lowercase, spaces)
+  - Fracture fix: GenreProfile keys align with Last.fm tag normalization
 """
 import pytest
 from datetime import datetime, timedelta
@@ -29,6 +37,8 @@ from services.scoring_engine import (
     _recency_score,
     _skip_multiplier,
     _breadth_bonus,
+    _derive_canonical_genres,
+    _dominant_genre,
     rebuild_artist_profiles,
     rebuild_genre_profiles,
     rebuild_track_scores,
@@ -84,16 +94,40 @@ def _make_play(item_id="t1", artist="Artist A", album="Album 1",
     return p
 
 
-def _make_db(library_tracks=None, plays=None, skip_penalties=None):
-    """Build a mock DB session for scoring tests."""
+def _make_artist_profile(artist_name, primary_genre="", canonical_genres=None):
+    """
+    Build a mock ArtistProfile for use in _make_db(artist_profiles=[...]).
+
+    canonical_genres should be a list of {"genre": str, "weight": float} dicts
+    (the same format stored in ArtistProfile.canonical_genres as JSON).
+    If omitted, canonical_genres is None and the scoring engine falls back
+    to norm_genre(LibraryTrack.genre).
+    """
+    import json as _json
+    ap = MagicMock()
+    ap.artist_name = artist_name
+    ap.primary_genre = primary_genre
+    ap.canonical_genres = _json.dumps(canonical_genres) if canonical_genres is not None else None
+    return ap
+
+
+def _make_db(library_tracks=None, plays=None, skip_penalties=None, artist_profiles=None):
+    """
+    Build a mock DB session for scoring tests.
+
+    artist_profiles: list of mock ArtistProfile objects (from _make_artist_profile).
+      Injected so rebuild_genre_profiles() and rebuild_track_scores() can test
+      the canonical genre path.  When omitted (None → []), both functions fall
+      back to the Jellyfin genre (norm_genre(Play.genre / LibraryTrack.genre)).
+    """
     from models import LibraryTrack, Play, SkipPenalty, ArtistProfile, GenreProfile, TrackScore
 
     lib = library_tracks or []
-    pl = plays or []
-    sk = skip_penalties or []
+    pl  = plays or []
+    sk  = skip_penalties or []
+    aps = artist_profiles or []
 
     db = MagicMock()
-    deleted = []
 
     def query_dispatch(model):
         if model is LibraryTrack:
@@ -111,7 +145,12 @@ def _make_db(library_tracks=None, plays=None, skip_penalties=None):
             q = MagicMock()
             q.filter_by.return_value.all.return_value = sk
             return q
-        if model in (ArtistProfile, GenreProfile, TrackScore):
+        if model is ArtistProfile:
+            q = MagicMock()
+            q.filter_by.return_value.delete.return_value = None
+            q.filter_by.return_value.all.return_value = aps
+            return q
+        if model in (GenreProfile, TrackScore):
             q = MagicMock()
             q.filter_by.return_value.delete.return_value = None
             q.filter_by.return_value.all.return_value = []
@@ -453,7 +492,15 @@ class TestArtistProfiles:
 # ── Unit tests: genre profiles ────────────────────────────────────────────────
 
 class TestGenreProfiles:
-    def test_builds_profile_from_plays(self):
+    def test_builds_profile_from_plays_fallback(self):
+        """
+        When no ArtistProfile enrichment is available, rebuild_genre_profiles()
+        falls back to norm_genre(Play.genre).  Keys are always normalized
+        (lowercase, hyphens→spaces) — never raw Jellyfin strings.
+
+        v9: this tests the Jellyfin-fallback path.  The primary path (Last.fm
+        canonical genres) is tested in TestCanonicalGenrePipeline.
+        """
         plays = [
             _make_play("t1", genre="Rock",  play_count=20),
             _make_play("t2", genre="Rock",  play_count=15),
@@ -461,9 +508,25 @@ class TestGenreProfiles:
         ]
         db = _make_db(plays=plays)
         result = rebuild_genre_profiles(db, "user1")
-        assert "Rock" in result
-        assert "Pop" in result
-        assert result["Rock"] > result["Pop"]
+        # Keys are normalized to lowercase (v9: norm_genre applied to Jellyfin fallback)
+        assert "rock" in result, f"Expected 'rock' in {list(result.keys())}"
+        assert "pop"  in result, f"Expected 'pop' in {list(result.keys())}"
+        assert result["rock"] > result["pop"]
+
+    def test_genre_keys_are_always_normalized(self):
+        """
+        GenreProfile.genre is always lowercase with spaces (normalized).
+        No raw Jellyfin strings like 'Classic Rock' or 'Hip-Hop' should appear.
+        """
+        plays = [
+            _make_play("t1", genre="Classic Rock", play_count=10),
+            _make_play("t2", genre="Hip-Hop",      play_count=5),
+        ]
+        db = _make_db(plays=plays)
+        result = rebuild_genre_profiles(db, "user1")
+        for key in result.keys():
+            assert key == key.lower(),   f"Genre key '{key}' is not lowercase"
+            assert "-" not in key,        f"Genre key '{key}' contains a hyphen"
 
     def test_scores_are_between_0_and_100(self):
         plays = [_make_play(f"t{i}", genre=f"Genre{i % 3}", play_count=i * 3) for i in range(1, 8)]
@@ -671,3 +734,331 @@ class TestLibraryScanner:
         db.commit = MagicMock()
         stats = scan_library(db, items)
         assert stats["added"] == 0
+
+
+# ── Unit tests: _derive_canonical_genres (v9) ────────────────────────────────
+
+class TestDeriveCanonicalGenres:
+    """
+    Tests for the canonical genre derivation helper.
+    This function is the single point where Last.fm tags are converted into
+    the authoritative weighted genre list for an artist.
+    """
+
+    def test_valid_lastfm_tags_preferred_over_jellyfin(self):
+        """Last.fm tags should override the Jellyfin file-tag fallback."""
+        result = _derive_canonical_genres('["hip hop", "rap"]', "Pop")
+        genres = [g["genre"] for g in result]
+        assert "hip hop" in genres
+        assert "pop" not in genres, "Jellyfin 'Pop' should not appear when Last.fm tags exist"
+
+    def test_position_decay_weighting(self):
+        """tag[0] gets 50% weight; tag[1] gets 25%; weights renormalize to sum=1."""
+        result = _derive_canonical_genres('["hip hop", "rap"]', "")
+        assert len(result) == 2
+        # After renormalization: 0.50/(0.50+0.25) ≈ 0.667, 0.25/0.75 ≈ 0.333
+        assert result[0]["genre"] == "hip hop"
+        assert result[0]["weight"] > result[1]["weight"]
+
+    def test_weights_sum_to_one(self):
+        result = _derive_canonical_genres('["hip hop", "rap", "southern hip hop", "r&b", "crunk"]', "")
+        total = sum(g["weight"] for g in result)
+        assert abs(total - 1.0) < 0.001, f"Weights sum to {total}, expected 1.0"
+
+    def test_junk_tags_filtered_out(self):
+        """Non-genre social tags must be excluded before weighting."""
+        tags = '["seen live", "favorites", "hip hop", "2000s"]'
+        result = _derive_canonical_genres(tags, "")
+        genres = [g["genre"] for g in result]
+        assert "seen live" not in genres
+        assert "favorites" not in genres
+        assert "2000s" not in genres
+        assert "hip hop" in genres
+
+    def test_all_junk_falls_back_to_jellyfin(self):
+        """When every Last.fm tag is junk, use the Jellyfin genre as fallback."""
+        tags = '["seen live", "favorites", "2000s"]'
+        result = _derive_canonical_genres(tags, "Rock")
+        assert len(result) == 1
+        assert result[0]["genre"] == "rock"  # norm_genre("Rock")
+
+    def test_fallback_to_jellyfin_when_no_lastfm(self):
+        """No Last.fm data → fall back to Jellyfin genre (normalized)."""
+        result = _derive_canonical_genres(None, "Classic Rock")
+        assert len(result) == 1
+        assert result[0]["genre"] == "classic rock"
+        assert result[0]["weight"] == 1.0
+
+    def test_empty_returns_empty(self):
+        """No tags, no Jellyfin genre → return []."""
+        assert _derive_canonical_genres(None, "") == []
+        assert _derive_canonical_genres("[]", "") == []
+
+    def test_tags_normalized_to_lowercase_and_spaces(self):
+        """Tags like 'Hip-Hop' should be normalized to 'hip hop'."""
+        result = _derive_canonical_genres('["Hip-Hop", "R&B"]', "")
+        genres = [g["genre"] for g in result]
+        assert "hip hop" in genres
+        assert "r&b" in genres
+        assert "Hip-Hop" not in genres
+
+    def test_invalid_json_falls_back_gracefully(self):
+        """Bad JSON in tags field should not crash — fall back to Jellyfin."""
+        result = _derive_canonical_genres("not-valid-json", "Jazz")
+        assert result[0]["genre"] == "jazz"
+
+    def test_up_to_five_tags_accepted(self):
+        """Only the first 5 tags are considered (Last.fm max)."""
+        tags = '["rock", "pop", "jazz", "blues", "folk", "country", "metal"]'
+        result = _derive_canonical_genres(tags, "")
+        # All 7 non-junk tags exist, but only first 5 should be used
+        assert len(result) <= 5
+
+    def test_ludacris_real_world(self):
+        """
+        Real-world regression: Ludacris was previously classified as 'Pop'
+        by Jellyfin.  With Last.fm tags, he should be 'hip hop' dominant.
+        """
+        tags = '["hip hop", "rap", "southern hip hop", "crunk", "r&b"]'
+        result = _derive_canonical_genres(tags, "Pop")
+        assert result[0]["genre"] == "hip hop", (
+            f"Ludacris dominant genre should be 'hip hop', got '{result[0]['genre']}'"
+        )
+        genres = [g["genre"] for g in result]
+        assert "pop" not in genres, "Jellyfin 'Pop' should not appear with valid Last.fm tags"
+
+
+# ── Unit tests: _dominant_genre (v9) ─────────────────────────────────────────
+
+class TestDominantGenre:
+
+    def test_empty_list_returns_empty_string(self):
+        assert _dominant_genre([]) == ""
+
+    def test_prefers_genre_adjacency_validated_entry(self):
+        """
+        If only the second entry is in GENRE_ADJACENCY, it should be preferred
+        over the first entry (which may be a Last.fm subgenre not in the map).
+        """
+        # "southern hip hop" might not be in GENRE_ADJACENCY; "hip hop" is.
+        genres = [
+            {"genre": "southern hip hop", "weight": 0.50},
+            {"genre": "hip hop",          "weight": 0.25},
+        ]
+        result = _dominant_genre(genres)
+        assert result == "hip hop", (
+            "Should prefer the GENRE_ADJACENCY-validated entry even if it's not first"
+        )
+
+    def test_falls_back_to_first_when_none_in_adjacency(self):
+        """If no entry is in GENRE_ADJACENCY, return the first entry's genre."""
+        genres = [
+            {"genre": "obscure subgenre xyz", "weight": 0.60},
+            {"genre": "another unknown",       "weight": 0.40},
+        ]
+        result = _dominant_genre(genres)
+        assert result == "obscure subgenre xyz"
+
+    def test_returns_first_adjacency_match_not_highest_weight(self):
+        """Validation against GENRE_ADJACENCY takes priority over weight order."""
+        genres = [
+            {"genre": "jazz",     "weight": 0.90},  # in GENRE_ADJACENCY
+            {"genre": "blues",    "weight": 0.10},  # also in GENRE_ADJACENCY
+        ]
+        # jazz is first AND highest weight — should win
+        assert _dominant_genre(genres) == "jazz"
+
+
+# ── Integration tests: canonical genre pipeline (v9) ────────────────────────
+
+class TestCanonicalGenrePipeline:
+    """
+    End-to-end tests verifying that Last.fm-sourced canonical genres flow
+    correctly through rebuild_genre_profiles() and rebuild_track_scores().
+
+    These tests are the primary regression guard for the v9 genre overhaul.
+    They verify the fix for the core data quality problem:
+      - Before: Jellyfin file-tags (e.g., "Pop" for Ludacris) drove everything
+      - After:  Last.fm artist tags drive genre profiles, track scores, and
+                all downstream playlist/discovery/insights features
+    """
+
+    def test_genre_profile_uses_canonical_genres_not_jellyfin(self):
+        """
+        When ArtistProfile has Last.fm canonical genres, GenreProfile should
+        aggregate by those genres — NOT by Play.genre (Jellyfin file-tag).
+
+        Simulates: Ludacris filed as 'Pop' by Jellyfin but tagged 'hip hop'
+        on Last.fm.  GenreProfile must show 'hip hop', not 'pop'.
+        """
+        plays = [
+            _make_play("t1", artist="Ludacris", genre="Pop", play_count=10),
+            _make_play("t2", artist="Ludacris", genre="Pop", play_count=5),
+        ]
+        # Inject ArtistProfile with Last.fm canonical genres
+        aps = [
+            _make_artist_profile(
+                "Ludacris",
+                primary_genre="hip hop",
+                canonical_genres=[
+                    {"genre": "hip hop", "weight": 0.67},
+                    {"genre": "rap",     "weight": 0.33},
+                ],
+            )
+        ]
+        db = _make_db(plays=plays, artist_profiles=aps)
+        result = rebuild_genre_profiles(db, "user1")
+
+        assert "hip hop" in result, (
+            f"Expected 'hip hop' in genre profiles, got: {list(result.keys())}. "
+            "Jellyfin 'Pop' tag is poisoning the genre profiles."
+        )
+        assert "pop" not in result, (
+            "Jellyfin 'Pop' file-tag must not appear in genre profiles "
+            "when artist has Last.fm canonical genres."
+        )
+
+    def test_fractional_play_credit_across_genres(self):
+        """
+        A blended artist (e.g., Ludacris: hip-hop 50%, r&b 25%, rap 25%)
+        should credit plays fractionally.  After 10 plays:
+          hip hop gets 5.0 credits, r&b gets 2.5, rap gets 2.5.
+        Both genres should appear in GenreProfile, with hip-hop having
+        higher affinity than r&b (more credit).
+        """
+        plays = [_make_play("t1", artist="Ludacris", genre="Pop", play_count=10)]
+        aps = [
+            _make_artist_profile(
+                "Ludacris",
+                primary_genre="hip hop",
+                canonical_genres=[
+                    {"genre": "hip hop", "weight": 0.50},
+                    {"genre": "r&b",     "weight": 0.25},
+                    {"genre": "rap",     "weight": 0.25},
+                ],
+            )
+        ]
+        db = _make_db(plays=plays, artist_profiles=aps)
+        result = rebuild_genre_profiles(db, "user1")
+
+        assert "hip hop" in result
+        assert "r&b"     in result
+        assert "rap"     in result
+        assert result["hip hop"] > result["r&b"], (
+            "hip hop (50% weight) should have higher affinity than r&b (25% weight)"
+        )
+
+    def test_track_score_genre_uses_artist_primary_genre(self):
+        """
+        TrackScore.genre must be the canonical primary genre from ArtistProfile,
+        NOT the Jellyfin file-tag from LibraryTrack.genre.
+
+        This is the core fix for the genre fracture: Ludacris tracks must be
+        labelled 'hip hop' in TrackScore so they surface in hip-hop playlist
+        blocks and genre-adjacent discovery — not in 'pop' blocks.
+        """
+        lib = [_make_library_track("t1", artist="Ludacris", genre="Pop")]
+        plays = [_make_play("t1", artist="Ludacris", genre="Pop", play_count=5)]
+        aps = [
+            _make_artist_profile(
+                "Ludacris",
+                primary_genre="hip hop",
+                canonical_genres=[{"genre": "hip hop", "weight": 1.0}],
+            )
+        ]
+        db = _make_db(library_tracks=lib, plays=plays, artist_profiles=aps)
+        added = []
+        db.add = lambda obj: added.append(obj)
+
+        rebuild_track_scores(db, "user1", {"Ludacris": 80.0}, {"hip hop": 75.0})
+
+        track_scores = [s for s in added if hasattr(s, "genre")]
+        assert len(track_scores) > 0
+        assert track_scores[0].genre == "hip hop", (
+            f"TrackScore.genre should be 'hip hop' (canonical), got '{track_scores[0].genre}'. "
+            "Jellyfin 'Pop' file-tag is leaking into TrackScore."
+        )
+
+    def test_genre_affinity_lookup_consistent_with_genre_profile(self):
+        """
+        The fracture fix: genre_affinity dict keys (from rebuild_genre_profiles)
+        and TrackScore.genre (from rebuild_track_scores) must use the same
+        normalized canonical strings so the lookup doesn't always miss.
+
+        Before v9: GenreProfile had 'Pop' (Jellyfin) but recommender compared
+        Last.fm tags like 'hip hop' against it — constant misses → neutral 50.0.
+        After v9: both sides use normalized canonical genres → consistent matches.
+        """
+        plays = [_make_play("t1", artist="Ludacris", genre="Pop", play_count=10)]
+        aps = [
+            _make_artist_profile(
+                "Ludacris",
+                primary_genre="hip hop",
+                canonical_genres=[{"genre": "hip hop", "weight": 1.0}],
+            )
+        ]
+        db = _make_db(plays=plays, artist_profiles=aps)
+
+        # Step 1: build genre profiles (returns canonical genre keys)
+        genre_aff = rebuild_genre_profiles(db, "user1")
+
+        # Step 2: genre_aff should have 'hip hop', not 'pop'
+        assert "hip hop" in genre_aff, (
+            f"genre_affinity should have 'hip hop', got {list(genre_aff.keys())}"
+        )
+
+        # Step 3: track scores should look up 'hip hop' and find it
+        lib = [_make_library_track("t1", artist="Ludacris", genre="Pop")]
+        db2 = _make_db(library_tracks=lib, plays=plays, artist_profiles=aps)
+        added = []
+        db2.add = lambda obj: added.append(obj)
+        rebuild_track_scores(db2, "user1", {"Ludacris": 80.0}, genre_aff)
+
+        track_scores = [s for s in added if hasattr(s, "genre_affinity")]
+        assert len(track_scores) > 0
+        # genre_affinity should be > 0 (lookup succeeded) rather than 0.0 (miss)
+        assert float(track_scores[0].genre_affinity) > 0.0, (
+            "genre_affinity is 0.0 — the canonical genre lookup is missing. "
+            "This indicates the v9 fracture fix is not working correctly."
+        )
+
+    def test_unenriched_artist_falls_back_to_jellyfin_genre(self):
+        """
+        Artists with no Last.fm enrichment (canonical_genres=None) must fall
+        back to norm_genre(Play.genre) rather than producing no genre at all.
+        This ensures the system still works for artists that haven't been enriched.
+        """
+        plays = [_make_play("t1", artist="UnknownArtist", genre="Country", play_count=5)]
+        # No artist_profiles → empty → triggers fallback path
+        db = _make_db(plays=plays)
+        result = rebuild_genre_profiles(db, "user1")
+
+        assert "country" in result, (
+            f"Unenriched artist should fall back to norm_genre('Country')='country'. "
+            f"Got: {list(result.keys())}"
+        )
+
+    def test_mixed_enriched_and_unenriched_artists(self):
+        """
+        A realistic scenario: some artists have Last.fm data, some don't.
+        Both enriched canonical genres and Jellyfin fallback genres should
+        appear in GenreProfile without interfering with each other.
+        """
+        plays = [
+            _make_play("t1", artist="Ludacris",       genre="Pop",     play_count=10),
+            _make_play("t2", artist="UnknownCountry",  genre="Country", play_count=5),
+        ]
+        aps = [
+            _make_artist_profile(
+                "Ludacris",
+                primary_genre="hip hop",
+                canonical_genres=[{"genre": "hip hop", "weight": 1.0}],
+            )
+            # UnknownCountry has no profile → falls back to Jellyfin "Country"
+        ]
+        db = _make_db(plays=plays, artist_profiles=aps)
+        result = rebuild_genre_profiles(db, "user1")
+
+        assert "hip hop" in result, "Enriched artist should contribute canonical genre"
+        assert "country" in result, "Unenriched artist should fall back to Jellyfin genre"
+        assert "pop"     not in result, "Jellyfin 'Pop' tag must not appear for enriched artist"

@@ -258,6 +258,10 @@ def _upsert_play(db: Session, user_id: str, item: dict):
     is_favorite = user_data.get("IsFavorite", False)
     last_played = _parse_last_played(item)
 
+    # Jellyfin file-tag genre — written to Play.genre as a historical record only.
+    # DO NOT use Play.genre for genre analytics or playlist logic.  File-tagger
+    # accuracy is poor (artists frequently misclassified as "Pop" or "Rock").
+    # All genre-sensitive features read from ArtistProfile.primary_genre instead.
     genres = item.get("Genres", [])
     genre = genres[0] if genres else ""
 

@@ -130,7 +130,11 @@ def _make_db(plays, artist_affinity=None, genre_affinity=None):
     cache_query = MagicMock()
     cache_query.filter_by.return_value.first.return_value = None
 
-    def _query_dispatch(model):
+    def _query_dispatch(*args):
+        # Accept *args because some recommender queries pass multiple column
+        # expressions: db.query(TrackEnrichment.col1, TrackEnrichment.col2).
+        # We only dispatch on the first argument (the primary model/column).
+        model = args[0] if args else None
         from models import Play, UserTasteProfile, PopularityCache, SkipPenalty
         if model is Play:
             return play_query
@@ -143,7 +147,11 @@ def _make_db(plays, artist_affinity=None, genre_affinity=None):
             skip_query = MagicMock()
             skip_query.filter_by.return_value.first.return_value = None
             return skip_query
-        return MagicMock()
+        # Multi-column queries (e.g. TrackEnrichment popularity lookup) —
+        # return a mock that yields an empty result set.
+        multi_q = MagicMock()
+        multi_q.all.return_value = []
+        return multi_q
 
     db.query.side_effect = _query_dispatch
     return db
@@ -152,8 +160,15 @@ def _make_db(plays, artist_affinity=None, genre_affinity=None):
 class TestRecommendLibraryTracks:
 
     def test_returns_correct_count(self):
-        plays = [_make_play(item_id=f"id{i}", track=f"Track {i}") for i in range(20)]
-        db = _make_db(plays, artist_affinity={"Artist": 80.0})
+        # Use distinct artists so per-artist caps don't limit results below the
+        # requested count.  Previously all 20 tracks had artist="Artist" which
+        # hit the recommender's per-artist saturation limit.
+        plays = [
+            _make_play(item_id=f"id{i}", track=f"Track {i}", artist=f"Artist{i}")
+            for i in range(20)
+        ]
+        artist_aff = {f"Artist{i}": 80.0 for i in range(20)}
+        db = _make_db(plays, artist_affinity=artist_aff)
         results = recommend_library_tracks("user1", "for_you", 10, db)
         assert len(results) == 10
 

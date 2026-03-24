@@ -104,6 +104,21 @@ def _parse_date(raw: Optional[str]) -> Optional[datetime]:
 
 
 def _extract_genre(item: dict) -> str:
+    """
+    Extract the first genre string from a Jellyfin API item.
+
+    DATA QUALITY WARNING — do NOT use the value returned here for genre analytics,
+    playlist generation, insights, or scoring.  Jellyfin genres come from music
+    file tags (e.g., ID3 tags), which are frequently inaccurate — file taggers
+    commonly default to broad labels like "Pop" or "Rock" regardless of the
+    actual artist style (Ludacris, Rage Against the Machine, and Taylor Swift
+    can all end up tagged as "Pop" depending on the tagger).
+
+    The value IS written to LibraryTrack.genre and Play.genre as a historical
+    record of the file's declared metadata.  All genre-sensitive features should
+    derive from ArtistProfile.primary_genre or ArtistProfile.canonical_genres,
+    which are populated from Last.fm artist tags during rebuild_artist_profiles().
+    """
     genres = item.get("Genres", [])
     return genres[0] if genres else ""
 

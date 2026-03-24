@@ -103,6 +103,7 @@ from models import (
     LibraryTrack, Play, SkipPenalty,
     ArtistProfile, GenreProfile, TrackScore,
 )
+from services.genre_adjacency import GENRE_ADJACENCY, norm_genre as _norm_genre
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +152,37 @@ POPULARITY_UNPLAYED_MAX = 10.0
 # log-scaled so the bonus grows quickly for the first ~10 tracks then plateaus.
 ARTIST_BREADTH_BONUS_MAX  = 15.0   # max pts awarded for catalogue depth
 ARTIST_BREADTH_MAX_TRACKS = 50     # track count at which bonus is fully awarded
+
+# ── v9: Canonical genre system constants ──────────────────────────────────────
+#
+# Genres in JellyDJ are sourced from Last.fm artist tags, NOT from Jellyfin
+# file-tag metadata (Play.genre / LibraryTrack.genre).  Jellyfin genres are
+# kept as historical records but must never drive analytics or playlist logic.
+#
+# Last.fm returns tags ordered by how frequently its users have applied them,
+# so tag[0] is the most representative genre for the artist.  We apply
+# position-decay weights so the dominant tag contributes the most to the
+# artist's genre profile while secondary tags still influence discovery.
+#
+# Example — Ludacris:
+#   Last.fm tags: ["hip hop", "rap", "southern hip hop", "r&b", "crunk"]
+#   Weights:       [0.50,     0.25,  0.14,               0.07,  0.04]
+#   → GenreProfile credits: hip-hop +50%, rap +25%, r&b +7% of every play.
+#   → primary_genre = "hip hop"  (stored on ArtistProfile, used by TrackScore)
+#
+_LASTFM_TAG_WEIGHTS = [0.50, 0.25, 0.14, 0.07, 0.04]
+
+# Strings that Last.fm users commonly apply as social tags but are not genres.
+# These are filtered out before canonical genre selection so they don't poison
+# the weighted genre profile with meaningless entries.
+_NON_GENRE_TAGS = frozenset({
+    "seen live", "favorites", "favourite", "love", "awesome", "best",
+    "female vocalists", "male vocalists", "all", "american", "british",
+    "canadian", "australian", "european", "80s", "90s", "2000s", "2010s",
+    "2020s", "70s", "60s", "albums i own", "under 2000 listeners",
+    "halloween", "christmas", "holiday", "spotify", "youtube", "playlist",
+    "beautiful", "chill", "sad", "happy", "party", "workout", "sleep",
+})
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -201,6 +233,96 @@ def _breadth_bonus(tracks_played: int) -> float:
     )
 
 
+def _derive_canonical_genres(
+    lastfm_tags_json: Optional[str],
+    jellyfin_genre: str,
+) -> list[dict]:
+    """
+    Derive a weighted multi-genre profile from Last.fm artist tags.
+
+    Returns a list of {"genre": <normalized str>, "weight": <float>} dicts,
+    ordered by Last.fm tag position (most-applied first), with weights
+    renormalized to sum to 1.0.  The list is empty only when no genre
+    signal is available at all.
+
+    Selection algorithm:
+      1. Parse Last.fm tags JSON (up to 5 strings).
+      2. Normalize each via norm_genre() — lowercase, hyphens→spaces.
+      3. Discard strings in _NON_GENRE_TAGS (social tags, decade labels, etc.).
+      4. Apply position-decay weights (50/25/14/7/4%) to surviving tags.
+      5. Renormalize weights of accepted tags so they sum to 1.0.
+      6. If no Last.fm tags survive filtering, fall back to the Jellyfin
+         file-tag genre (lower quality but better than nothing).
+      7. Return [] only when both sources yield nothing usable.
+
+    Dominant genre = result[0]["genre"]  (highest weight, always the primary).
+    Tags present in GENRE_ADJACENCY are usable by the genre_adjacent playlist
+    block and genre map lookups.  Tags not in the map are still stored and
+    contribute to GenreProfile affinity — they just won't expand to neighbours.
+
+    DATA SOURCE NOTES:
+      - lastfm_tags_json comes from ArtistEnrichment.tags / ArtistProfile.tags.
+        This is the authoritative source — always prefer it.
+      - jellyfin_genre (fallback) comes from Play.genre / LibraryTrack.genre.
+        File taggers frequently misclassify artists (e.g., Ludacris as "Pop").
+        Only used when Last.fm enrichment is absent for this artist.
+    """
+    raw_tags: list[str] = []
+    if lastfm_tags_json:
+        try:
+            parsed = json.loads(lastfm_tags_json)
+            if isinstance(parsed, list):
+                raw_tags = [t for t in parsed if isinstance(t, str)][:5]
+        except Exception:
+            pass
+
+    accepted: list[tuple[str, float]] = []  # (normalized_genre, position_weight)
+    for i, tag in enumerate(raw_tags):
+        if i >= len(_LASTFM_TAG_WEIGHTS):
+            break
+        normalized = _norm_genre(tag)
+        if not normalized or len(normalized) < 2:
+            continue
+        if normalized in _NON_GENRE_TAGS:
+            continue
+        accepted.append((normalized, _LASTFM_TAG_WEIGHTS[i]))
+
+    # Fallback: no usable Last.fm tags — try Jellyfin file-tag genre.
+    # This is lower-quality data; the comment in _NON_GENRE_TAGS explains why.
+    if not accepted and jellyfin_genre:
+        normalized_jf = _norm_genre(jellyfin_genre)
+        if normalized_jf and len(normalized_jf) >= 2:
+            accepted.append((normalized_jf, 1.0))
+
+    if not accepted:
+        return []
+
+    # Renormalize so weights sum to 1.0 regardless of how many tags survived.
+    total_w = sum(w for _, w in accepted)
+    return [
+        {"genre": g, "weight": round(w / total_w, 4)}
+        for g, w in accepted
+    ]
+
+
+def _dominant_genre(canonical_genres: list[dict]) -> str:
+    """
+    Return the single best genre from a canonical_genres list.
+
+    Preference order:
+      1. First entry that exists as a key in GENRE_ADJACENCY (verified,
+         mappable — works with genre_adjacent playlist blocks).
+      2. First entry overall (still better than Jellyfin genre).
+      3. Empty string if the list is empty.
+    """
+    if not canonical_genres:
+        return ""
+    for entry in canonical_genres:
+        if entry["genre"] in GENRE_ADJACENCY:
+            return entry["genre"]
+    return canonical_genres[0]["genre"]
+
+
 # ── Phase 1: Build ArtistProfile ─────────────────────────────────────────────
 
 def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
@@ -215,6 +337,15 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
       - Uses best (most recent) recency, not average.
       - Adds a breadth bonus for catalogue depth.
       - Scores now span the full 0–100 range.
+
+    v9: canonical genre system.
+      - Derives ArtistProfile.canonical_genres from Last.fm artist tags
+        (stored in ArtistEnrichment.tags / ArtistProfile.tags) using
+        position-decay weighting and junk-tag filtering.
+      - ArtistProfile.primary_genre is repurposed to store the dominant
+        canonical genre (normalized, Last.fm-sourced) rather than the
+        Jellyfin file-tag genre.  All downstream genre logic reads from
+        primary_genre / canonical_genres — never from Play.genre.
 
     Returns dict of artist_name → affinity_score for use in TrackScore phase.
     """
@@ -338,10 +469,15 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             effective_skip_rate = skip_rate * (0.5 if agg["has_favorite"] else 1.0)
             affinity = round(max(1.0, affinity * (1.0 - effective_skip_rate)), 2)
 
-        primary_genre = (
+        # Jellyfin file-tag primary genre (most-played by play count).
+        # This is the FALLBACK only — used by _derive_canonical_genres() when
+        # Last.fm enrichment is absent.  Do not use this value directly for any
+        # genre feature; read primary_genre from the ArtistProfile row instead.
+        jellyfin_primary_genre = (
             max(agg["genres"].items(), key=lambda x: x[1])[0]
             if agg["genres"] else ""
         )
+
         # Store both the canonical name and the lowercase key so downstream
         # lookups (e.g. rebuild_track_scores) find the right affinity regardless
         # of capitalisation differences between LibraryTrack and Play rows.
@@ -357,6 +493,19 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         related = enc.similar_artists if enc else None
         tags = enc.tags if enc else None
 
+        # v9: derive canonical genres from Last.fm tags (authoritative source).
+        # _derive_canonical_genres() filters junk tags, applies position-decay
+        # weights, and falls back to jellyfin_primary_genre only when Last.fm
+        # data is absent.  The result is the single consistent genre truth for
+        # this artist used by ALL downstream features.
+        canonical_genres_list = _derive_canonical_genres(tags, jellyfin_primary_genre)
+        canonical_genres_json = json.dumps(canonical_genres_list) if canonical_genres_list else None
+
+        # primary_genre stores the dominant canonical genre (normalized, Last.fm-sourced).
+        # This column is repurposed in v9 — it no longer stores the Jellyfin file-tag
+        # genre.  All genre analytics and playlist logic must read from this column.
+        primary_genre = _dominant_genre(canonical_genres_list)
+
         db.add(ArtistProfile(
             user_id=user_id,
             artist_name=artist,
@@ -371,6 +520,7 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             replay_boost=artist_replay_boost,
             related_artists=related,
             tags=tags,
+            canonical_genres=canonical_genres_json,
         ))
 
     # v8: create stub profiles for skip-only artists — artists the user has
@@ -391,6 +541,8 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
         affinity_map[display_name] = stub_affinity
         affinity_map[skip_key] = stub_affinity  # lowercase alias
 
+        # Skip-only stub: no play history → no enrichment lookup → no canonical genre.
+        # primary_genre stays empty; canonical_genres stays null.
         db.add(ArtistProfile(
             user_id=user_id,
             artist_name=display_name,
@@ -403,6 +555,7 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             affinity_score=str(stub_affinity),
             updated_at=now,
             replay_boost=0.0,
+            canonical_genres=None,
         ))
 
     db.flush()
@@ -414,78 +567,152 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
 def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
     """
     Build GenreProfile for every genre the user has played.
-    Returns dict of genre → affinity_score.
+    Returns dict of normalized_genre → affinity_score.
 
-    Fixed: previously averaged per-track play_score and recency_score across
-    all tracks in the genre. This compressed everything into a ~13-point range
-    (typically 48-61) because:
-      1. play_score was normalised against the single most-played track in the
-         whole library, so per-track averages for any genre were always modest.
-      2. Averaging recency across all genre tracks heavily diluted large genres —
-         200 older rock tracks pulled the average recency way down even if the
-         user played rock yesterday.
+    v5 fix: uses total genre plays (log-scaled) and best recency instead of
+    per-track averages, preventing score compression into a narrow range.
 
-    Now uses:
-      - play_score: log(total_genre_plays) / log(max_genre_total_plays) * 100
-        Captures how much you listen to this genre as a whole.
-      - recency_score: score of the most-recently-played track in the genre.
-        If you played any rock song yesterday, rock feels current — averaging
-        in hundreds of old tracks shouldn't penalise it.
+    v9: canonical genre system overhaul.
+      Genres are now sourced from ArtistProfile.canonical_genres (Last.fm-derived,
+      weighted) instead of Play.genre (Jellyfin file-tag, unreliable).
+
+      Key behaviours:
+        - Plays are fractionally credited across all of an artist's canonical
+          genres proportional to their weights.  A Ludacris play (hip-hop 50%,
+          rap 25%, r&b 14%) credits hip-hop with 50% of the play count, r&b
+          with 14%, etc.  This lets genre affinity reflect the actual musical
+          blend rather than a single mis-tagged file genre.
+        - Skip penalties are spread the same way so genre skip rates are
+          accurate across the weighted genre profile.
+        - Artists with no Last.fm enrichment fall back to their Jellyfin
+          file-tag genre (normalized).  This keeps the system functional for
+          unenriched artists while not letting bad Jellyfin tags poison the
+          profiles of artists that do have Last.fm data.
+        - GenreProfile.genre is now a normalized canonical genre string
+          (lowercase, spaces — e.g., "hip hop") rather than a raw Jellyfin
+          string (e.g., "Hip-Hop" or "Pop").  This aligns with TrackScore.genre
+          and user_genre_affinity in the recommender, eliminating the fracture
+          where Last.fm tags were compared against Jellyfin genre strings and
+          almost never matched.
+
+    DATA SOURCE:
+      ArtistProfile.canonical_genres — authoritative (Last.fm + junk filtering).
+      Play.genre / SkipPenalty.genre — NOT used for genre analytics. Kept as
+        Jellyfin file-tag historical records only.  Fallback for unenriched artists.
     """
     now = datetime.utcnow()
     plays = db.query(Play).filter_by(user_id=user_id).all()
     if not plays:
         return {}
 
+    # Load canonical genre map from the ArtistProfile rows just written by
+    # rebuild_artist_profiles() (flushed to the session, visible here).
+    # Maps artist_name.lower() → [{genre, weight}, ...] from Last.fm enrichment.
+    artist_canonical_map: dict[str, list[dict]] = {}
+    for ap in db.query(ArtistProfile).filter_by(user_id=user_id).all():
+        if ap.canonical_genres and ap.artist_name:
+            try:
+                genres_list = json.loads(ap.canonical_genres)
+                if isinstance(genres_list, list) and genres_list:
+                    artist_canonical_map[ap.artist_name.lower()] = genres_list
+            except Exception:
+                pass
+
+    # Accumulate weighted plays per canonical genre.
+    # total_plays is a float here (fractional credits); rounded to int before storage.
     genre_agg: dict[str, dict] = {}
-    for p in plays:
-        key = p.genre
-        if not key:
-            continue
-        if key not in genre_agg:
-            genre_agg[key] = {
-                "total_plays": 0,
+
+    def _credit_genre(
+        genre_key: str,
+        plays_credit: float,
+        last_played,
+        is_fav: bool,
+    ) -> None:
+        """Add weighted play credit to a canonical genre bucket."""
+        if not genre_key:
+            return
+        if genre_key not in genre_agg:
+            genre_agg[genre_key] = {
+                "total_plays": 0.0,
                 "tracks_played": 0,
                 "best_last_played": None,
                 "has_favorite": False,
             }
-        agg = genre_agg[key]
-        agg["total_plays"] += p.play_count
-        agg["tracks_played"] += 1
-        if p.last_played:
-            if agg["best_last_played"] is None or p.last_played > agg["best_last_played"]:
-                agg["best_last_played"] = p.last_played
-        if p.is_favorite:
+        agg = genre_agg[genre_key]
+        agg["total_plays"] += plays_credit
+        agg["tracks_played"] += 1  # one record per artist+track regardless of weight
+        if last_played:
+            if agg["best_last_played"] is None or last_played > agg["best_last_played"]:
+                agg["best_last_played"] = last_played
+        if is_fav:
             agg["has_favorite"] = True
 
-    # Normalise against the most-played genre, not the most-played single track
-    max_genre_plays = max((a["total_plays"] for a in genre_agg.values()), default=1) or 1
+    for p in plays:
+        artist_key = p.artist_name.lower().strip() if p.artist_name else ""
+        canonical_genres = artist_canonical_map.get(artist_key)
 
+        if canonical_genres:
+            # Fractionally credit each canonical genre weighted by its share.
+            # e.g., Ludacris [hip hop:0.50, rap:0.25, r&b:0.14, ...]:
+            #   a play of 3 listens → hip hop +1.50, rap +0.75, r&b +0.42
+            for g in canonical_genres:
+                _credit_genre(
+                    g["genre"],
+                    p.play_count * g["weight"],
+                    p.last_played,
+                    p.is_favorite,
+                )
+        else:
+            # Fallback: artist has no Last.fm enrichment — use Jellyfin genre.
+            # Quality is lower (file-tagger may have assigned "Pop" to Ludacris),
+            # but it's better than discarding the play entirely.
+            fallback = _norm_genre(p.genre) if p.genre else ""
+            _credit_genre(fallback, float(p.play_count), p.last_played, p.is_favorite)
+
+    # Normalise against the most-played genre (by weighted total play count).
+    max_genre_plays = max((a["total_plays"] for a in genre_agg.values()), default=1.0) or 1.0
+
+    # Build per-genre skip aggregates using the same artist → canonical genre map
+    # so skip signals align with the same genre buckets as play credits.
     skip_rows = db.query(SkipPenalty).filter_by(user_id=user_id).all()
     genre_skips: dict[str, dict] = {}
+
     for sk in skip_rows:
-        g = sk.genre
-        if not g:
-            continue
-        if g not in genre_skips:
-            genre_skips[g] = {"total_events": 0, "skip_count": 0}
-        genre_skips[g]["total_events"] += sk.total_events
-        genre_skips[g]["skip_count"] += sk.skip_count
+        artist_key = sk.artist_name.lower().strip() if sk.artist_name else ""
+        canonical_genres = artist_canonical_map.get(artist_key)
+
+        if canonical_genres:
+            # Spread skip events proportionally across canonical genres.
+            for g in canonical_genres:
+                gkey = g["genre"]
+                w = g["weight"]
+                if gkey not in genre_skips:
+                    genre_skips[gkey] = {"total_events": 0.0, "skip_count": 0.0}
+                genre_skips[gkey]["total_events"] += sk.total_events * w
+                genre_skips[gkey]["skip_count"]   += sk.skip_count * w
+        else:
+            # Fallback: no canonical genres → use Jellyfin genre from SkipPenalty.
+            gkey = _norm_genre(sk.genre) if sk.genre else ""
+            if gkey:
+                if gkey not in genre_skips:
+                    genre_skips[gkey] = {"total_events": 0.0, "skip_count": 0.0}
+                genre_skips[gkey]["total_events"] += sk.total_events
+                genre_skips[gkey]["skip_count"]   += sk.skip_count
 
     db.query(GenreProfile).filter_by(user_id=user_id).delete()
 
     affinity_map: dict[str, float] = {}
 
     for genre, agg in genre_agg.items():
-        genre_play_score = _play_score(agg["total_plays"], max_genre_plays)
+        genre_play_score   = _play_score(agg["total_plays"], max_genre_plays)
         genre_recency_score = _recency_score(agg["best_last_played"])
         fav_boost = FAVORITE_ARTIST_BOOST if agg["has_favorite"] else 0.0
         raw_score = W_PLAY * genre_play_score + W_RECENCY * genre_recency_score + fav_boost
-        affinity = round(min(100.0, raw_score), 2)
+        affinity  = round(min(100.0, raw_score), 2)
 
-        sk_data = genre_skips.get(genre, {})
-        total_ev = sk_data.get("total_events", 0)
-        skip_ct = sk_data.get("skip_count", 0)
+        sk_data   = genre_skips.get(genre, {})
+        total_ev  = sk_data.get("total_events", 0.0)
+        skip_ct   = sk_data.get("skip_count", 0.0)
         skip_rate = round(skip_ct / total_ev, 4) if total_ev >= SKIP_MIN_EVENTS else 0.0
         if skip_rate > 0:
             affinity = round(affinity * (1.0 - skip_rate * 0.4), 2)
@@ -494,10 +721,10 @@ def rebuild_genre_profiles(db: Session, user_id: str) -> dict[str, float]:
 
         db.add(GenreProfile(
             user_id=user_id,
-            genre=genre,
-            total_plays=agg["total_plays"],
+            genre=genre,                          # canonical, normalized (e.g. "hip hop")
+            total_plays=int(round(agg["total_plays"])),
             total_tracks_played=agg["tracks_played"],
-            total_skips=skip_ct,
+            total_skips=int(round(skip_ct)),
             skip_rate=str(skip_rate),
             has_favorite=agg["has_favorite"],
             affinity_score=str(affinity),
@@ -538,6 +765,16 @@ def rebuild_track_scores(
       - artist_affinity values coming in from rebuild_artist_profiles() now
         use the v7 total-play / breadth-bonus formula, so a_aff correctly
         reflects genuine engagement.  No changes needed in this phase.
+
+    v9: canonical genre system.
+      - TrackScore.genre is now populated from ArtistProfile.primary_genre
+        (canonical, normalized, Last.fm-sourced) instead of LibraryTrack.genre
+        (Jellyfin file-tag, unreliable).
+      - genre_affinity dict keys are canonical genres (from rebuild_genre_profiles
+        v9), so the lookup is now consistent — no more fracture where Jellyfin
+        genres were compared against Last.fm-derived affinity maps.
+      - Falls back to norm_genre(LibraryTrack.genre) for artists whose profiles
+        have no canonical genre (unenriched artists).
     """
     now = datetime.utcnow()
 
@@ -579,6 +816,16 @@ def rebuild_track_scores(
         for a, d in _artist_skip_agg.items()
         if d["total_events"] >= SKIP_MIN_EVENTS
     }
+
+    # v9: canonical primary genre per artist — sourced from Last.fm, not Jellyfin.
+    # Used to populate TrackScore.genre and to look up genre_affinity accurately.
+    # Maps artist_name.lower() → primary_genre (normalized canonical string).
+    # Falls back to norm_genre(LibraryTrack.genre) when artist has no profile
+    # (rare — only affects artists with 0 plays and no enrichment).
+    artist_primary_genre_map: dict[str, str] = {}
+    for ap in db.query(ArtistProfile).filter_by(user_id=user_id).all():
+        if ap.artist_name:
+            artist_primary_genre_map[ap.artist_name.lower()] = ap.primary_genre or ""
 
     max_plays = max((p.play_count for p in plays.values() if p.play_count), default=1) or 1
 
@@ -629,7 +876,20 @@ def rebuild_track_scores(
             artist_affinity.get(track.artist_name)
             or artist_affinity.get(track.artist_name.lower(), 0.0)
         )
-        raw_genre = genre_affinity.get(track.genre, 0.0)
+
+        # v9: resolve the canonical genre for this track from ArtistProfile.
+        # ArtistProfile.primary_genre is Last.fm-sourced (normalized) and is the
+        # authoritative genre for all scoring and filtering.  LibraryTrack.genre
+        # (Jellyfin file-tag) is NOT used here — it is an unreliable historical
+        # record only.  The fallback to norm_genre(track.genre) only fires for
+        # library tracks whose artist has no profile at all (extremely rare).
+        canonical_genre = artist_primary_genre_map.get(
+            track.artist_name.lower() if track.artist_name else ""
+        )
+        if canonical_genre is None:
+            canonical_genre = _norm_genre(track.genre) if track.genre else ""
+
+        raw_genre = genre_affinity.get(canonical_genre, 0.0)
         a_aff = round((raw_artist / max_artist_aff) * 100, 2)
         g_aff = round((raw_genre / max_genre_aff) * 100, 2)
 
@@ -702,7 +962,9 @@ def rebuild_track_scores(
                 track_name=track.track_name,
                 artist_name=track.artist_name,
                 album_name=track.album_name,
-                genre=track.genre,
+                # v9: canonical genre (normalized, Last.fm-sourced via ArtistProfile).
+                # Previously track.genre (Jellyfin file-tag) — no longer used here.
+                genre=canonical_genre,
                 play_count=play.play_count,
                 last_played=play.last_played,
                 is_favorite=play.is_favorite,
@@ -785,7 +1047,9 @@ def rebuild_track_scores(
                 track_name=track.track_name,
                 artist_name=track.artist_name,
                 album_name=track.album_name,
-                genre=track.genre,
+                # v9: canonical genre (normalized, Last.fm-sourced via ArtistProfile).
+                # Previously track.genre (Jellyfin file-tag) — no longer used here.
+                genre=canonical_genre,
                 play_count=0,
                 last_played=None,
                 is_favorite=False,

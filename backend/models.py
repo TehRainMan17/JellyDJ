@@ -80,6 +80,10 @@ class Play(Base):
     track_name = Column(String, nullable=False, default="")
     artist_name = Column(String, nullable=False, default="")
     album_name = Column(String, nullable=False, default="")
+    # Jellyfin file-tag genre (Genres[0] from Jellyfin API). Kept as a historical
+    # record. DO NOT use for genre analytics or feature implementation — it reflects
+    # whatever was tagged in the music file (often inaccurate, e.g., Ludacris as "Pop").
+    # Use ArtistProfile.primary_genre or ArtistProfile.canonical_genres instead.
     genre = Column(String, nullable=False, default="")
     play_count = Column(Integer, nullable=False, default=0)
     last_played = Column(DateTime, nullable=True)
@@ -157,6 +161,8 @@ class SkipPenalty(Base):
     user_id = Column(String, nullable=False, index=True)
     jellyfin_item_id = Column(String, nullable=False, index=True)
     artist_name = Column(String, nullable=False, default="")
+    # Jellyfin file-tag genre — inherited from Play.genre at skip time. Historical only.
+    # Skip signals are spread across canonical genres during GenreProfile rebuild (v9).
     genre = Column(String, nullable=False, default="")
     total_events = Column(Integer, nullable=False, default=0)
     skip_count = Column(Integer, nullable=False, default=0)
@@ -227,6 +233,10 @@ class LibraryTrack(Base):
     artist_name = Column(String, nullable=False, default="", index=True)
     album_name = Column(String, nullable=False, default="", index=True)
     album_artist = Column(String, nullable=False, default="")
+    # Jellyfin file-tag genre (Genres[0] from Jellyfin API). Kept as a historical
+    # record of what the music file declared. DO NOT use for genre analytics or feature
+    # implementation — accuracy is poor (file taggers frequently default to "Pop" or "Rock").
+    # Use ArtistProfile.primary_genre or ArtistProfile.canonical_genres instead.
     genre = Column(String, nullable=False, default="")
     duration_ticks = Column(Integer, nullable=True)
     track_number = Column(Integer, nullable=True)
@@ -266,6 +276,28 @@ class ArtistProfile(Base):
     """
     Per-user per-artist signals. Rebuilt on every index.
     v2: added replay_boost, related_artists, tags.
+    v9: canonical genre system.
+
+    GENRE DATA GUIDANCE — which columns to use for feature implementation:
+
+      USE FOR GENRE FEATURES:
+        primary_genre   — dominant canonical genre, normalized (lowercase, spaces).
+                          Sourced from Last.fm artist tags as of v9. This is the
+                          authoritative genre signal for playlist blocks, scoring,
+                          discovery, and insights. Falls back to Jellyfin file-tag
+                          genre only when the artist has no Last.fm enrichment.
+        canonical_genres — weighted multi-genre JSON: [{"genre": str, "weight": float}, ...]
+                          Weights decay by Last.fm tag position (50/25/14/7/4%).
+                          Use this when you need the full genre blend (e.g., Ludacris:
+                          hip-hop 50%, r&b 25%, rap 14%).  GenreProfile is built from
+                          these fractional weights, so users accumulate genre affinity
+                          proportionally across all an artist's genres.
+
+      DO NOT USE FOR GENRE FEATURES:
+        tags            — raw Last.fm tags JSON (string list, not weighted, not
+                          filtered for junk). Used to derive canonical_genres but
+                          not authoritative on its own. Includes non-genre strings
+                          like "seen live", "favorites", "2000s".
     """
     __tablename__ = "artist_profiles"
     id = Column(Integer, primary_key=True, index=True)
@@ -276,13 +308,22 @@ class ArtistProfile(Base):
     total_skips = Column(Integer, nullable=False, default=0)
     skip_rate = Column(String, nullable=False, default="0.0")
     has_favorite = Column(Boolean, default=False)
+    # v9: repurposed — now stores the dominant CANONICAL genre (normalized, Last.fm-sourced).
+    # Previously stored the most-played Jellyfin file-tag genre (unreliable).
+    # Always use this column, never Play.genre or LibraryTrack.genre, for genre analytics.
     primary_genre = Column(String, nullable=False, default="")
     affinity_score = Column(String, nullable=False, default="0.0")
     updated_at = Column(DateTime, default=datetime.utcnow)
     # v2
     replay_boost = Column(Float, nullable=True, default=0.0)
     related_artists = Column(Text, nullable=True)
+    # Raw Last.fm tags (unweighted, unfiltered). See docstring — prefer canonical_genres.
     tags = Column(Text, nullable=True)
+    # v9: weighted canonical genre list — JSON [{genre, weight}, ...].
+    # The authoritative multi-genre representation for this artist. Built from Last.fm
+    # tags with position-decay weighting, junk-tag filtering, and GENRE_ADJACENCY
+    # validation. All genre-sensitive features should derive from this column.
+    canonical_genres = Column(Text, nullable=True)
 
 
 class GenreProfile(Base):
@@ -311,6 +352,10 @@ class TrackScore(Base):
     track_name = Column(String, nullable=False, default="")
     artist_name = Column(String, nullable=False, default="")
     album_name = Column(String, nullable=False, default="")
+    # v9: canonical genre (normalized, Last.fm-sourced) for this track.
+    # Populated from ArtistProfile.primary_genre during rebuild_track_scores().
+    # This is the genre used by all playlist blocks, insights, and the galaxy.
+    # Safe to filter and query against — it aligns with GenreProfile.genre.
     genre = Column(String, nullable=False, default="")
     play_count = Column(Integer, nullable=False, default=0)
     last_played = Column(DateTime, nullable=True)
