@@ -10,7 +10,7 @@
  *  4. Album Suggestions — albums to fetch via Lidarr to fill gaps
  */
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { api } from '../lib/api.js'
 
@@ -503,6 +503,10 @@ export default function PlaylistImportDetail() {
   const [deleting, setDeleting]       = useState(false)
   const [rematching, setRematching]   = useState(false)
   const [addingArtists, setAddingArtists] = useState(false)
+  const [renaming, setRenaming]       = useState(false)
+  const [renameVal, setRenameVal]     = useState('')
+  const [renameSaving, setRenameSaving] = useState(false)
+  const renameInputRef = useRef(null)
 
   const load = useCallback(async () => {
     try {
@@ -595,6 +599,34 @@ export default function PlaylistImportDetail() {
     }
   }
 
+  function startRename() {
+    setRenameVal(detail?.name || '')
+    setRenaming(true)
+    setTimeout(() => renameInputRef.current?.focus(), 0)
+  }
+
+  async function saveRename() {
+    const trimmed = renameVal.trim()
+    if (!trimmed || trimmed === detail?.name) { setRenaming(false); return }
+    setRenameSaving(true)
+    try {
+      const updated = await api.patch(`/api/import/playlists/${id}/rename`, { name: trimmed })
+      setDetail(prev => ({ ...prev, name: updated.name }))
+      setRenaming(false)
+      if (updated.jellyfin_error) {
+        alert(`Renamed in JellyDJ, but Jellyfin sync failed:\n${updated.jellyfin_error}`)
+      }
+    } catch (err) {
+      alert('Rename failed: ' + err.message)
+    }
+    setRenameSaving(false)
+  }
+
+  function handleRenameKeyDown(e) {
+    if (e.key === 'Enter') saveRename()
+    if (e.key === 'Escape') { setRenaming(false); setRenameVal(detail?.name || '') }
+  }
+
   if (loading) return (
     <div style={{ padding: 24, color: 'var(--color-text-secondary)' }}>Loading…</div>
   )
@@ -643,7 +675,44 @@ export default function PlaylistImportDetail() {
                 <span style={{ fontSize: 11, color: '#facc15' }}>Matching…</span>
               )}
             </div>
-            <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>{detail.name}</h1>
+            {renaming ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                <input
+                  ref={renameInputRef}
+                  value={renameVal}
+                  onChange={e => setRenameVal(e.target.value)}
+                  onKeyDown={handleRenameKeyDown}
+                  className="input"
+                  style={{ fontSize: 18, fontWeight: 600, flex: 1 }}
+                />
+                <button
+                  onClick={saveRename}
+                  disabled={renameSaving}
+                  style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid var(--accent)', background: 'transparent', color: 'var(--accent)', fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  {renameSaving ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  onClick={() => { setRenaming(false); setRenameVal(detail?.name || '') }}
+                  style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 12, cursor: 'pointer' }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'default' }}>
+                <h1 style={{ fontSize: 20, fontWeight: 600, margin: 0 }}>{detail.name}</h1>
+                <button
+                  onClick={startRename}
+                  title="Rename playlist"
+                  style={{ padding: '3px 8px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 11, cursor: 'pointer', opacity: 0.6 }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                  onMouseLeave={e => e.currentTarget.style.opacity = '0.6'}
+                >
+                  Rename
+                </button>
+              </div>
+            )}
             <MatchBar matched={detail.matched_count} total={detail.track_count} />
           </div>
         </div>

@@ -12,7 +12,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Loader2, Trash2, ChevronRight, ArrowDownToLine, Settings2, RefreshCw,
+  Loader2, Trash2, ChevronRight, ArrowDownToLine, Settings2, RefreshCw, Pencil, Check, X,
 } from 'lucide-react'
 import { api } from '../lib/api.js'
 import PlatformIcon from '../components/PlatformIcon.jsx'
@@ -107,13 +107,16 @@ function ImportForm({ onImported }) {
 
 // ── Playlist card ───────────────────────────────────────────────────────────
 
-function PlaylistCard({ playlist, onOpen, onDelete, onRematched }) {
+function PlaylistCard({ playlist, onOpen, onDelete, onRematched, onRenamed }) {
   const isPending = playlist.status === 'pending'
   const isMatching = playlist.status === 'matching'
   const isBusy = isPending || isMatching
-  const [deleting, setDeleting] = useState(false)
-  const [confirmDel, setConfirm] = useState(false)
+  const [deleting, setDeleting]     = useState(false)
+  const [confirmDel, setConfirm]    = useState(false)
   const [rematching, setRematching] = useState(false)
+  const [renaming, setRenaming]     = useState(false)
+  const [renameVal, setRenameVal]   = useState(playlist.name)
+  const [renameSaving, setRenameSaving] = useState(false)
   const missingCount = playlist.track_count - playlist.matched_count
   const pct = playlist.track_count > 0
     ? Math.round((playlist.matched_count / playlist.track_count) * 100) : 0
@@ -156,6 +159,29 @@ function PlaylistCard({ playlist, onOpen, onDelete, onRematched }) {
     }
   }
 
+  async function handleRenameSave(e) {
+    e.stopPropagation()
+    const trimmed = renameVal.trim()
+    if (!trimmed || trimmed === playlist.name) { setRenaming(false); return }
+    setRenameSaving(true)
+    try {
+      const updated = await api.patch(`/api/import/playlists/${playlist.id}/rename`, { name: trimmed })
+      setRenaming(false)
+      onRenamed(updated)
+      if (updated.jellyfin_error) {
+        alert(`Renamed in JellyDJ, but Jellyfin sync failed:\n${updated.jellyfin_error}`)
+      }
+    } catch (err) {
+      alert('Rename failed: ' + err.message)
+    }
+    setRenameSaving(false)
+  }
+
+  function handleRenameKeyDown(e) {
+    if (e.key === 'Enter') handleRenameSave(e)
+    if (e.key === 'Escape') { e.stopPropagation(); setRenaming(false); setRenameVal(playlist.name) }
+  }
+
   return (
     <div
       className="card anim-fade-up overflow-hidden"
@@ -168,9 +194,46 @@ function PlaylistCard({ playlist, onOpen, onDelete, onRematched }) {
         <div className="flex items-start gap-3">
           <PlatformIcon platform={playlist.source_platform} size={28} />
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
-              {playlist.name}
-            </div>
+            {renaming ? (
+              <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                <input
+                  autoFocus
+                  className="input text-xs flex-1 min-w-0"
+                  value={renameVal}
+                  onChange={e => setRenameVal(e.target.value)}
+                  onKeyDown={handleRenameKeyDown}
+                  style={{ padding: '3px 8px', height: 28 }}
+                />
+                <button
+                  onClick={handleRenameSave}
+                  disabled={renameSaving}
+                  className="btn-secondary p-1 flex-shrink-0"
+                  title="Save"
+                >
+                  {renameSaving ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} style={{ color: 'var(--accent)' }} />}
+                </button>
+                <button
+                  onClick={e => { e.stopPropagation(); setRenaming(false); setRenameVal(playlist.name) }}
+                  className="btn-secondary p-1 flex-shrink-0"
+                  title="Cancel"
+                >
+                  <X size={10} />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 group/name min-w-0">
+                <div className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                  {playlist.name}
+                </div>
+                <button
+                  onClick={e => { e.stopPropagation(); setRenaming(true); setRenameVal(playlist.name) }}
+                  className="opacity-0 group-hover/name:opacity-100 transition-opacity btn-secondary p-0.5 flex-shrink-0"
+                  title="Rename"
+                >
+                  <Pencil size={9} />
+                </button>
+              </div>
+            )}
             <div className="flex items-center gap-2 mt-1">
               <PlatformBadge platform={playlist.source_platform} />
               {(isPending || isMatching) && (
@@ -329,6 +392,7 @@ export default function PlaylistImport() {
                 onOpen={p => navigate(`/import/${p.id}`)}
                 onDelete={loadPlaylists}
                 onRematched={loadPlaylists}
+                onRenamed={updated => setPlaylists(prev => prev.map(p => p.id === updated.id ? updated : p))}
               />
             ))}
           </div>

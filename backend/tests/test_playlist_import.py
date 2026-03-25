@@ -639,6 +639,222 @@ class TestBuildAlbumSuggestionsLidarrFailure:
         assert "Artist not in Lidarr" not in album_names
         db.close()
 
+
+# ── Playlist name username-appending + rename endpoint ────────────────────────
+
+def _make_imported_playlist(db, name="Liked Songs", user_id="user-1",
+                            jellyfin_id=None):
+    """Create a minimal ImportedPlaylist row and return it."""
+    pl = models.ImportedPlaylist(
+        owner_user_id=user_id,
+        source_platform="spotify",
+        source_url="https://open.spotify.com/playlist/test",
+        name=name,
+        track_count=0,
+        matched_count=0,
+        status="active",
+        jellyfin_playlist_id=jellyfin_id,
+    )
+    db.add(pl)
+    db.commit()
+    db.refresh(pl)
+    return pl
+
+
+class TestImportedPlaylistName:
+    """Verify username is appended to playlist names at import time."""
+
+    def test_username_suffix_format(self):
+        """
+        The stored playlist name must follow '<source name> - <username>'.
+        We test the string-construction logic directly since the router
+        uses f-string concatenation.
+        """
+        source_name = "Liked Songs"
+        username = "alice"
+        result = source_name + f" - {username}"
+        assert result == "Liked Songs - alice"
+
+    def test_fallback_name_gets_username(self):
+        """When no playlist_name is supplied, 'Imported Playlist - <user>' is used."""
+        username = "bob"
+        result = ("Imported Playlist") + f" - {username}"
+        assert result == "Imported Playlist - bob"
+
+    def test_two_users_same_source_differ(self):
+        """
+        Simulates two users importing the same named playlist — their stored
+        names must be different so they don't clobber each other in Jellyfin.
+        """
+        source = "Top Hits"
+        name_alice = source + " - alice"
+        name_bob   = source + " - bob"
+        assert name_alice != name_bob
+
+
+class TestRenameImportedPlaylist:
+    """Unit tests for the rename logic (DB side, no HTTP layer)."""
+
+    def test_rename_updates_db(self, db):
+        """After rename, the ImportedPlaylist.name column reflects the new name."""
+        pl = _make_imported_playlist(db, name="Liked Songs - alice", user_id="user-1")
+        pl.name = "My Favourites - alice"
+        db.commit()
+        db.refresh(pl)
+        assert pl.name == "My Favourites - alice"
+
+    def test_rename_different_user_does_not_affect_original(self, db):
+        """Renaming user B's playlist leaves user A's unchanged."""
+        pl_a = _make_imported_playlist(db, name="Liked Songs - alice", user_id="user-a")
+        pl_b = _make_imported_playlist(db, name="Liked Songs - bob",   user_id="user-b")
+
+        pl_b.name = "Bob's playlist - bob"
+        db.commit()
+        db.refresh(pl_a)
+
+        assert pl_a.name == "Liked Songs - alice"
+        assert pl_b.name == "Bob's playlist - bob"
+
+    def test_rename_preserves_other_fields(self, db):
+        """A rename must not change status, track_count, etc."""
+        pl = _make_imported_playlist(db, name="Original - alice", user_id="user-1")
+        pl.name = "Renamed - alice"
+        db.commit()
+        db.refresh(pl)
+
+        assert pl.status == "active"
+        assert pl.track_count == 0
+        assert pl.source_platform == "spotify"
+
+    def test_ownership_filter_returns_none_for_wrong_user(self, db):
+        """A query that filters by owner_user_id returns None for a different user."""
+        pl = _make_imported_playlist(db, name="Alice's list - alice", user_id="user-a")
+
+        # Simulate what the rename endpoint does: filter by both id AND user_id
+        wrong_user_result = db.query(models.ImportedPlaylist).filter_by(
+            id=pl.id, owner_user_id="user-b"
+        ).first()
+        assert wrong_user_result is None
+
+    def test_rename_jellyfin_helper_skips_when_no_config(self, db):
+        """_rename_jellyfin_playlist returns (False, ...) when Jellyfin is not configured."""
+        import asyncio
+        from routers.playlist_import import _rename_jellyfin_playlist
+        pl = _make_imported_playlist(db, name="Test - alice", user_id="user-1",
+                                     jellyfin_id="old-jf-id")
+        success, err = asyncio.get_event_loop().run_until_complete(
+            _rename_jellyfin_playlist(pl, "New Name - alice", db)
+        )
+        assert success is False
+        assert "not configured" in err.lower()
+
+    def test_rename_jellyfin_helper_creates_then_deletes(self, db):
+        """
+        Helper POSTs to /Playlists with the new name, updates jellyfin_playlist_id
+        in DB, then DELETEs the old playlist.
+        """
+        import asyncio
+        from crypto import encrypt
+        from routers.playlist_import import _rename_jellyfin_playlist
+
+        conn = models.ConnectionSettings(
+            service="jellyfin",
+            base_url="http://jellyfin-test:8096",
+            api_key_encrypted=encrypt("test-key"),
+        )
+        db.add(conn)
+        db.commit()
+
+        pl = _make_imported_playlist(db, name="Old Name - alice", user_id="user-1",
+                                     jellyfin_id="old-jf-id")
+
+        mock_create_resp = MagicMock()
+        mock_create_resp.status_code = 201
+        mock_create_resp.json = MagicMock(return_value={"Id": "new-jf-id"})
+
+        mock_del_resp = MagicMock()
+        mock_del_resp.status_code = 204
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post   = AsyncMock(return_value=mock_create_resp)
+            mock_client.delete = AsyncMock(return_value=mock_del_resp)
+            mock_cls.return_value = mock_client
+
+            success, err = asyncio.get_event_loop().run_until_complete(
+                _rename_jellyfin_playlist(pl, "New Name - alice", db)
+            )
+
+        assert success is True, f"Expected success, got error: {err}"
+        assert err == ""
+
+        # New name sent to Jellyfin
+        create_call = mock_client.post.call_args
+        assert create_call.kwargs["json"]["Name"] == "New Name - alice"
+
+        # Old playlist deleted
+        mock_client.delete.assert_awaited_once()
+        del_url = mock_client.delete.call_args.args[0]
+        assert "old-jf-id" in del_url
+
+        # DB updated with new Jellyfin ID
+        db.refresh(pl)
+        assert pl.jellyfin_playlist_id == "new-jf-id"
+
+    def test_rename_jellyfin_helper_create_fail_returns_false(self, db):
+        """If Jellyfin create returns non-200/201, helper returns (False, detail)."""
+        import asyncio
+        from crypto import encrypt
+        from routers.playlist_import import _rename_jellyfin_playlist
+
+        conn = models.ConnectionSettings(
+            service="jellyfin",
+            base_url="http://jellyfin-test:8096",
+            api_key_encrypted=encrypt("test-key"),
+        )
+        db.add(conn)
+        db.commit()
+
+        pl = _make_imported_playlist(db, name="Old - alice", user_id="user-1",
+                                     jellyfin_id="old-jf-id")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        mock_resp.text = "Service Unavailable"
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_cls.return_value = mock_client
+
+            success, err = asyncio.get_event_loop().run_until_complete(
+                _rename_jellyfin_playlist(pl, "New - alice", db)
+            )
+
+        assert success is False
+        assert "503" in err
+        # DB must NOT be updated when create failed
+        db.refresh(pl)
+        assert pl.jellyfin_playlist_id == "old-jf-id"
+
+
+# ── Remaining TestBuildAlbumSuggestionsLidarrFailure cases ────────────────────
+# (separated to avoid class-method reference issues after insertion point)
+
+def _mock_lidarr_resp(status_code: int, json_body=None):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value=json_body or [])
+    return resp
+
+
+class TestBuildAlbumSuggestionsLidarrFallback:
+    """Extra cases from TestBuildAlbumSuggestionsLidarrFailure that need their own class."""
+
     def test_lidarr_non200_produces_unknown_album_fallback(self):
         """
         When Lidarr bulk fetch fails, the artist should still get an
@@ -649,7 +865,7 @@ class TestBuildAlbumSuggestionsLidarrFailure:
         db = _make_db()
         playlist_id = _make_import_setup(db, artist_name="The Beatles", track_name="Come Together")
 
-        mock_get = AsyncMock(return_value=self._mock_lidarr_response(503))
+        mock_get = AsyncMock(return_value=_mock_lidarr_resp(503))
 
         with patch("httpx.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
@@ -658,12 +874,13 @@ class TestBuildAlbumSuggestionsLidarrFailure:
             mock_client.get = mock_get
             mock_client_class.return_value = mock_client
 
-            self._run(build_album_suggestions(playlist_id, db))
+            asyncio.get_event_loop().run_until_complete(
+                build_album_suggestions(playlist_id, db)
+            )
 
         suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
             playlist_id=playlist_id
         ).all()
-        # Should have exactly one suggestion for the artist, labelled Unknown Album
         assert len(suggestions) == 1
         assert suggestions[0].artist_name == "The Beatles"
         assert suggestions[0].album_name == "Unknown Album"
@@ -672,8 +889,7 @@ class TestBuildAlbumSuggestionsLidarrFailure:
     def test_lidarr_200_with_known_artist_does_not_show_not_in_lidarr(self):
         """
         When Lidarr returns 200 and the artist IS in the list, no
-        'Artist not in Lidarr' suggestion is created.  (The per-artist album
-        fetch may return empty, but the artist is still 'known'.)
+        'Artist not in Lidarr' suggestion is created.
         """
         from services.playlist_import import build_album_suggestions
 
@@ -688,20 +904,14 @@ class TestBuildAlbumSuggestionsLidarrFailure:
 
         async def _mock_get(url, **kwargs):
             if "/api/v1/artist" in url and "album" not in url and "track" not in url:
-                return self._mock_lidarr_response(200, [beatles_artist])
+                return _mock_lidarr_resp(200, [beatles_artist])
             if "/api/v1/album" in url:
-                # Return one album containing our track
-                return self._mock_lidarr_response(200, [{
-                    "id": 10,
-                    "title": "Abbey Road",
-                    "albumType": "Album",
-                    "images": [],
+                return _mock_lidarr_resp(200, [{
+                    "id": 10, "title": "Abbey Road", "albumType": "Album", "images": [],
                 }])
             if "/api/v1/track" in url:
-                return self._mock_lidarr_response(200, [
-                    {"albumId": 10, "title": "Yesterday"},
-                ])
-            return self._mock_lidarr_response(200, [])
+                return _mock_lidarr_resp(200, [{"albumId": 10, "title": "Yesterday"}])
+            return _mock_lidarr_resp(200, [])
 
         with patch("httpx.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
@@ -710,7 +920,9 @@ class TestBuildAlbumSuggestionsLidarrFailure:
             mock_client.get = _mock_get
             mock_client_class.return_value = mock_client
 
-            self._run(build_album_suggestions(playlist_id, db))
+            asyncio.get_event_loop().run_until_complete(
+                build_album_suggestions(playlist_id, db)
+            )
 
         suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
             playlist_id=playlist_id

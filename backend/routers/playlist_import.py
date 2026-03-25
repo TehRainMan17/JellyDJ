@@ -3,11 +3,12 @@ JellyDJ — Playlist Import Router
 
 Endpoints
 ─────────
-  POST   /api/import/playlists           Submit a URL or browser-extension payload
-  GET    /api/import/playlists           List all imported playlists for current user
-  GET    /api/import/playlists/{id}      Detail: tracks + album suggestions
+  POST   /api/import/playlists                 Submit a URL or browser-extension payload
+  GET    /api/import/playlists                 List all imported playlists for current user
+  GET    /api/import/playlists/{id}            Detail: tracks + album suggestions
+  PATCH  /api/import/playlists/{id}/rename     Rename an imported playlist (DB + Jellyfin)
   POST   /api/import/playlists/{id}/rematch    Re-run the match pass (after library update)
-  DELETE /api/import/playlists/{id}      Remove import + delete Jellyfin playlist
+  DELETE /api/import/playlists/{id}            Remove import + delete Jellyfin playlist
 
   GET    /api/import/playlists/{id}/suggestions     Album suggestions for missing tracks
   POST   /api/import/playlists/{id}/suggestions/{sid}/approve    Send album to Lidarr
@@ -71,6 +72,17 @@ class ImportRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("URL must not be empty")
+        return v
+
+
+class RenameRequest(BaseModel):
+    name: str
+
+    @validator("name")
+    def name_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Name must not be empty")
         return v
 
 
@@ -397,6 +409,87 @@ def _format_track(t: ImportedPlaylistTrack) -> dict:
     }
 
 
+async def _rename_jellyfin_playlist(
+    pl: ImportedPlaylist,
+    new_name: str,
+    db: Session,
+) -> tuple[bool, str]:
+    """
+    Rename a Jellyfin playlist by recreating it with the new name.
+
+    Jellyfin playlist names are tied to the folder/file Jellyfin created on
+    disk; ``POST /Items/{id}`` is silently ignored for playlists.  The only
+    reliable rename is: create a new playlist with the correct name and all
+    current matched tracks, update our DB record with the new Jellyfin ID,
+    then delete the old playlist.
+
+    Returns ``(True, "")`` on success, ``(False, detail)`` on failure.
+    Never raises.
+    """
+    conn = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+    if not conn or not conn.base_url:
+        return False, "Jellyfin not configured"
+
+    base_url   = conn.base_url.rstrip("/")
+    api_key    = decrypt(conn.api_key_encrypted)
+    headers    = {"X-Emby-Token": api_key, "Content-Type": "application/json"}
+    old_jf_id  = pl.jellyfin_playlist_id
+
+    # Collect matched track IDs in playlist order
+    matched = (
+        db.query(ImportedPlaylistTrack)
+        .filter_by(playlist_id=pl.id, match_status="matched")
+        .order_by(ImportedPlaylistTrack.position)
+        .all()
+    )
+    item_ids = [t.matched_item_id for t in matched if t.matched_item_id]
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Step 1 — create new playlist with the new name
+            create_resp = await client.post(
+                f"{base_url}/Playlists",
+                headers=headers,
+                json={
+                    "Name":      new_name,
+                    "Ids":       ",".join(item_ids) if item_ids else "",
+                    "UserId":    pl.owner_user_id,
+                    "MediaType": "Audio",
+                },
+            )
+            if create_resp.status_code not in (200, 201):
+                log.error(
+                    "Jellyfin create-for-rename failed (%s): %s",
+                    create_resp.status_code, create_resp.text[:300],
+                )
+                return False, f"Jellyfin create failed: HTTP {create_resp.status_code}"
+
+            new_jf_id = create_resp.json().get("Id")
+            if not new_jf_id:
+                return False, "Jellyfin returned no playlist ID after create"
+
+            # Step 2 — persist the new Jellyfin ID before attempting delete
+            pl.jellyfin_playlist_id = new_jf_id
+            db.commit()
+
+            # Step 3 — delete old playlist (best-effort; failure is non-fatal)
+            if old_jf_id:
+                del_resp = await client.delete(
+                    f"{base_url}/Items/{old_jf_id}", headers=headers
+                )
+                if del_resp.status_code not in (200, 204):
+                    log.warning(
+                        "Jellyfin delete of old playlist %s returned %s — ignored",
+                        old_jf_id, del_resp.status_code,
+                    )
+
+    except Exception as exc:
+        log.error("Jellyfin rename-by-recreate raised: %s", exc)
+        return False, str(exc)
+
+    return True, ""
+
+
 # ── Background job ────────────────────────────────────────────────────────────
 
 async def _run_full_import(playlist_id: int, owner_user_id: str):
@@ -460,7 +553,7 @@ async def import_playlist(
     if payload.tracks is not None:
         # Browser extension path — trust the pre-parsed data
         tracks_raw = payload.tracks
-        playlist_name = payload.playlist_name or "Imported Playlist"
+        playlist_name = (payload.playlist_name or "Imported Playlist") + f" - {current_user.username}"
         source_id = ""  # extension doesn't always provide this
     else:
         # URL paste path — use yt-dlp
@@ -472,7 +565,7 @@ async def import_playlist(
             raise HTTPException(502, str(exc))
 
         tracks_raw = meta["tracks"]
-        playlist_name = meta["name"]
+        playlist_name = meta["name"] + f" - {current_user.username}"
         source_id = meta.get("source_id", "")
 
     # Create ImportedPlaylist row
@@ -559,6 +652,35 @@ def get_imported_playlist(
         **_format_playlist(pl),
         "tracks": [_format_track(t) for t in tracks],
     }
+
+
+@router.patch("/playlists/{playlist_id}/rename")
+async def rename_imported_playlist(
+    playlist_id: int,
+    payload: RenameRequest,
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rename an imported playlist in the DB and, if already in Jellyfin, there too."""
+    pl = db.query(ImportedPlaylist).filter_by(
+        id=playlist_id, owner_user_id=current_user.user_id
+    ).first()
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+
+    pl.name = payload.name
+    db.commit()
+
+    jf_ok = True
+    jf_error = ""
+    if pl.jellyfin_playlist_id:
+        jf_ok, jf_error = await _rename_jellyfin_playlist(pl, payload.name, db)
+
+    result = _format_playlist(pl)
+    result["jellyfin_synced"] = jf_ok
+    if jf_error:
+        result["jellyfin_error"] = jf_error
+    return result
 
 
 @router.post("/playlists/{playlist_id}/rematch", status_code=202)
