@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import {
-  DatabaseBackup, RefreshCw, RotateCcw, Trash2, Save,
+  DatabaseBackup, RefreshCw, RotateCcw, RotateCw, Trash2, Save,
   ChevronDown, ChevronUp, Check, Shield, ShieldOff, Clock,
   Settings2, AlertCircle, Loader2, Eye, EyeOff, Pencil, X,
   CheckCircle2, History, Tag, ChevronRight,
@@ -751,10 +751,10 @@ export default function PlaylistBackups() {
                   disabled={!selected.size} icon={DatabaseBackup}
                   label={`Back up selected (${selected.size})`} variant="primary" />
                 <ActionBtn onClick={handleBackupAll} loading={backingUpAll}
-                  icon={RefreshCw} label="Back up all" variant="default" />
+                  icon={DatabaseBackup} label="Back up all" variant="default" />
                 <button onClick={() => load()} disabled={loading}
                   className="ml-auto p-2 rounded-lg hover:bg-white/10 transition-colors">
-                  <RefreshCw size={14} style={{ color: 'var(--text-muted)' }} />
+                  <RotateCw size={14} style={{ color: 'var(--text-muted)' }} />
                 </button>
               </div>
 

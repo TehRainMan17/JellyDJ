@@ -694,6 +694,19 @@ async def _populate_all_users(users, limit: int = 0):
         # Yield between users so other requests can be handled
         await asyncio.sleep(0)
 
+    # Sync the scheduler's next-fire time with the fresh last_discovery_refresh stamp
+    # so manual populates and scheduled runs share the same 24h cadence.
+    try:
+        from database import SessionLocal as _SL
+        _db = _SL()
+        try:
+            from scheduler import reschedule_automation_jobs
+            reschedule_automation_jobs(_db)
+        finally:
+            _db.close()
+    except Exception as _e:
+        log.debug("_populate_all_users: reschedule skipped — %s", _e)
+
 
 @router.post("/{item_id}/action")
 def action_item(

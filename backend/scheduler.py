@@ -624,7 +624,7 @@ def reschedule_automation_jobs(db):
         _disc_last     = getattr(s, "last_discovery_refresh", None)
         _now           = datetime.now(timezone.utc)
         if _disc_last is None:
-            _disc_next = _now + _disc_interval
+            _disc_next = _now + _td(minutes=2)   # never run — fire soon after startup
         else:
             if _disc_last.tzinfo is None:
                 _disc_last = _disc_last.replace(tzinfo=timezone.utc)

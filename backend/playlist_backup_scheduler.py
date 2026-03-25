@@ -47,16 +47,27 @@ async def _async_auto_backup(SessionLocal):
             _get_admin_user_id,
             _fetch_jellyfin_playlists,
             _do_backup_playlist,
+            _build_managed_set,
+            _is_managed,
         )
 
         admin_user_id = await _get_admin_user_id(base_url, api_key)
         playlists = await _fetch_jellyfin_playlists(base_url, api_key, admin_user_id)
+        managed_ids, managed_names = _build_managed_set(db)
 
         backed_up = 0
         skipped = 0
         for p in playlists:
+            # Never auto-backup JellyDJ-managed playlists
+            if _is_managed(p["id"], p["name"], managed_ids, managed_names):
+                skipped += 1
+                continue
             existing = db.query(PlaylistBackup).filter_by(jellyfin_playlist_id=p["id"]).first()
-            if existing and existing.exclude_from_auto:
+            # Only back up playlists explicitly enrolled by the user (existing record)
+            if not existing:
+                skipped += 1
+                continue
+            if existing.exclude_from_auto:
                 skipped += 1
                 continue
             await _do_backup_playlist(
@@ -122,12 +133,17 @@ def register_playlist_backup_job(SessionLocal):
 def reschedule_backup_job(db):
     """
     Re-read settings from DB and update the scheduler job.
-    Called by PUT /api/playlist-backups/settings.
+    Called by PUT /api/playlist-backups/settings and on startup.
+
+    Uses last_auto_backup_at to compute start_date so container restarts
+    and settings saves don't reset the interval clock (same pattern as
+    reschedule_index_job in scheduler.py).
     """
     from models import PlaylistBackupSettings
     from apscheduler.triggers.interval import IntervalTrigger
     from scheduler import scheduler
     from database import SessionLocal
+    from datetime import timedelta as _td
 
     settings = db.query(PlaylistBackupSettings).first()
     if not settings:
@@ -141,15 +157,28 @@ def reschedule_backup_job(db):
             pass
         return
 
+    _interval = _td(hours=settings.auto_backup_interval_hours)
+    _last = settings.last_auto_backup_at
+    _now = datetime.now(timezone.utc)
+    if _last is None:
+        _next = _now + _td(minutes=2)   # never run yet — fire soon after startup
+    else:
+        if _last.tzinfo is None:
+            _last = _last.replace(tzinfo=timezone.utc)
+        _next = _last + _interval
+        if _next < _now:
+            _next = _now + _td(minutes=2)  # overdue — run soon but not instantly
+
     scheduler.add_job(
         _run_auto_backup,
-        trigger=IntervalTrigger(hours=settings.auto_backup_interval_hours),
+        trigger=IntervalTrigger(hours=settings.auto_backup_interval_hours, start_date=_next),
         id=PLAYLIST_BACKUP_JOB_ID,
         args=[SessionLocal],
         replace_existing=True,
         name="Playlist auto-backup",
     )
     log.info(
-        "Playlist backup job rescheduled — every %d hour(s)",
+        "Playlist backup job rescheduled — every %d hour(s), next run %s",
         settings.auto_backup_interval_hours,
+        _next.strftime("%Y-%m-%d %H:%M UTC"),
     )
