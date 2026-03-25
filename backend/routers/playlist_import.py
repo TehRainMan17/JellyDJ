@@ -47,7 +47,7 @@ from services.external_playlist_fetcher import (
 )
 from services.playlist_import import (
     build_album_suggestions, on_jellyfin_item_added,
-    run_match_pass, write_jellyfin_playlist,
+    run_match_pass, write_jellyfin_playlist, _normalise as _norm_album,
 )
 
 log = logging.getLogger(__name__)
@@ -281,19 +281,28 @@ async def _send_album_to_lidarr(
             target = clean_album.lower().strip()
 
             def _album_score(alb: dict) -> float:
-                title = alb.get("title", "").lower().strip()
+                raw_title  = alb.get("title", "").lower().strip()
+                norm_title = _norm_album(alb.get("title", ""))
+                norm_tgt   = _norm_album(clean_album)
                 if not target:
                     return 0.0
-                if title == target:
+                # Exact match on raw or normalised forms
+                if raw_title == target or norm_title == norm_tgt:
                     return 1.0
-                if target in title:
-                    return 0.9 - (len(title) - len(target)) * 0.01
-                if title in target:
-                    return 0.8
-                t_words = set(target.split())
-                a_words = set(title.split())
+                # Normalised substring containment (handles "(1st album)", "(Remastered)", etc.)
+                if norm_tgt and norm_title and (norm_tgt in norm_title or norm_title in norm_tgt):
+                    # Prefer titles that are closer in length after normalisation
+                    return 0.95 - abs(len(norm_title) - len(norm_tgt)) * 0.01
+                # Raw substring containment (fallback for titles that survive normalisation)
+                if target in raw_title:
+                    return 0.85 - (len(raw_title) - len(target)) * 0.01
+                if raw_title in target:
+                    return 0.75
+                # Word-overlap on normalised tokens
+                t_words = set(norm_tgt.split())
+                a_words = set(norm_title.split())
                 overlap = len(t_words & a_words)
-                if overlap:
+                if t_words and a_words and overlap:
                     return 0.5 + (overlap / max(len(t_words), len(a_words))) * 0.3
                 return 0.0
 
@@ -572,6 +581,108 @@ async def rematch_playlist(
 
     background_tasks.add_task(_run_full_import, playlist_id, current_user.user_id)
     return {"ok": True, "message": "Re-match started in background."}
+
+
+# ── Manual match helpers ───────────────────────────────────────────────────────
+
+class ManualMatchBody(BaseModel):
+    track_name: str
+    library_item_id: str
+
+
+async def _rebuild_suggestions_only(playlist_id: int):
+    """Background task: rebuild album suggestions after a manual match."""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        await build_album_suggestions(playlist_id, db)
+        pl = db.query(ImportedPlaylist).filter_by(id=playlist_id).first()
+        if pl:
+            await write_jellyfin_playlist(playlist_id, pl.owner_user_id, db)
+    except Exception as exc:
+        log.exception("Manual match rebuild failed for playlist %d: %s", playlist_id, exc)
+    finally:
+        db.close()
+
+
+@router.get("/playlists/{playlist_id}/library-search")
+def library_search(
+    playlist_id: int,
+    q: str = Query(""),
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Search library tracks by name — used by the manual match modal."""
+    from models import LibraryTrack
+    pl = db.query(ImportedPlaylist).filter_by(
+        id=playlist_id, owner_user_id=current_user.user_id
+    ).first()
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    if not q.strip():
+        return []
+    results = (
+        db.query(LibraryTrack)
+        .filter(
+            LibraryTrack.track_name.ilike(f"%{q}%"),
+            LibraryTrack.missing_since.is_(None),
+        )
+        .order_by(LibraryTrack.track_name)
+        .limit(25)
+        .all()
+    )
+    return [
+        {
+            "item_id":    r.jellyfin_item_id,
+            "track_name": r.track_name,
+            "artist_name": r.artist_name,
+            "album_name": r.album_name or "",
+        }
+        for r in results
+    ]
+
+
+@router.post("/playlists/{playlist_id}/tracks/manual-match")
+async def manual_match_track(
+    playlist_id: int,
+    body: ManualMatchBody,
+    background_tasks: BackgroundTasks,
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manually link an import track to a library track, bypassing fuzzy matching."""
+    pl = db.query(ImportedPlaylist).filter_by(
+        id=playlist_id, owner_user_id=current_user.user_id
+    ).first()
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+
+    tracks = (
+        db.query(ImportedPlaylistTrack)
+        .filter_by(playlist_id=playlist_id, track_name=body.track_name)
+        .filter(ImportedPlaylistTrack.match_status != "matched")
+        .all()
+    )
+    if not tracks:
+        raise HTTPException(404, "Track not found or already matched")
+
+    for t in tracks:
+        t.match_status = "matched"
+        t.matched_item_id = body.library_item_id
+        t.match_score = 1.0
+        t.resolved_at = datetime.utcnow()
+
+    pl.matched_count = (
+        db.query(ImportedPlaylistTrack)
+        .filter_by(playlist_id=playlist_id, match_status="matched")
+        .count()
+        + len(tracks)  # optimistic — commits below confirm
+    )
+    db.commit()
+
+    # Rebuild suggestions and re-write playlist in background
+    background_tasks.add_task(_rebuild_suggestions_only, playlist_id)
+    return {"matched": len(tracks)}
 
 
 @router.delete("/playlists/{playlist_id}", status_code=204)

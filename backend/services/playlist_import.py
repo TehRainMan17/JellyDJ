@@ -66,6 +66,33 @@ def _normalise(text: str) -> str:
     # Remove parenthetical suffixes common in streaming metadata
     # e.g. "(feat. X)", "(Remastered)", "[Radio Edit]"
     ascii_text = re.sub(r"[\(\[][^\)\]]{0,60}[\)\]]", "", ascii_text)
+    # Remove hyphenated version/remaster suffixes that appear in streaming
+    # metadata but not in clean library titles (or vice-versa).
+    # Must be applied while the hyphen is still present (before the
+    # non-alphanumeric strip below).
+    # e.g. "Hey Jude - Remastered 2015"      → "Hey Jude"
+    #      "That's All - 2007 Remaster"       → "That's All"
+    #      "Faith - Remastered"               → "Faith"
+    #      "Come and Get Your Love - Single Version" → "Come and Get Your Love"
+    #      "Hungry Eyes - From Dirty Dancing Soundtrack" → "Hungry Eyes"
+    ascii_text = re.sub(
+        r"\s+-\s+("
+        r"remaster(?:ed)?(?:\s+\d{2,4})?"   # "Remastered", "Remastered 2015"
+        r"|\d{2,4}\s+remaster(?:ed)?"        # "2007 Remaster", "2009 Remastered"
+        r"|single\s+version"
+        r"|album\s+version"
+        r"|radio\s+edit"
+        r"|live(?:\s+at\b.*)?"              # "Live", "Live at MSG"
+        r"|mono(?:\s+mix)?"
+        r"|stereo(?:\s+mix)?"
+        r"|acoustic(?:\s+version)?"
+        r"|instrumental"
+        r"|from\b.*soundtrack"              # "From '...' Soundtrack"
+        r").*$",
+        "",
+        ascii_text,
+        flags=re.IGNORECASE,
+    )
     # Strip all non-alphanumeric (keep spaces)
     ascii_text = re.sub(r"[^a-z0-9 ]", "", ascii_text)
     # Remove noise words that differ between platforms/library metadata
@@ -78,6 +105,25 @@ def _normalise(text: str) -> str:
 
 def _ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
+
+
+_NOISE_WORDS = frozenset({"the", "and", "n", "a", "an", "in", "of", "to", "s"})
+
+
+def _word_set(text: str) -> frozenset[str]:
+    """
+    Returns the set of meaningful words in a title, ignoring parenthetical
+    structure and punctuation.  Used for bag-of-words matching so that
+    swapped-parenthetical titles like:
+      "Stronger (What Doesn't Kill You)"  ↔  "What Doesn't Kill You (Stronger)"
+    produce identical frozensets.
+    """
+    if not text:
+        return frozenset()
+    nfkd = unicodedata.normalize("NFKD", text)
+    ascii_text = nfkd.encode("ascii", "ignore").decode("ascii").lower()
+    ascii_text = re.sub(r"[^a-z0-9 ]", " ", ascii_text)
+    return frozenset(w for w in ascii_text.split() if w not in _NOISE_WORDS and len(w) > 1)
 
 
 # ── Core match function ────────────────────────────────────────────────────────
@@ -145,6 +191,24 @@ def match_track(
                         best_id = entry["item_id"]
                         best_score = score
 
+    # Pass 5: bag-of-words equality — catches swapped parenthetical titles
+    # "Stronger (What Doesn't Kill You)" ↔ "What Doesn't Kill You (Stronger)"
+    # Both produce word set {'stronger','what','doesnt','kill','you'}.
+    if not best_id:
+        t_words = _word_set(track_name)
+        if len(t_words) >= 3:  # need enough words to avoid trivial collisions
+            for entry in library_index:
+                et_words = entry.get("track_words", frozenset())
+                if et_words != t_words:
+                    continue
+                a_r = _ratio(entry["artist_norm"], a_norm)
+                if a_r < 0.60:
+                    continue
+                score = 0.78 * a_r
+                if score > best_score:
+                    best_id = entry["item_id"]
+                    best_score = score
+
     return best_id, best_score
 
 
@@ -166,10 +230,13 @@ def build_library_index(db: Session) -> list[dict]:
     for row in rows:
         artist_norm = _normalise(row.artist_name)
         album_artist_norm = _normalise(row.album_artist) if row.album_artist else ""
+        track_norm = _normalise(row.track_name)
+        track_words = _word_set(row.track_name)
         entry = {
-            "item_id":            row.jellyfin_item_id,
-            "track_norm":         _normalise(row.track_name),
-            "artist_norm":        artist_norm,
+            "item_id":     row.jellyfin_item_id,
+            "track_norm":  track_norm,
+            "artist_norm": artist_norm,
+            "track_words": track_words,
         }
         index.append(entry)
         # If album_artist differs from artist, add a second index entry
@@ -177,8 +244,9 @@ def build_library_index(db: Session) -> list[dict]:
         if album_artist_norm and album_artist_norm != artist_norm:
             index.append({
                 "item_id":     row.jellyfin_item_id,
-                "track_norm":  _normalise(row.track_name),
+                "track_norm":  track_norm,
                 "artist_norm": album_artist_norm,
+                "track_words": track_words,
             })
     return index
 
@@ -299,6 +367,8 @@ async def build_album_suggestions(playlist_id: int, db: Session) -> int:
     # ── For each artist, query Lidarr for real albums + tracks ────────────
     # Result: album_suggestions[key] = {artist, album_title, track_list, image_url, ...}
     album_suggestions: dict[tuple[str, str], dict] = {}
+    # Tracks artists confirmed to exist in Lidarr (even if no album candidates found)
+    lidarr_found_artists: set[str] = set()
 
     if has_lidarr:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -309,7 +379,8 @@ async def build_album_suggestions(playlist_id: int, db: Session) -> int:
             existing_artists = {}       # lowered name → artist dict
             existing_by_foreign = {}    # foreignArtistId → artist dict
             existing_artists_norm = {}  # normalised name → artist dict
-            if existing_resp.status_code == 200:
+            lidarr_artists_ok = existing_resp.status_code == 200
+            if lidarr_artists_ok:
                 for a in existing_resp.json():
                     name_lower = a.get("artistName", "").lower()
                     existing_artists[name_lower] = a
@@ -319,8 +390,20 @@ async def build_album_suggestions(playlist_id: int, db: Session) -> int:
                     norm = _normalise(a.get("artistName", ""))
                     if norm:
                         existing_artists_norm[norm] = a
+            else:
+                log.warning(
+                    "Playlist %d: Lidarr /api/v1/artist returned HTTP %d — "
+                    "cannot verify artist membership; skipping Lidarr artist lookup "
+                    "(artists will fall back to 'Unknown Album' until the next re-match)",
+                    playlist_id, existing_resp.status_code,
+                )
 
             for artist_lower, track_list in artist_tracks.items():
+                if not lidarr_artists_ok:
+                    # Bulk fetch failed — skip Lidarr lookup entirely for this artist.
+                    # The fallback loop below will create an 'Unknown Album' suggestion
+                    # so the user can re-match once Lidarr is available again.
+                    continue
                 display_artist = track_list[0][1]  # use first track's display name
                 # Deduplicate track names (same track can appear multiple times)
                 seen_tracks: set[str] = set()
@@ -372,6 +455,9 @@ async def build_album_suggestions(playlist_id: int, db: Session) -> int:
                         lidarr_artist_id = lidarr_artist.get("id")
                         log.info("  '%s' matched Lidarr artist '%s' by fuzzy name (%.2f)",
                                  display_artist, lidarr_artist.get("artistName"), best_score)
+
+                if lidarr_artist_id:
+                    lidarr_found_artists.add(_normalise(display_artist))
 
                 if not lidarr_artist_id:
                     log.info("  '%s' NOT matched in Lidarr (norm='%s', mbid=%s)",
@@ -548,14 +634,20 @@ async def build_album_suggestions(playlist_id: int, db: Session) -> int:
 
     for artist_lower, track_list in artist_tracks.items():
         display_artist = track_list[0][1]
-        if _normalise(display_artist) in resolved_artists:
+        artist_norm = _normalise(display_artist)
+        if artist_norm in resolved_artists:
             continue
         track_names = [t[0] for t in track_list]
         enrichment = enrichment_map.get(artist_lower)
-        key = (_normalise(display_artist), "")
+        # Distinguish: artist confirmed in Lidarr (no matching albums) vs truly unknown
+        if artist_norm in lidarr_found_artists:
+            album_label = "No albums tracked in Lidarr"
+        else:
+            album_label = "Unknown Album"
+        key = (artist_norm, "")
         album_suggestions[key] = {
             "artist": display_artist,
-            "album": "Unknown Album",
+            "album": album_label,
             "tracks": track_names,
             "image_url": enrichment.image_url if enrichment else None,
             "artist_mbid": enrichment.mbid if enrichment else None,

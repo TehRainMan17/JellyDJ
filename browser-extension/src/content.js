@@ -187,6 +187,11 @@
   // ── Scrapers per platform ───────────────────────────────────────────────────
 
   function getPlaylistName() {
+    // Spotify Liked Songs page doesn't have a playlist header — use fixed name
+    if (platform === 'spotify' && location.pathname === '/collection/tracks') {
+      return 'Liked Songs';
+    }
+
     const selectors = [
       // Spotify
       '[data-testid="playlist-page"] h1',
@@ -470,7 +475,7 @@
 
   function isPlaylistPage() {
     return (
-      (platform === 'spotify'       && /\/playlist\//.test(location.pathname)) ||
+      (platform === 'spotify'       && (/\/playlist\//.test(location.pathname) || location.pathname === '/collection/tracks')) ||
       (platform === 'tidal'         && /\/playlist\//.test(location.pathname)) ||
       (platform === 'youtube_music' && /[?&]list=/.test(location.search))
     );

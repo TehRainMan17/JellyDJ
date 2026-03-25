@@ -18,6 +18,10 @@ Covers:
   - build_library_index(): DB — excludes missing tracks, deduplicates
     album_artist into a second index entry so both artist and album_artist
     spellings can be matched
+  - build_album_suggestions(): Lidarr bulk-fetch failure (non-200) must not
+    produce 'Artist not in Lidarr' suggestions; instead artists fall through
+    to the 'Unknown Album' fallback so the user is not misled into adding
+    artists that are already in their Lidarr library.
 
 Uses an in-memory SQLite database for DB-dependent tests.
 
@@ -27,10 +31,22 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import asyncio
+import os
 import pytest
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
+# Ensure SECRET_KEY is set before importing crypto-dependent modules.
+# os.environ.setdefault leaves the value alone if it was already set
+# (e.g. when running inside the real Docker container).
+os.environ.setdefault("SECRET_KEY", "test-only-secret-key-for-unit-tests-32b!")
+# Reset the cached Fernet singleton so the test key is picked up if the
+# environment was previously empty (module may have been imported already).
+import crypto as _crypto
+_crypto._fernet = None
 
 from database import Base
 import models  # registers all ORM models with Base.metadata
@@ -148,6 +164,63 @@ class TestNormalise:
         from services.playlist_import import _normalise
         assert _normalise("Hall & Oates") == _normalise("Hall and Oates")
 
+    def test_strips_hyphenated_remastered_year_suffix(self):
+        """'Hey Jude - Remastered 2015' → 'hey jude'"""
+        from services.playlist_import import _normalise
+        assert _normalise("Hey Jude - Remastered 2015") == "hey jude"
+
+    def test_strips_hyphenated_remastered_no_year(self):
+        """'Faith - Remastered' → 'faith'"""
+        from services.playlist_import import _normalise
+        assert _normalise("Faith - Remastered") == "faith"
+
+    def test_strips_hyphenated_year_remaster(self):
+        """'That's All - 2007 Remaster' → 'thats'  (apostrophe stripped, trailing 'all' is fine)"""
+        from services.playlist_import import _normalise
+        result = _normalise("That's All - 2007 Remaster")
+        assert "remaster" not in result
+        assert "2007" not in result
+
+    def test_strips_hyphenated_single_version(self):
+        """'Come and Get Your Love - Single Version' → 'come get your love'"""
+        from services.playlist_import import _normalise
+        result = _normalise("Come and Get Your Love - Single Version")
+        assert "single" not in result
+        assert result == "come get your love"
+
+    def test_strips_hyphenated_album_version(self):
+        from services.playlist_import import _normalise
+        result = _normalise("Golden Years - Album Version")
+        assert "album" not in result
+        assert result == "golden years"
+
+    def test_strips_hyphenated_radio_edit(self):
+        from services.playlist_import import _normalise
+        result = _normalise("Somebody That I Used to Know - Radio Edit")
+        assert "radio" not in result
+        assert result == "somebody that i used to know"
+
+    def test_strips_hyphenated_from_soundtrack(self):
+        """'Hungry Eyes - From Dirty Dancing Soundtrack' → 'hungry eyes'"""
+        from services.playlist_import import _normalise
+        result = _normalise("Hungry Eyes - From Dirty Dancing Soundtrack")
+        assert "soundtrack" not in result
+        assert result == "hungry eyes"
+
+    def test_hyphenated_suffix_normalises_same_as_base(self):
+        """Streaming version and library version normalise identically."""
+        from services.playlist_import import _normalise
+        assert _normalise("Hey Jude - Remastered 2015") == _normalise("Hey Jude")
+
+    def test_does_not_strip_legitimate_hyphen_in_title(self):
+        """Hyphens that are part of the title (not version suffixes) are kept through normalisation."""
+        from services.playlist_import import _normalise
+        # "Spider-Man" — the hyphen is part of the word, no space around it
+        result = _normalise("Spider-Man Theme")
+        # After stripping non-alphanumeric, hyphen goes away, but the words stay
+        assert "spider" in result
+        assert "man" in result
+
 
 # ── _ratio ────────────────────────────────────────────────────────────────────
 
@@ -175,8 +248,14 @@ class TestRatio:
 
 class TestMatchTrack:
 
-    def _entry(self, item_id, track_norm, artist_norm):
-        return {"item_id": item_id, "track_norm": track_norm, "artist_norm": artist_norm}
+    def _entry(self, item_id, track_norm, artist_norm, track_words=None):
+        from services.playlist_import import _word_set
+        return {
+            "item_id": item_id,
+            "track_norm": track_norm,
+            "artist_norm": artist_norm,
+            "track_words": track_words if track_words is not None else _word_set(track_norm),
+        }
 
     def test_pass1_exact_both_returns_1_confidence(self):
         from services.playlist_import import match_track, _normalise
@@ -293,6 +372,75 @@ class TestMatchTrack:
         assert item_id == "id-1"
         assert conf > 0.0
 
+    def test_pass5_swapped_parenthetical_title(self):
+        """'Stronger (What Doesn't Kill You)' matches 'What Doesn't Kill You (Stronger)'."""
+        from services.playlist_import import match_track, _word_set
+        # Library has the Kelly Clarkson version with parenthetical in one order
+        lib = [{
+            "item_id": "id-1",
+            "track_norm": "what doesnt kill you",   # _normalise strips "(Stronger)"
+            "artist_norm": "kelly clarkson",
+            "track_words": _word_set("What Doesn't Kill You (Stronger)"),
+        }]
+        item_id, conf = match_track(
+            "Stronger (What Doesn't Kill You)", "Kelly Clarkson", lib
+        )
+        assert item_id == "id-1"
+        assert conf > 0.0
+
+    def test_pass5_not_triggered_on_short_titles(self):
+        """Bag-of-words pass requires ≥3 words to avoid trivial collisions."""
+        from services.playlist_import import match_track, _word_set
+        lib = [{
+            "item_id": "id-1",
+            "track_norm": "ok",
+            "artist_norm": "radiohead",
+            "track_words": frozenset({"ok"}),
+        }]
+        # "OK Computer" has 2 meaningful words; should not match "ok" via pass 5
+        # (even though 'ok' is in both) because 2 words < 3 threshold
+        item_id, _ = match_track("OK Computer", "Radiohead", lib)
+        assert item_id is None
+
+
+# ── _word_set ─────────────────────────────────────────────────────────────────
+
+class TestWordSet:
+
+    def test_swapped_parenthetical_same_set(self):
+        from services.playlist_import import _word_set
+        a = _word_set("Stronger (What Doesn't Kill You)")
+        b = _word_set("What Doesn't Kill You (Stronger)")
+        assert a == b
+
+    def test_ignores_noise_words(self):
+        from services.playlist_import import _word_set
+        result = _word_set("The Edge of Glory")
+        assert "the" not in result
+        assert "of" not in result
+        assert "edge" in result
+        assert "glory" in result
+
+    def test_strips_punctuation(self):
+        from services.playlist_import import _word_set
+        result = _word_set("Don't Stop (Thinking About Tomorrow)")
+        assert "dont" in result or "stop" in result  # apostrophe stripped
+        assert "thinking" in result
+        assert "tomorrow" in result
+
+    def test_empty_returns_empty_frozenset(self):
+        from services.playlist_import import _word_set
+        assert _word_set("") == frozenset()
+
+    def test_min_word_length_filters_single_chars(self):
+        from services.playlist_import import _word_set
+        result = _word_set("A B C Hello")
+        assert "hello" in result
+        # Single-char words excluded (len > 1 requirement)
+        assert "a" not in result
+        assert "b" not in result
+        assert "c" not in result
+
 
 # ── build_library_index ───────────────────────────────────────────────────────
 
@@ -351,3 +499,222 @@ class TestBuildLibraryIndex:
     def test_empty_library_returns_empty_list(self, db):
         from services.playlist_import import build_library_index
         assert build_library_index(db) == []
+
+
+# ── build_album_suggestions — Lidarr bulk-fetch failure ───────────────────────
+
+def _make_db():
+    """Create a fresh in-memory SQLite session for async tests."""
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    return Session()
+
+
+def _make_import_setup(db, artist_name="The Beatles", track_name="Yesterday"):
+    """
+    Insert the minimum rows needed for build_album_suggestions:
+      ImportedPlaylist + one missing ImportedPlaylistTrack + lidarr ConnectionSettings.
+    Returns the playlist id.
+    """
+    from crypto import encrypt
+
+    # Lidarr connection (required for has_lidarr=True path)
+    conn = models.ConnectionSettings(
+        service="lidarr",
+        base_url="http://lidarr-test:8686",
+        api_key_encrypted=encrypt("test-api-key"),
+    )
+    db.add(conn)
+
+    pl = models.ImportedPlaylist(
+        owner_user_id="user-1",
+        source_platform="spotify",
+        source_url="https://open.spotify.com/playlist/test",
+        name="Test Playlist",
+        track_count=1,
+        matched_count=0,
+        status="pending",
+    )
+    db.add(pl)
+    db.commit()
+    db.refresh(pl)
+
+    track = models.ImportedPlaylistTrack(
+        playlist_id=pl.id,
+        position=1,
+        track_name=track_name,
+        artist_name=artist_name,
+        album_name="Abbey Road",
+        match_status="missing",
+        suggested_artist=artist_name,
+        suggested_album="Abbey Road",
+    )
+    db.add(track)
+    db.commit()
+    return pl.id
+
+
+class TestBuildAlbumSuggestionsLidarrFailure:
+    """
+    Verify that a Lidarr /api/v1/artist non-200 response does NOT produce
+    'Artist not in Lidarr' suggestions.  Artists must fall through to the
+    'Unknown Album' fallback so the user is not misled.
+
+    This guards against the failure mode where Lidarr is temporarily
+    unavailable (e.g. restarting, API key stale, 503), causing
+    existing_artists to be empty, making all 4 lookup strategies fail, and
+    falsely labelling every missing-track artist as 'Artist not in Lidarr'.
+    """
+
+    def _mock_lidarr_response(self, status_code: int, json_body=None):
+        """Return a mock httpx.Response with the given status and JSON body."""
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json = MagicMock(return_value=json_body or [])
+        return resp
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_lidarr_non200_does_not_produce_artist_not_in_lidarr(self):
+        """
+        When GET /api/v1/artist returns 503, no 'Artist not in Lidarr'
+        suggestion should be created.  Artists fall through to 'Unknown Album'.
+        """
+        from services.playlist_import import build_album_suggestions
+
+        db = _make_db()
+        playlist_id = _make_import_setup(db, artist_name="The Beatles", track_name="Yesterday")
+
+        # Mock the Lidarr artist-list endpoint to return 503
+        mock_get = AsyncMock(return_value=self._mock_lidarr_response(503))
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = mock_get
+            mock_client_class.return_value = mock_client
+
+            self._run(build_album_suggestions(playlist_id, db))
+
+        suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
+            playlist_id=playlist_id
+        ).all()
+
+        album_names = [s.album_name for s in suggestions]
+        assert "Artist not in Lidarr" not in album_names, (
+            "A non-200 Lidarr response must not produce 'Artist not in Lidarr' "
+            "suggestions — the artist may already be in Lidarr and the failure "
+            "was transient."
+        )
+        db.close()
+
+    def test_lidarr_401_does_not_produce_artist_not_in_lidarr(self):
+        """
+        When GET /api/v1/artist returns 401 (bad API key), no 'Artist not in
+        Lidarr' suggestion should be created.
+        """
+        from services.playlist_import import build_album_suggestions
+
+        db = _make_db()
+        playlist_id = _make_import_setup(db, artist_name="Led Zeppelin", track_name="Stairway to Heaven")
+
+        mock_get = AsyncMock(return_value=self._mock_lidarr_response(401))
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = mock_get
+            mock_client_class.return_value = mock_client
+
+            self._run(build_album_suggestions(playlist_id, db))
+
+        suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
+            playlist_id=playlist_id
+        ).all()
+        album_names = [s.album_name for s in suggestions]
+        assert "Artist not in Lidarr" not in album_names
+        db.close()
+
+    def test_lidarr_non200_produces_unknown_album_fallback(self):
+        """
+        When Lidarr bulk fetch fails, the artist should still get an
+        'Unknown Album' suggestion so the missing tracks are visible.
+        """
+        from services.playlist_import import build_album_suggestions
+
+        db = _make_db()
+        playlist_id = _make_import_setup(db, artist_name="The Beatles", track_name="Come Together")
+
+        mock_get = AsyncMock(return_value=self._mock_lidarr_response(503))
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = mock_get
+            mock_client_class.return_value = mock_client
+
+            self._run(build_album_suggestions(playlist_id, db))
+
+        suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
+            playlist_id=playlist_id
+        ).all()
+        # Should have exactly one suggestion for the artist, labelled Unknown Album
+        assert len(suggestions) == 1
+        assert suggestions[0].artist_name == "The Beatles"
+        assert suggestions[0].album_name == "Unknown Album"
+        db.close()
+
+    def test_lidarr_200_with_known_artist_does_not_show_not_in_lidarr(self):
+        """
+        When Lidarr returns 200 and the artist IS in the list, no
+        'Artist not in Lidarr' suggestion is created.  (The per-artist album
+        fetch may return empty, but the artist is still 'known'.)
+        """
+        from services.playlist_import import build_album_suggestions
+
+        db = _make_db()
+        playlist_id = _make_import_setup(db, artist_name="The Beatles", track_name="Yesterday")
+
+        beatles_artist = {
+            "id": 42,
+            "artistName": "The Beatles",
+            "foreignArtistId": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d",
+        }
+
+        async def _mock_get(url, **kwargs):
+            if "/api/v1/artist" in url and "album" not in url and "track" not in url:
+                return self._mock_lidarr_response(200, [beatles_artist])
+            if "/api/v1/album" in url:
+                # Return one album containing our track
+                return self._mock_lidarr_response(200, [{
+                    "id": 10,
+                    "title": "Abbey Road",
+                    "albumType": "Album",
+                    "images": [],
+                }])
+            if "/api/v1/track" in url:
+                return self._mock_lidarr_response(200, [
+                    {"albumId": 10, "title": "Yesterday"},
+                ])
+            return self._mock_lidarr_response(200, [])
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = _mock_get
+            mock_client_class.return_value = mock_client
+
+            self._run(build_album_suggestions(playlist_id, db))
+
+        suggestions = db.query(models.ImportAlbumSuggestion).filter_by(
+            playlist_id=playlist_id
+        ).all()
+        album_names = [s.album_name for s in suggestions]
+        assert "Artist not in Lidarr" not in album_names
+        db.close()

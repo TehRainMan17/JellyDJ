@@ -68,11 +68,162 @@ const STATUS_COLORS = {
   complete:    '#4ade80',
 }
 
+// ── Manual match modal ──────────────────────────────────────────────────────
+
+function ManualMatchModal({ trackName, playlistId, onClose, onMatched }) {
+  const [query, setQuery] = useState(trackName)
+  const [results, setResults] = useState([])
+  const [searching, setSearching] = useState(false)
+  const [matching, setMatching] = useState(false)
+
+  useEffect(() => {
+    if (!query.trim()) { setResults([]); return }
+    const t = setTimeout(async () => {
+      setSearching(true)
+      try {
+        const data = await api.get(`/api/import/playlists/${playlistId}/library-search?q=${encodeURIComponent(query.trim())}`)
+        setResults(data || [])
+      } catch { setResults([]) }
+      setSearching(false)
+    }, 300)
+    return () => clearTimeout(t)
+  }, [query, playlistId])
+
+  async function selectTrack(item) {
+    setMatching(true)
+    try {
+      await api.post(`/api/import/playlists/${playlistId}/tracks/manual-match`, {
+        track_name: trackName,
+        library_item_id: item.item_id,
+      })
+      onMatched()
+    } catch (e) { alert(e.message); setMatching(false) }
+  }
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0,
+        background: 'rgba(9, 11, 34, 0.80)',
+        backdropFilter: 'blur(6px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 1000,
+      }}
+    >
+      <div
+        className="anim-scale-in"
+        onClick={e => e.stopPropagation()}
+        style={{
+          background: 'var(--bg-elevated)',
+          border: '1px solid var(--border-mid)',
+          borderRadius: 18,
+          padding: '24px 24px 20px',
+          width: 500,
+          maxWidth: '92vw',
+          maxHeight: '74vh',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 14,
+          boxShadow: '0 32px 72px rgba(0,0,0,0.55), 0 0 0 1px rgba(162,143,251,0.08)',
+        }}
+      >
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text-primary)', letterSpacing: '-0.2px' }}>
+              Find in Library
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.4 }}>
+              Matching{' '}
+              <span style={{ color: 'var(--purple)', fontWeight: 600 }}>"{trackName}"</span>
+              {' '}to a track you already have
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              width: 28, height: 28, borderRadius: 8,
+              border: '1px solid var(--border)',
+              background: 'rgba(255,255,255,0.04)',
+              color: 'var(--text-muted)',
+              fontSize: 14, cursor: 'pointer', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              lineHeight: 1,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Search input */}
+        <input
+          autoFocus
+          className="input"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="Search by track name…"
+        />
+
+        {/* Results */}
+        <div style={{ overflowY: 'auto', flex: 1, minHeight: 120, display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {searching && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '10px 2px' }}>Searching…</div>
+          )}
+          {!searching && results.length === 0 && query.trim() && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '10px 2px' }}>No matches in your library</div>
+          )}
+          {!searching && !query.trim() && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '10px 2px' }}>Type to search your library</div>
+          )}
+          {results.map(r => (
+            <div
+              key={r.item_id}
+              onClick={() => !matching && selectTrack(r)}
+              style={{
+                padding: '10px 14px',
+                borderRadius: 12,
+                border: '1px solid var(--border)',
+                background: 'var(--bg-surface)',
+                cursor: matching ? 'wait' : 'pointer',
+                display: 'flex', flexDirection: 'column', gap: 3,
+                transition: 'border-color 120ms ease, background 120ms ease',
+              }}
+              onMouseEnter={e => {
+                e.currentTarget.style.borderColor = 'rgba(83, 236, 252, 0.45)'
+                e.currentTarget.style.background = 'var(--bg-overlay)'
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.borderColor = 'var(--border)'
+                e.currentTarget.style.background = 'var(--bg-surface)'
+              }}
+            >
+              <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>{r.track_name}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                {r.artist_name}{r.album_name ? <span style={{ color: 'var(--border-mid)' }}> — </span> : ''}{r.album_name}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Footer */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 4, borderTop: '1px solid var(--border)' }}>
+          <button className="btn-secondary" onClick={onClose} style={{ fontSize: 12, padding: '6px 16px' }}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
 // ── Suggestion row ──────────────────────────────────────────────────────────
 
 function SuggestionRow({ suggestion, playlistId, onUpdate }) {
   const [loading, setLoading] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const [matchingTrack, setMatchingTrack] = useState(null)
 
   async function approve() {
     setLoading(true)
@@ -93,8 +244,9 @@ function SuggestionRow({ suggestion, playlistId, onUpdate }) {
   }
 
   const isPending = suggestion.lidarr_status === 'pending' || suggestion.lidarr_status === 'rejected'
-  const isPlaceholder = suggestion.album_name === 'Artist not in Lidarr' || suggestion.album_name === 'Unknown Album'
-  const canFetch = isPending && !isPlaceholder
+  const isRequested = suggestion.lidarr_status === 'approved'
+  const isPlaceholder = suggestion.album_name === 'Artist not in Lidarr' || suggestion.album_name === 'Unknown Album' || suggestion.album_name === 'No albums tracked in Lidarr'
+  const canFetch = (isPending || isRequested) && !isPlaceholder
   const trackList = suggestion.missing_tracks || []
 
   return (
@@ -147,39 +299,56 @@ function SuggestionRow({ suggestion, playlistId, onUpdate }) {
           {suggestion.coverage_count} track{suggestion.coverage_count !== 1 ? 's' : ''}
         </div>
 
-        {/* Status — only show when NOT pending (pending shows Fetch/Skip buttons instead) */}
-        {!isPending && (
+        {/* Status — only show for terminal states (downloading / complete) */}
+        {!isPending && !isRequested && (
           <div style={{
             fontSize: 12, minWidth: 80, textAlign: 'right',
             color: STATUS_COLORS[suggestion.lidarr_status] || '#888',
             fontWeight: 500,
           }}>
-            {suggestion.lidarr_status === 'approved' ? 'Sent to Lidarr' : suggestion.lidarr_status}
+            {suggestion.lidarr_status}
           </div>
         )}
 
         {/* Action buttons */}
         {canFetch && (
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button
-              onClick={(e) => { e.stopPropagation(); approve() }}
-              disabled={loading}
-              style={{ padding: '6px 16px', borderRadius: 6, border: 'none', background: '#6366f1', color: 'white', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
-            >
-              {loading ? '…' : 'Fetch'}
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); reject() }}
-              disabled={loading}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 12, cursor: 'pointer' }}
-            >
-              Skip
-            </button>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+            {isRequested && (
+              <span style={{
+                fontSize: 10, fontWeight: 600, letterSpacing: '0.3px',
+                color: '#facc15', display: 'flex', alignItems: 'center', gap: 3,
+              }}>
+                ✓ Requested
+              </span>
+            )}
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                onClick={(e) => { e.stopPropagation(); approve() }}
+                disabled={loading}
+                style={{ padding: '6px 16px', borderRadius: 6, border: 'none', background: '#6366f1', color: 'white', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+              >
+                {loading ? '…' : 'Fetch'}
+              </button>
+              {!isRequested && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); reject() }}
+                  disabled={loading}
+                  style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid var(--color-border-secondary)', background: 'transparent', color: 'var(--color-text-secondary)', fontSize: 12, cursor: 'pointer' }}
+                >
+                  Skip
+                </button>
+              )}
+            </div>
           </div>
         )}
-        {isPlaceholder && isPending && (
+        {suggestion.album_name === 'Artist not in Lidarr' && isPending && (
           <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)', fontStyle: 'italic', whiteSpace: 'nowrap' }}>
             Add artist to Lidarr first
+          </span>
+        )}
+        {suggestion.album_name === 'No albums tracked in Lidarr' && isPending && (
+          <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)', fontStyle: 'italic', whiteSpace: 'nowrap' }}>
+            Artist in Lidarr — add an album to track
           </span>
         )}
 
@@ -203,15 +372,52 @@ function SuggestionRow({ suggestion, playlistId, onUpdate }) {
           </div>
           {trackList.map((name, i) => (
             <div key={i} style={{
-              fontSize: 12, color: 'var(--color-text-secondary)',
-              padding: '3px 0',
-              display: 'flex', alignItems: 'center', gap: 6,
+              fontSize: 12, color: 'var(--text-secondary)',
+              padding: '4px 0',
+              display: 'flex', alignItems: 'center', gap: 10,
             }}>
-              <span style={{ color: '#f87171', fontSize: 10 }}>●</span>
-              {name}
+              <span style={{ color: 'var(--danger)', fontSize: 9, flexShrink: 0 }}>●</span>
+              <span style={{ flex: 1, color: 'var(--text-secondary)' }}>{name}</span>
+              <button
+                onClick={e => { e.stopPropagation(); setMatchingTrack(name) }}
+                style={{
+                  padding: '3px 10px',
+                  borderRadius: 20,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  border: '1px solid rgba(83, 236, 252, 0.28)',
+                  background: 'rgba(83, 236, 252, 0.07)',
+                  color: 'var(--accent)',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                  flexShrink: 0,
+                  letterSpacing: '0.1px',
+                  transition: 'background 120ms ease, border-color 120ms ease',
+                }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.background = 'rgba(83, 236, 252, 0.14)'
+                  e.currentTarget.style.borderColor = 'rgba(83, 236, 252, 0.5)'
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.background = 'rgba(83, 236, 252, 0.07)'
+                  e.currentTarget.style.borderColor = 'rgba(83, 236, 252, 0.28)'
+                }}
+              >
+                Match
+              </button>
             </div>
           ))}
         </div>
+      )}
+
+      {/* Manual match modal */}
+      {matchingTrack && (
+        <ManualMatchModal
+          trackName={matchingTrack}
+          playlistId={playlistId}
+          onClose={() => setMatchingTrack(null)}
+          onMatched={() => { setMatchingTrack(null); onUpdate() }}
+        />
       )}
     </div>
   )

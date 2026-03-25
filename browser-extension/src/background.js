@@ -13,6 +13,7 @@
 chrome.runtime.onInstalled.addListener(() => {
   const patterns = [
     'https://open.spotify.com/playlist/*',
+    'https://open.spotify.com/collection/tracks',
     'https://tidal.com/browse/playlist/*',
     'https://listen.tidal.com/playlist/*',
     'https://music.youtube.com/playlist*',

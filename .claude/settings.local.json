@@ -37,7 +37,9 @@
       "Bash(grep -n \"excluded_item_ids\" /f/Docker/JellyDJ/backend/services/*.py)",
       "Bash(python -m pytest tests/test_scoring_engine.py -v --tb=short)",
       "Bash(docker cp:*)",
-      "Bash(python -m pytest tests/test_playlist_backup_scheduler.py -v)"
+      "Bash(python -m pytest tests/test_playlist_backup_scheduler.py -v)",
+      "Bash(python:*)",
+      "Bash(docker restart:*)"
     ]
   }
 }
