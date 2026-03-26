@@ -39,7 +39,10 @@
       "Bash(docker cp:*)",
       "Bash(python -m pytest tests/test_playlist_backup_scheduler.py -v)",
       "Bash(python:*)",
-      "Bash(docker restart:*)"
+      "Bash(docker restart:*)",
+      "Bash(find F:dockerJellyDJ/backend -name *.py -type f -exec grep -l \"zip\\\\|extension\\\\|static\" {})",
+      "Bash(2)",
+      "Bash(unzip -l F:dockerJellyDJ/frontend/public/jellydj-extension.zip)"
     ]
   }
 }
