@@ -490,6 +490,48 @@ async def lifespan(app: FastAPI):
     pattern because it's the current FastAPI recommendation and gives us clean
     shutdown behaviour via the yield boundary.
     """
+    # ── Startup security checks ───────────────────────────────────────────────
+    # Validate critical secrets before accepting any requests.  A missing or
+    # insecure key must crash at boot with a clear diagnostic rather than
+    # failing silently on the first authenticated request (which could be hard
+    # to trace back to a misconfigured .env).
+    import auth as _auth_module
+    import crypto as _crypto_module
+    _sec_log = logging.getLogger("jellydj.startup")
+
+    try:
+        _auth_module._secret_key()
+    except RuntimeError as _exc:
+        _sec_log.critical(
+            "Startup aborted — JWT signing key is missing or insecure: %s\n"
+            "Generate a strong key: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            "Then set JWT_SECRET_KEY=<value> (or SECRET_KEY) in your .env and restart.",
+            _exc,
+        )
+        raise SystemExit(1) from _exc
+
+    try:
+        _crypto_module._get_fernet()
+    except RuntimeError as _exc:
+        _sec_log.critical(
+            "Startup aborted — SECRET_KEY is missing or insecure: %s\n"
+            "Generate a strong key: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            "Then set SECRET_KEY=<value> in your .env and restart.",
+            _exc,
+        )
+        raise SystemExit(1) from _exc
+
+    # Warn if the webhook endpoint has been opened without a shared secret.
+    # This is safe on a fully private LAN, but dangerous on internet-facing
+    # deployments — any host can inject playback events.
+    if os.getenv("WEBHOOK_SECRET_REQUIRED", "true").strip().lower() in ("false", "0", "no"):
+        _sec_log.warning(
+            "SECURITY: WEBHOOK_SECRET_REQUIRED=false — the /api/webhooks/jellyfin "
+            "endpoint accepts unauthenticated requests.  Any reachable host can "
+            "inject playback events and manipulate listening history.  Set "
+            "WEBHOOK_SECRET in .env to enable authentication."
+        )
+
     # Create all tables defined in models.py (no-ops if they already exist)
     Base.metadata.create_all(bind=engine)
 

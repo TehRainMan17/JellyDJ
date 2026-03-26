@@ -206,6 +206,59 @@ def _job_playlist_backup():
     _run_auto_backup(SessionLocal)
 
 
+# Maximum time (hours) a job is allowed to stay running=True before the watchdog
+# forcibly resets it. Jobs that legitimately run long (enrichment, cache refresh)
+# still complete well under this ceiling.
+_STALE_JOB_THRESHOLD_HOURS = 4
+
+def _job_stale_watchdog():
+    """
+    Hourly watchdog: reset any job that has been stuck at running=True for longer
+    than _STALE_JOB_THRESHOLD_HOURS.
+
+    This is the last-resort safety net for the daemon-thread fire-and-forget
+    pattern used by the popularity cache and enrichment jobs.  If a daemon thread
+    dies (container restart, OOM, unhandled exception that bypasses the finally
+    block), its finally block never runs, the DB row stays running=True, and
+    every subsequent scheduler tick skips the job — permanently, until the next
+    container restart clears it.
+
+    The watchdog breaks that deadlock without waiting for a full restart.
+    """
+    from datetime import datetime, timezone, timedelta
+    from database import SessionLocal
+    from models import JobState
+
+    threshold = datetime.now(timezone.utc) - timedelta(hours=_STALE_JOB_THRESHOLD_HOURS)
+    db = SessionLocal()
+    try:
+        stale = (
+            db.query(JobState)
+            .filter(
+                JobState.running == True,  # noqa: E712
+                JobState.started_at.isnot(None),
+                JobState.started_at < threshold,
+            )
+            .all()
+        )
+        if stale:
+            for row in stale:
+                age_h = (datetime.now(timezone.utc) - row.started_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                log.warning(
+                    "Stale job watchdog: resetting job_id=%s (running for %.1fh, threshold=%dh)",
+                    row.job_id, age_h, _STALE_JOB_THRESHOLD_HOURS,
+                )
+                row.running = False
+                row.phase = f"Reset by stale-job watchdog after {age_h:.1f}h"
+                row.finished_at = datetime.now(timezone.utc)
+            db.commit()
+            log.info("Stale job watchdog: reset %d stale job(s).", len(stale))
+    except Exception as e:
+        log.error("Stale job watchdog failed: %s", e)
+    finally:
+        db.close()
+
+
 async def _run_user_playlist_autopush():
     """
     Poll all UserPlaylist rows with schedule_enabled=True and push any whose
@@ -530,12 +583,22 @@ def start_scheduler(db_session_factory):
         name="Playlist auto-backup",
     )
 
+    # Stale-job watchdog — runs every hour and resets any job that has been
+    # stuck at running=True longer than _STALE_JOB_THRESHOLD_HOURS.
+    scheduler.add_job(
+        _job_stale_watchdog,
+        trigger=IntervalTrigger(hours=1),
+        id="stale_job_watchdog",
+        replace_existing=True,
+        name="Stale-job watchdog",
+    )
+
     scheduler.start()
 
     # Auto-download starts paused — reschedule_automation_jobs will enable it
     # only if auto_download_enabled=True is saved in the database
     scheduler.pause_job(AUTO_DOWNLOAD_JOB_ID)
-    log.info("Scheduler started (9 jobs registered, including user_playlist_autopush and playlist_backup).")
+    log.info("Scheduler started (10 jobs registered, including user_playlist_autopush, playlist_backup, and stale-job watchdog).")
 
     # Run billboard sync immediately on first start if table is empty
     _run_billboard_if_empty()

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/release-v1.2.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.2.0" /></a>
+  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.3.0"><img src="https://img.shields.io/badge/release-v1.3.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.3.0" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/stargazers"><img src="https://img.shields.io/github/stars/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=5be6f5&labelColor=090b22&logoColor=5be6f5" alt="Stars" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/network/members"><img src="https://img.shields.io/github/forks/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=a28ffb&labelColor=090b22&logoColor=a28ffb" alt="Forks" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/issues"><img src="https://img.shields.io/github/issues/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=f87171&labelColor=090b22&logoColor=f87171" alt="Issues" /></a>

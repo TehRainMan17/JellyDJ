@@ -269,6 +269,9 @@ class SetupLoginResponse(BaseModel):
 class SetupStatusResponse(BaseModel):
     setup_available: bool   # True when env vars are set AND Jellyfin is not yet configured
     jellyfin_configured: bool
+    backdoor_active: bool   # True when SETUP_ALLOW_AFTER_CONFIGURE=true AND Jellyfin is
+                            # already configured — the setup credentials act as a persistent
+                            # admin backdoor.  Remove SETUP_ALLOW_AFTER_CONFIGURE from .env.
 
 
 class RefreshRequest(BaseModel):
@@ -306,9 +309,14 @@ def setup_status(db: Session = Depends(get_db)):
         creds is not None
         and (not configured or allow_after)
     )
+    # Backdoor: setup credentials can still obtain an admin token even though
+    # Jellyfin is configured.  Surface this so the frontend (or any API
+    # consumer) can display a prominent warning to the operator.
+    backdoor_active = bool(creds is not None and configured and allow_after)
     return SetupStatusResponse(
         setup_available=setup_available,
         jellyfin_configured=configured,
+        backdoor_active=backdoor_active,
     )
 
 

@@ -19,6 +19,20 @@ _Nothing pending._
 
 ---
 
+## [1.3.0] — 2026-03-26
+
+### Added
+- `!!` **Startup security checks** — backend validates JWT signing key and Fernet encryption key on boot. Logs a clear error and exits if either is missing or malformed, preventing silent misconfiguration.
+- `~~` **Backdoor detection in setup endpoint** — `GET /setup-status` now returns `backdoor_active: true` when `SETUP_ALLOW_AFTER_CONFIGURE=true` and Jellyfin is already configured, making persistent admin backdoors visible to health checks and monitoring.
+- `~~` **Webhook secret warning** — startup logs a warning when `WEBHOOK_SECRET_REQUIRED=false`, surfacing unauthenticated webhook exposure before it becomes a problem.
+- `~~` **Stale job watchdog** — hourly scheduler job that resets any job stuck at `running=True` for longer than 4 hours, preventing permanent job deadlock in the daemon-thread fire-and-forget pattern.
+- Comprehensive tests for startup security checks (`test_security.py`) and stale job watchdog (`test_stale_watchdog.py`).
+
+### Changed
+- Uvicorn reduced from 4 workers to 1 — CPU compute is not the bottleneck; multiple workers introduced race conditions on shared in-process state. Single-worker removes the hazard with no throughput loss.
+
+---
+
 ## [1.2.0] — 2026-03-23
 
 ### Added
