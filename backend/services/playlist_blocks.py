@@ -376,6 +376,14 @@ def execute_discovery_block(
         else:
             familiar.append(row)
 
+    # Sort each bucket by final_score descending before slicing so the
+    # highest-scored candidates from each familiarity tier are selected.
+    # Without this sort, slicing uses arbitrary DB insertion order and the
+    # playlist engine's subsequent score-sort overrides the intended tier mix.
+    strangers.sort(    key=lambda r: float(r.final_score or 0), reverse=True)
+    acquaintances.sort(key=lambda r: float(r.final_score or 0), reverse=True)
+    familiar.sort(     key=lambda r: float(r.final_score or 0), reverse=True)
+
     # Take proportional slice from each bucket
     limit = FETCH_LIMIT
     n_s = int(limit * stranger_pct)

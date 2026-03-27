@@ -459,6 +459,94 @@ class TestDiscoveryBlockPopularityRange:
         assert "unplayed-1" in result
 
 
+# ── execute_discovery_block — bucket sort ─────────────────────────────────────
+
+class TestDiscoveryBlockBucketSorting:
+    """
+    Bug fix: before this fix each familiarity bucket was sliced in arbitrary
+    DB insertion order.  When the playlist engine then sorted all returned IDs
+    by final_score and applied an artist cap, higher-scored acquaintances crowded
+    out lower-scored strangers, breaking the intended tier split.
+
+    After the fix, each bucket is pre-sorted by final_score so the best
+    candidates from each tier survive the slice and are always represented.
+    """
+
+    def test_highest_scored_stranger_wins_when_bucket_is_limited(self, db, monkeypatch):
+        """
+        With 6 strangers and only 5 stranger slots (stranger_pct=50,
+        FETCH_LIMIT=10), the top-5 by final_score must be selected — not the
+        first 5 by DB insertion order.
+        """
+        import services.playlist_blocks as pb
+        monkeypatch.setattr(pb, "FETCH_LIMIT", 10)
+
+        from services.playlist_blocks import execute_discovery_block
+
+        # Insert 6 strangers (play_count=0) with scores 10 through 60.
+        # Without the bucket sort, slicing uses DB insertion order and the
+        # highest-scored track (60, inserted last) would be excluded.
+        for score in [10, 20, 30, 40, 50, 60]:
+            db.add(_score(
+                f"stranger-{score}", is_played=False,
+                final_score=float(score), play_count=0,
+                artist_name=f"Band{score}",
+            ))
+        db.commit()
+
+        # stranger_pct=50 → n_s = int(10 * 0.5) = 5; only 5 of 6 strangers fit.
+        result = execute_discovery_block(
+            "u1",
+            {"stranger_pct": 50, "acquaintance_pct": 50, "familiar_pct": 0},
+            db,
+            frozenset(),
+        )
+
+        assert "stranger-60" in result, (
+            "Highest-scored stranger (60) must be selected. "
+            "Bucket sort is likely missing."
+        )
+        assert "stranger-10" not in result, (
+            "Lowest-scored stranger (10) should be excluded when the bucket "
+            "has fewer slots than candidates."
+        )
+
+    def test_acquaintance_bucket_also_sorted_by_score(self, db, monkeypatch):
+        """The same sort fix applies to the acquaintance bucket.
+
+        Using stranger_pct=50/acquaintance_pct=50 with NO strangers in the pool
+        keeps n_a=5 (half of FETCH_LIMIT=10) so 5 of the 6 acquaintances must be
+        selected — normalization would collapse all weight to acquaintances if only
+        one pct is non-zero, removing the slot pressure the fix needs to be visible.
+        """
+        import services.playlist_blocks as pb
+        monkeypatch.setattr(pb, "FETCH_LIMIT", 10)
+
+        from services.playlist_blocks import execute_discovery_block
+
+        # 6 acquaintances (total_plays=5 via ArtistProfile → acquaintance tier).
+        # No strangers in the pool, so the 5 stranger slots are wasted and
+        # n_a = int(10 * 0.5) = 5 constrains which acquaintances are selected.
+        for score in [15, 25, 35, 45, 55, 65]:
+            db.add(_score(
+                f"acq-{score}", is_played=False,
+                final_score=float(score), play_count=5,
+                artist_name=f"AcqBand{score}",
+            ))
+            db.add(_artist_profile("u1", f"AcqBand{score}", total_plays=5))
+        db.commit()
+
+        result = execute_discovery_block(
+            "u1",
+            {"stranger_pct": 50, "acquaintance_pct": 50, "familiar_pct": 0},
+            db,
+            frozenset(),
+        )
+
+        assert "acq-65" in result, "Highest-scored acquaintance must be selected."
+        assert "acq-15" not in result, "Lowest-scored acquaintance should be excluded."
+
+
 # ── execute_global_popularity_block ──────────────────────────────────────────
 
 class TestGlobalPopularityBlock:

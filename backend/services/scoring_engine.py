@@ -147,6 +147,14 @@ REPLAY_BOOST_CAP      = 12.0
 POPULARITY_PLAYED_MAX   = 5.0
 POPULARITY_UNPLAYED_MAX = 10.0
 
+# v10: recently-added boost — surface fresh library additions in discovery.
+# Linear decay from RECENTLY_ADDED_BOOST_MAX (added today) to 0 at RECENTLY_ADDED_BOOST_DAYS.
+# Applied only to unplayed tracks with a known date_added from Jellyfin DateCreated.
+# The boost lives inside the genre-affinity gate: genre blocks filter first, so
+# a newly-added track only benefits if it already qualifies for the user's liked genres.
+RECENTLY_ADDED_BOOST_MAX  = 12.0   # max pts for a track added today
+RECENTLY_ADDED_BOOST_DAYS = 90     # days until boost fully decays to zero
+
 # v7: artist breadth bonus constants
 # Rewards users who listen to many distinct tracks from an artist.
 # log-scaled so the bonus grows quickly for the first ~10 tracks then plateaus.
@@ -1037,6 +1045,19 @@ def rebuild_track_scores(
                 headroom = max(0.0, (UNPLAYED_CAP - final) / UNPLAYED_CAP)
                 pop_nudge = round((global_pop / 100.0) * POPULARITY_UNPLAYED_MAX * (0.5 + 0.5 * headroom), 2)
                 final = round(min(UNPLAYED_CAP, final + pop_nudge), 2)
+
+            # v10: recently-added boost — surface fresh library additions.
+            # Tracks added within RECENTLY_ADDED_BOOST_DAYS get a linearly-decaying
+            # lift so new content competes against stale catalog in the same genre.
+            # The boost only reorders candidates that already passed the genre-affinity
+            # filter in the playlist block, so it cannot cross genre boundaries.
+            if track.date_added is not None:
+                days_since = max(0, (now - track.date_added).days)
+                if days_since < RECENTLY_ADDED_BOOST_DAYS:
+                    headroom = max(0.0, (UNPLAYED_CAP - final) / UNPLAYED_CAP)
+                    raw_boost = RECENTLY_ADDED_BOOST_MAX * (1.0 - days_since / RECENTLY_ADDED_BOOST_DAYS)
+                    added_boost = round(raw_boost * (0.5 + 0.5 * headroom), 2)
+                    final = round(min(UNPLAYED_CAP, final + added_boost), 2)
 
             if is_permanent_dislike:
                 final = min(final, 20.0)

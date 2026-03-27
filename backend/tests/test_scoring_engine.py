@@ -51,6 +51,8 @@ from services.scoring_engine import (
     ARTIST_BREADTH_BONUS_MAX,
     ARTIST_BREADTH_MAX_TRACKS,
     FAVORITE_ARTIST_BOOST,
+    RECENTLY_ADDED_BOOST_MAX,
+    RECENTLY_ADDED_BOOST_DAYS,
 )
 from services.library_scanner import scan_library
 
@@ -655,6 +657,102 @@ class TestTrackScores:
             f"Unplayed track from high-affinity artist scored {scores[0]:.1f}, "
             f"expected > {UNPLAYED_BASE + 10:.1f}. "
             "This tests that v7 affinity improvements feed correctly into discovery."
+        )
+
+
+# ── Unit tests: recently-added boost (v10) ────────────────────────────────────
+
+class TestRecentlyAddedBoost:
+    """
+    v10: unplayed tracks added to the library within RECENTLY_ADDED_BOOST_DAYS
+    receive a linearly-decaying score lift so fresh library additions surface
+    above stale catalog in the same genre.
+    """
+
+    def test_recently_added_scores_higher_than_old(self):
+        """A track added yesterday scores above an identical track added 200 days ago."""
+        lib_new = [_make_library_track("new", artist="Eagles", genre="Rock")]
+        lib_new[0].date_added = datetime.utcnow() - timedelta(days=1)
+
+        lib_old = [_make_library_track("old", artist="Eagles", genre="Rock")]
+        lib_old[0].date_added = datetime.utcnow() - timedelta(days=200)
+
+        added_new, added_old = [], []
+        db_new = _make_db(library_tracks=lib_new, plays=[])
+        db_old = _make_db(library_tracks=lib_old, plays=[])
+        db_new.add = lambda obj: added_new.append(obj)
+        db_old.add = lambda obj: added_old.append(obj)
+
+        rebuild_track_scores(db_new, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+        rebuild_track_scores(db_old, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+
+        score_new = next(float(s.final_score) for s in added_new if hasattr(s, "final_score"))
+        score_old = next(float(s.final_score) for s in added_old if hasattr(s, "final_score"))
+        assert score_new > score_old, (
+            f"Recently-added track scored {score_new:.2f}, older track scored {score_old:.2f}. "
+            "Recently-added track should score higher."
+        )
+
+    def test_no_boost_after_window(self):
+        """A track added beyond RECENTLY_ADDED_BOOST_DAYS gets no lift over one with no date."""
+        lib_past = [_make_library_track("past", artist="Eagles", genre="Rock")]
+        lib_past[0].date_added = datetime.utcnow() - timedelta(days=RECENTLY_ADDED_BOOST_DAYS + 1)
+
+        lib_none = [_make_library_track("nodate", artist="Eagles", genre="Rock")]
+        lib_none[0].date_added = None
+
+        added_past, added_none = [], []
+        db_past = _make_db(library_tracks=lib_past, plays=[])
+        db_none = _make_db(library_tracks=lib_none, plays=[])
+        db_past.add = lambda obj: added_past.append(obj)
+        db_none.add = lambda obj: added_none.append(obj)
+
+        rebuild_track_scores(db_past, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+        rebuild_track_scores(db_none, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+
+        score_past = next(float(s.final_score) for s in added_past if hasattr(s, "final_score"))
+        score_none = next(float(s.final_score) for s in added_none if hasattr(s, "final_score"))
+        assert score_past == score_none, (
+            f"Track added {RECENTLY_ADDED_BOOST_DAYS + 1} days ago scored {score_past:.2f}, "
+            f"track with no date scored {score_none:.2f}. Both should be equal (no boost)."
+        )
+
+    def test_boost_decays_with_age(self):
+        """A track added 10 days ago scores higher than one added 60 days ago."""
+        lib_10 = [_make_library_track("t10", artist="Eagles", genre="Rock")]
+        lib_10[0].date_added = datetime.utcnow() - timedelta(days=10)
+
+        lib_60 = [_make_library_track("t60", artist="Eagles", genre="Rock")]
+        lib_60[0].date_added = datetime.utcnow() - timedelta(days=60)
+
+        added_10, added_60 = [], []
+        db_10 = _make_db(library_tracks=lib_10, plays=[])
+        db_60 = _make_db(library_tracks=lib_60, plays=[])
+        db_10.add = lambda obj: added_10.append(obj)
+        db_60.add = lambda obj: added_60.append(obj)
+
+        rebuild_track_scores(db_10, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+        rebuild_track_scores(db_60, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+
+        score_10 = next(float(s.final_score) for s in added_10 if hasattr(s, "final_score"))
+        score_60 = next(float(s.final_score) for s in added_60 if hasattr(s, "final_score"))
+        assert score_10 > score_60, (
+            f"10-day-old track scored {score_10:.2f}, 60-day-old scored {score_60:.2f}. "
+            "Boost should decay with age."
+        )
+
+    def test_boost_never_exceeds_unplayed_cap(self):
+        """The recently-added boost must not push the final score above UNPLAYED_CAP."""
+        lib = [_make_library_track("t1", artist="Beatles", genre="Rock")]
+        lib[0].date_added = datetime.utcnow()  # added today — maximum boost
+
+        added = []
+        db = _make_db(library_tracks=lib, plays=[])
+        db.add = lambda obj: added.append(obj)
+        rebuild_track_scores(db, "user1", {"Beatles": 100.0}, {"Rock": 100.0})
+        scores = [float(s.final_score) for s in added if hasattr(s, "final_score")]
+        assert all(s <= UNPLAYED_CAP for s in scores), (
+            f"Score(s) exceeded UNPLAYED_CAP={UNPLAYED_CAP}: {scores}"
         )
 
 
