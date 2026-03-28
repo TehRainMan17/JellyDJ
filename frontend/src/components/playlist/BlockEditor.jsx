@@ -1,13 +1,16 @@
 /**
  * BlockEditor.jsx — Full-screen playlist template editor.
  *
- * NEW in this revision — 5 new filter blocks, all backed by existing DB columns:
+ * NEW in this revision — 7 new filter blocks, all backed by existing DB columns:
  *
- *   skip_rate     TrackScore.skip_penalty (0.0–1.0 float string)
- *   replay_boost  ArtistProfile.replay_boost (Float) via a JOIN-free artist lookup
- *   novelty       TrackScore.novelty_bonus (float string, unplayed tracks only)
- *   recency_score TrackScore.recency_score (float string, smooth 0–100 gradient)
- *   skip_streak   TrackScore.skip_streak (Integer, consecutive skips)
+ *   skip_rate        TrackScore.skip_penalty (0.0–1.0 float string)
+ *   replay_boost     ArtistProfile.replay_boost (Float) via a JOIN-free artist lookup
+ *   novelty          TrackScore.novelty_bonus (float string, unplayed tracks only)
+ *   recency_score    TrackScore.recency_score (float string, smooth 0–100 gradient)
+ *   skip_streak      TrackScore.skip_streak (Integer, consecutive skips)
+ *   favorite_artists           ArtistProfile.has_favorite — all tracks from favourited artists
+ *   favorite_genres            GenreProfile.has_favorite  — all tracks in favourited genres
+ *   artist_catalog_popularity  TrackScore.artist_catalog_popularity — track's rank within artist catalog
  *
  * Each new block has:
  *   - An entry in FILTER_TYPES (label, icon, color, oneliner, desc with tiers)
@@ -20,7 +23,7 @@ import {
   X, Plus, Save, Eye, Loader2, CheckCircle2, Search,
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users, Tag,
   ChevronUp, ChevronDown, Trash2, Shuffle, AlertCircle,
-  Zap, Wind, BarChart2, SkipForward, Repeat
+  Zap, Wind, BarChart2, SkipForward, Repeat, Heart
 } from 'lucide-react'
 import { useAuth } from '../../contexts/AuthContext'
 import { api } from '../../lib/api'
@@ -104,6 +107,22 @@ export const FILTER_TYPES = {
       'A pure pass-through filter — only tracks with a Jellyfin favourite flag pass through. No parameters needed.',
     ],
   },
+  favorite_artists: {
+    label: 'Favorite Artists', icon: Heart, color: '#fb7185',
+    oneliner: "All tracks from artists you've favourited at least one song by",
+    desc: [
+      "Surfaces every track from any artist where you've marked at least one song as a Jellyfin favourite — not just the favourited tracks themselves.",
+      'Pair with Played Status (unplayed) to discover new tracks from artists you already love.',
+    ],
+  },
+  favorite_genres: {
+    label: 'Favorite Genres', icon: Heart, color: '#c084fc',
+    oneliner: "All tracks in genres where you have at least one favourited track",
+    desc: [
+      "Passes through tracks whose genre contains at least one of your Jellyfin-favourited songs — a broad genre-level affinity signal.",
+      'Pair with Played Status (unplayed) or a Final Score floor to surface the best unheard tracks in genres you clearly love.',
+    ],
+  },
   played_status: {
     label: 'Played Status', icon: TrendingUp, color: '#94a3b8',
     oneliner: 'Narrow to played or unplayed tracks only',
@@ -131,6 +150,19 @@ export const FILTER_TYPES = {
     oneliner: 'Randomise track ordering so every generation feels different',
     desc: [
       'Nudges each track\'s score by a small random amount before sorting. Without jitter, the same filters always produce the same order.',
+    ],
+  },
+
+  artist_catalog_popularity: {
+    label: "Artist's Top Tracks", icon: BarChart2, color: '#38bdf8',
+    oneliner: "Filter by how popular a track is within its artist's own catalog",
+    desc: [
+      "Scores each track 0–100 based on Last.fm listener counts relative to that artist's most-streamed song (which always scores 100). This is per-artist — a 70 means 'top 3 for this artist', not globally.",
+      "Use this instead of Global Popularity when you want an artist's signature hits without surfacing the same mega-hits across all artists.",
+      { '80–100': "Artist's #1–2 most popular songs" },
+      { '50–79':  'Top 3–4 tracks in catalog' },
+      { '30–49':  'Solid hits — roughly top 5–6' },
+      { '10–29':  'Any track in the Last.fm top 10 for this artist' },
     ],
   },
 
@@ -208,6 +240,9 @@ const DEFAULT_PARAMS = {
   global_popularity: { popularity_min: 0, popularity_max: 100 },
   affinity:          { affinity_min: 0, affinity_max: 100 },
   favorites:         {},
+  artist_catalog_popularity: { catalog_min: 30, catalog_max: 100, played_filter: 'all' },
+  favorite_artists:  { played_filter: 'all' },
+  favorite_genres:   { played_filter: 'all' },
   played_status:     { played_filter: 'unplayed' },
   artist_cap:        { max_per_artist: 3 },
   jitter:            { jitter_pct: 0.15 },
@@ -635,6 +670,24 @@ const Editors = {
     <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No settings needed — passes only tracks you've explicitly favourited in Jellyfin.</p>
   ),
 
+  favorite_artists: ({ p, set }) => (
+    <div className="space-y-3">
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+        Includes all tracks from any artist where you've favourited at least one song — not just the favourited tracks themselves.
+      </p>
+    </div>
+  ),
+
+  favorite_genres: ({ p, set }) => (
+    <div className="space-y-3">
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+        Includes all tracks in any genre where you've favourited at least one song. Use with an AND child (e.g. Played Status: unplayed) to find new tracks in your favourite genres.
+      </p>
+    </div>
+  ),
+
   played_status: ({ p, set }) => (
     <Chips value={p.played_filter ?? 'unplayed'} onChange={v => set({ ...p, played_filter: v })}
       options={[{ v: 'played', label: 'Played before' }, { v: 'unplayed', label: 'Never played' }]} />
@@ -662,6 +715,35 @@ const Editors = {
   },
 
   // ── NEW block editors ─────────────────────────────────────────────────────
+
+  /**
+   * artist_catalog_popularity
+   * Backend field: TrackScore.artist_catalog_popularity (Float 0–100, nullable)
+   * Params sent: catalog_min, catalog_max, played_filter
+   * NULL tracks (unenriched artists) are automatically excluded by the block.
+   */
+  artist_catalog_popularity: ({ p, set }) => {
+    const lo = p.catalog_min ?? 30
+    const hi = p.catalog_max ?? 100
+    const hint = lo >= 80 ? 'Top 1–2 hits per artist'
+      : lo >= 50 ? 'Top 3–4 tracks per artist'
+      : lo >= 30 ? 'Top ~5 tracks per artist'
+      : 'Any track in artist top 10'
+    return (
+      <div className="space-y-4">
+        <RangeInputs
+          label={`Catalog popularity range · ${hint}`}
+          lo={lo} hi={hi} min={0} max={100} step={5}
+          onLo={v => set({ ...p, catalog_min: v })}
+          onHi={v => set({ ...p, catalog_max: v })}
+        />
+        <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+        <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+          Tracks from artists without Last.fm enrichment are excluded — run an enrichment pass first to populate catalog data.
+        </p>
+      </div>
+    )
+  },
 
   /**
    * skip_rate

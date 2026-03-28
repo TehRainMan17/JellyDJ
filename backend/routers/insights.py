@@ -136,9 +136,10 @@ def get_tracks(
         "track_name":         "track_name",
         "skip_streak":        "skip_streak",
         "replay_boost":       "replay_boost",
-        "global_popularity":  "global_popularity",
-        "cooldown_until":     "cooldown_until",
-        "holiday_tag":        "holiday_tag",
+        "global_popularity":         "global_popularity",
+        "artist_catalog_popularity": "artist_catalog_popularity",
+        "cooldown_until":            "cooldown_until",
+        "holiday_tag":               "holiday_tag",
     }
 
     if sort_by == "skip_count":
@@ -329,6 +330,8 @@ def get_tracks(
                     if r.jellyfin_item_id in skip_map else 0,
                 "skip_rate": float(skip_map[r.jellyfin_item_id].skip_rate)
                     if r.jellyfin_item_id in skip_map else 0.0,
+                # Catalog popularity — track's rank within its artist's catalog (0–100)
+                "artist_catalog_popularity": getattr(r, "artist_catalog_popularity", None),
                 # Holiday
                 "holiday_tag":       getattr(r, "holiday_tag", None),
                 "holiday_exclude":   bool(getattr(r, "holiday_exclude", False)),
@@ -503,24 +506,100 @@ def get_artists(
 def get_genres(
     user_id: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
+    sort_by: str = Query("affinity_score"),
+    order: str = Query("desc"),
+    search_filter: Optional[str] = Query(None),
     current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    from datetime import timedelta
+    from sqlalchemy import case, and_ as sa_and
+
     uid = _resolve_user(user_id, username, db)
     _assert_can_view_user(uid, current_user)
-    rows = db.query(GenreProfile).filter_by(user_id=uid)\
-             .order_by(desc(GenreProfile.affinity_score)).all()
-    return [
-        {
-            "genre":         r.genre,
-            "affinity_score": float(r.affinity_score),
-            "total_plays":   r.total_plays,
-            "total_skips":   r.total_skips,
-            "skip_rate":     float(r.skip_rate),
-            "has_favorite":  r.has_favorite,
-        }
-        for r in rows
-    ]
+
+    q = db.query(GenreProfile).filter_by(user_id=uid)
+    if search_filter:
+        q = q.filter(GenreProfile.genre.ilike(f"%{search_filter}%"))
+    rows = q.all()
+
+    # ── Trend: compare recent 30-day plays vs prior 30 days per genre ─────────
+    now = datetime.utcnow()
+    cutoff_recent = now - timedelta(days=30)
+    cutoff_prior  = now - timedelta(days=60)
+
+    play_stats = (
+        db.query(
+            TrackScore.genre,
+            func.sum(
+                case((Play.last_played >= cutoff_recent, 1), else_=0)
+            ).label("recent_plays"),
+            func.sum(
+                case((sa_and(Play.last_played >= cutoff_prior, Play.last_played < cutoff_recent), 1), else_=0)
+            ).label("prior_plays"),
+        )
+        .join(Play, sa_and(
+            TrackScore.jellyfin_item_id == Play.jellyfin_item_id,
+            Play.user_id == uid,
+        ))
+        .filter(TrackScore.user_id == uid)
+        .filter(TrackScore.genre.isnot(None), TrackScore.genre != "")
+        .group_by(TrackScore.genre)
+        .all()
+    )
+
+    trend_map: dict[str, dict] = {}
+    for ps in play_stats:
+        recent = ps.recent_plays or 0
+        prior  = ps.prior_plays  or 0
+        if recent > 0 and recent > prior * 1.2:
+            direction = "rising"
+        elif prior > 0 and prior > recent * 1.2:
+            direction = "falling"
+        else:
+            direction = "stable"
+        trend_map[ps.genre] = {"trend_direction": direction, "recent_plays": recent}
+
+    max_affinity = max((float(r.affinity_score) for r in rows), default=1.0) or 1.0
+
+    result = []
+    for r in rows:
+        trend = trend_map.get(r.genre, {})
+        raw_affinity = float(r.affinity_score)
+        result.append({
+            "genre":               r.genre,
+            "affinity_score":      raw_affinity,
+            "normalized_affinity": round((raw_affinity / max_affinity) * 100, 1),
+            "total_plays":         r.total_plays,
+            "total_tracks_played": r.total_tracks_played,
+            "total_skips":         r.total_skips,
+            "skip_rate":           float(r.skip_rate),
+            "has_favorite":        r.has_favorite,
+            "trend_direction":     trend.get("trend_direction", "stable"),
+            "recent_plays":        trend.get("recent_plays", 0),
+            "updated_at":          r.updated_at.isoformat() if r.updated_at else None,
+        })
+
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    rev = (order == "desc")
+    if sort_by == "genre":
+        result.sort(key=lambda g: g["genre"].lower(), reverse=rev)
+    elif sort_by == "total_plays":
+        result.sort(key=lambda g: g["total_plays"], reverse=rev)
+    elif sort_by == "total_tracks_played":
+        result.sort(key=lambda g: g["total_tracks_played"], reverse=rev)
+    elif sort_by == "skip_rate":
+        result.sort(key=lambda g: g["skip_rate"], reverse=rev)
+    elif sort_by == "total_skips":
+        result.sort(key=lambda g: g["total_skips"], reverse=rev)
+    elif sort_by == "recent_plays":
+        result.sort(key=lambda g: g["recent_plays"], reverse=rev)
+    elif sort_by == "normalized_affinity":
+        result.sort(key=lambda g: g["normalized_affinity"], reverse=rev)
+    else:
+        result.sort(key=lambda g: g["affinity_score"], reverse=rev)
+
+    return result
 
 
 @router.get("/cooldowns")

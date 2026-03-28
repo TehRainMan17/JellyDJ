@@ -377,6 +377,11 @@ class TrackScore(Base):
     # v4: holiday tagging
     holiday_tag     = Column(String,  nullable=True)
     holiday_exclude = Column(Boolean, nullable=False, default=False)
+    # v12: per-artist catalog popularity (0–100).
+    # 100 = this track is the artist's #1 most-listened song on Last.fm.
+    # Score is proportional: (track_listeners / artist_top_track_listeners) * 100.
+    # NULL = artist has no Last.fm enrichment or track not found in artist top-10.
+    artist_catalog_popularity = Column(Float, nullable=True)
 
 
 class AutomationSettings(Base):

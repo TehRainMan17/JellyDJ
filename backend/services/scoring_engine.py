@@ -936,6 +936,37 @@ def rebuild_track_scores(
     except Exception:
         enrichment_pop = {}
 
+    # v12: build per-artist catalog popularity lookup.
+    # Maps (artist_name.lower(), track_name.lower()) → catalog_popularity (0–100).
+    # 100 = artist's #1 Last.fm track; others are proportional by listener count.
+    # Source: ArtistEnrichment.top_tracks JSON written by _enrich_artist_lastfm().
+    catalog_popularity_map: dict[tuple[str, str], float] = {}
+    try:
+        from models import ArtistEnrichment
+        for enc in db.query(ArtistEnrichment.artist_name_lower, ArtistEnrichment.top_tracks).all():
+            if not enc.top_tracks or not enc.artist_name_lower:
+                continue
+            try:
+                top = json.loads(enc.top_tracks)
+                if not isinstance(top, list) or not top:
+                    continue
+                # Max listeners is the #1 track (rank=1 or first entry).
+                max_listeners = max(
+                    int(t.get("listeners", 0)) for t in top if t.get("listeners")
+                )
+                if max_listeners <= 0:
+                    continue
+                for t in top:
+                    name = (t.get("name") or "").strip().lower()
+                    listeners = int(t.get("listeners", 0))
+                    if name and listeners > 0:
+                        score = round((listeners / max_listeners) * 100, 1)
+                        catalog_popularity_map[(enc.artist_name_lower, name)] = score
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     # v2: load active cooldowns for this user
     try:
         from models import TrackCooldown
@@ -999,6 +1030,12 @@ def rebuild_track_scores(
 
         # v2: global popularity (may be None for unenriched tracks)
         global_pop = enrichment_pop.get(jid)
+
+        # v12: catalog popularity — how popular is this track within the artist's catalog?
+        # Lookup key is (artist_name.lower(), track_name.lower()); None if not in top-10.
+        _artist_key = track.artist_name.lower().strip() if track.artist_name else ""
+        _track_key  = track.track_name.lower().strip()  if track.track_name  else ""
+        catalog_pop = catalog_popularity_map.get((_artist_key, _track_key))
 
         # v2: cooldown
         cooldown_until = active_cooldowns.get(jid)
@@ -1084,6 +1121,8 @@ def rebuild_track_scores(
                 # v4: holiday
                 holiday_tag=track.holiday_tag,
                 holiday_exclude=(True if track.holiday_exclude else False),
+                # v12: catalog popularity
+                artist_catalog_popularity=catalog_pop,
             ))
 
         else:
@@ -1182,6 +1221,8 @@ def rebuild_track_scores(
                 # v4: holiday
                 holiday_tag=track.holiday_tag,
                 holiday_exclude=(True if track.holiday_exclude else False),
+                # v12: catalog popularity
+                artist_catalog_popularity=catalog_pop,
             ))
 
         count += 1

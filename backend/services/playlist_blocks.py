@@ -416,6 +416,133 @@ def execute_favorites_block(
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 
+def execute_artist_catalog_popularity_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks whose popularity within their artist's catalog meets a threshold.
+
+    artist_catalog_popularity is 0–100 where 100 = the artist's #1 most-listened
+    track on Last.fm and lower values are proportional by listener count.  This
+    lets you build "artist's signature hits" blocks without the score being
+    polluted by overall global popularity across all artists.
+
+    Example thresholds:
+      >= 80  — typically the #1–2 hits per artist
+      >= 50  — top 3–4 tracks
+      >= 30  — top 5–6 tracks (good default for discovery)
+      >= 10  — anything in the top 10 that has at least some traction
+
+    Tracks whose artist has no Last.fm enrichment (catalog_popularity = NULL)
+    are excluded — they have no catalog signal to filter on.
+
+    Params:
+      catalog_min  : float 0–100 — minimum catalog popularity (default 30)
+      catalog_max  : float 0–100 — maximum catalog popularity (default 100)
+      played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+    """
+    from models import TrackScore
+    catalog_min   = float(params.get("catalog_min",  30.0))
+    catalog_max   = float(params.get("catalog_max", 100.0))
+    played_filter = params.get("played_filter", "all")
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.artist_catalog_popularity.isnot(None))
+        .filter(TrackScore.artist_catalog_popularity >= catalog_min)
+        .filter(TrackScore.artist_catalog_popularity <= catalog_max)
+        .order_by(satext("artist_catalog_popularity DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_favorite_artists_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks from artists the user has at least one favourite track by.
+
+    ArtistProfile.has_favorite is True when any track by that artist carries a
+    Jellyfin favourite flag.  This block returns all tracks (subject to
+    played_filter) from those artists — not just the individual favourited tracks.
+
+    Params:
+      played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+    """
+    from models import TrackScore, ArtistProfile
+    played_filter = params.get("played_filter", "all")
+
+    fav_artists = (
+        db.query(ArtistProfile.artist_name)
+        .filter(
+            ArtistProfile.user_id == user_id,
+            ArtistProfile.has_favorite == True,  # noqa: E712
+        )
+        .all()
+    )
+    artist_names = [r.artist_name for r in fav_artists if r.artist_name]
+    if not artist_names:
+        return set()
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.artist_name.in_(artist_names))
+        .order_by(satext("CAST(final_score AS REAL) DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
+def execute_favorite_genres_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Tracks in genres where the user has at least one favourite track.
+
+    GenreProfile.has_favorite is True when any track in that genre carries a
+    Jellyfin favourite flag.  This block returns all tracks (subject to
+    played_filter) whose canonical genre matches one of those genres.
+
+    Params:
+      played_filter: 'all' | 'played' | 'unplayed' (default 'all')
+    """
+    from models import TrackScore, GenreProfile
+    played_filter = params.get("played_filter", "all")
+
+    fav_genres = (
+        db.query(GenreProfile.genre)
+        .filter(
+            GenreProfile.user_id == user_id,
+            GenreProfile.has_favorite == True,  # noqa: E712
+        )
+        .all()
+    )
+    genre_names = [r.genre for r in fav_genres if r.genre]
+    if not genre_names:
+        return set()
+
+    query = (
+        db.query(TrackScore)
+        .filter(TrackScore.user_id == user_id)
+        .filter(TrackScore.genre.in_(genre_names))
+        .order_by(satext("CAST(final_score AS REAL) DESC"))
+    )
+    query = _apply_played_filter(query, played_filter)
+    rows = query.limit(FETCH_LIMIT).all()
+    return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
+
+
 def execute_played_status_block(
     user_id: str,
     params: dict,
@@ -828,7 +955,10 @@ BLOCK_REGISTRY: dict = {
     "play_recency":      execute_play_recency_block,
     "global_popularity": execute_global_popularity_block,
     "discovery":         execute_discovery_block,
-    "favorites":         execute_favorites_block,
+    "favorites":                    execute_favorites_block,
+    "artist_catalog_popularity":    execute_artist_catalog_popularity_block,
+    "favorite_artists":             execute_favorite_artists_block,
+    "favorite_genres":   execute_favorite_genres_block,
     "played_status":     execute_played_status_block,
     "artist_cap":        execute_artist_cap_block,
     "jitter":            execute_jitter_block,

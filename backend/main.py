@@ -169,6 +169,8 @@ def _run_migrations():
         ("import_album_suggestions",  "album_mbid",          "TEXT",     "NULL"),
         ("import_album_suggestions",  "image_url",           "TEXT",     "NULL"),
         ("import_album_suggestions",  "missing_tracks",      "TEXT",     "NULL"),
+        # v12: per-artist catalog popularity — track's listeners relative to artist's #1 hit
+        ("track_scores", "artist_catalog_popularity", "REAL", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:

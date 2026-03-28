@@ -260,7 +260,8 @@ const ALL_COLUMNS = [
   { key: 'recency_score',     label: 'Recency',         default: false, hint: 'Score component for how recently you played this. Full marks within 30 days, decays to 0 after 1 year.' },
   { key: 'artist_affinity',   label: 'Artist aff.',     default: true,  hint: 'How much the engine thinks you like this artist (0–100), based on your overall play history for them.' },
   { key: 'genre_affinity',    label: 'Genre affinity',  default: true,  hint: 'How much you like this track\'s genre overall (0–100). Drives 10% of the final score.' },
-  { key: 'global_popularity', label: 'Song Popularity', default: true,  hint: 'Per-song Last.fm popularity (0–100). Based on how many people globally have listened to this specific track. Requires enrichment to populate — blank until enrichment has run.' },
+  { key: 'global_popularity',         label: 'Song Popularity',  default: true,  hint: 'Per-song Last.fm popularity (0–100). Based on how many people globally have listened to this specific track. Requires enrichment to populate — blank until enrichment has run.' },
+  { key: 'artist_catalog_popularity', label: 'Catalog rank',     default: true,  hint: "How popular this track is within its own artist's catalog (0–100). 100 = the artist's most-listened song on Last.fm. Used by the 'Artist's Top Tracks' playlist block." },
   { key: 'replay_boost',      label: 'Replay ↑',        default: true,  hint: 'Bonus score from voluntary replays within 7 days of a previous play — a strong signal that you really like this track.' },
   { key: 'novelty_bonus',     label: 'Novelty',         default: false, hint: 'Small bonus for unplayed tracks to give them a chance. 0 on played tracks.' },
   { key: 'skip_penalty',      label: 'Skip pen.',       default: true,  hint: 'Skip penalty multiplier applied to the final score. High values suppress the track in playlists.' },
@@ -660,6 +661,12 @@ function TrackTable({ userId }) {
                       hint="Song-level Last.fm popularity 0–100 (falls back to artist-level if not enriched)" />
                   </th>
                 )}
+                {col('artist_catalog_popularity') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Catalog rank" field="artist_catalog_popularity" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="How popular this track is within its artist's catalog (0–100). 100 = artist's #1 hit." />
+                  </th>
+                )}
                 {col('artist_affinity') && (
                   <th className="px-2 py-2.5 hidden lg:table-cell">
                     <SortHeader label="Artist aff." field="artist_affinity" currentSort={sort} currentOrder={order} onSort={handleSort}
@@ -801,6 +808,16 @@ function TrackTable({ userId }) {
                     {col('global_popularity') && (
                       <td className="px-2 py-2.5 hidden lg:table-cell min-w-[80px]">
                         <PopularityBar value={t.global_popularity} />
+                      </td>
+                    )}
+
+                    {/* Catalog rank */}
+                    {col('artist_catalog_popularity') && (
+                      <td className="px-2 py-2.5 hidden lg:table-cell min-w-[80px]">
+                        {t.artist_catalog_popularity != null
+                          ? <PopularityBar value={t.artist_catalog_popularity} />
+                          : <span className="text-xs text-[var(--text-secondary)]">—</span>
+                        }
                       </td>
                     )}
 
@@ -1079,6 +1096,321 @@ function TrackTable({ userId }) {
             </button>
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+// ── Genre Column definitions ──────────────────────────────────────────────────
+
+const GENRE_COLUMNS = [
+  { key: 'genre',               label: 'Genre',          always: true,  hint: 'Canonical genre name' },
+  { key: 'affinity_score',      label: 'Affinity',       always: true,  hint: 'Genre affinity score (0–100): how much you enjoy this genre based on plays, recency, and favorites.' },
+  { key: 'normalized_affinity', label: 'Norm. affinity', default: false, hint: 'Affinity normalized relative to your top genre (0–100). This is the scale used by playlist blocks — your #1 genre always scores 100.' },
+  { key: 'trend_direction',     label: 'Trend',          default: true,  hint: 'Rising = more plays in last 30 days vs prior 30. Falling = fewer. Stable = roughly the same.' },
+  { key: 'recent_plays',        label: 'Recent (30d)',   default: true,  hint: 'Unique tracks in this genre you played in the last 30 days.' },
+  { key: 'total_plays',         label: 'Total plays',    default: true,  hint: 'Lifetime play count across all tracks in this genre.' },
+  { key: 'total_tracks_played', label: 'Tracks played',  default: true,  hint: 'Unique tracks in this genre you have played at least once.' },
+  { key: 'skip_rate',           label: 'Skip rate',      default: true,  hint: 'Fraction of plays in this genre that ended in a skip.' },
+  { key: 'total_skips',         label: 'Skips',          default: false, hint: 'Raw skip count for this genre.' },
+  { key: 'has_favorite',        label: 'Fav',            default: true,  hint: 'You have at least one favorited artist in this genre.' },
+]
+
+const GENRE_DEFAULT_VISIBLE = new Set(
+  GENRE_COLUMNS.filter(c => c.always || c.default).map(c => c.key)
+)
+
+const GENRE_COLS_STORAGE_KEY = 'jellydj_insights_genre_cols_v1'
+
+function loadSavedGenreCols() {
+  try {
+    const raw = localStorage.getItem(GENRE_COLS_STORAGE_KEY)
+    if (!raw) return GENRE_DEFAULT_VISIBLE
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length === 0) return GENRE_DEFAULT_VISIBLE
+    const valid = new Set(GENRE_COLUMNS.map(c => c.key))
+    const filtered = parsed.filter(k => valid.has(k))
+    GENRE_COLUMNS.filter(c => c.always).forEach(c => filtered.push(c.key))
+    return new Set(filtered)
+  } catch {
+    return GENRE_DEFAULT_VISIBLE
+  }
+}
+
+function saveGenreCols(colSet) {
+  try {
+    localStorage.setItem(GENRE_COLS_STORAGE_KEY, JSON.stringify([...colSet]))
+  } catch {}
+}
+
+function GenreColumnPicker({ visible, onChange }) {
+  const [open, setOpen] = useState(false)
+  const toggleable = GENRE_COLUMNS.filter(c => !c.always)
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 px-3 py-1.5 bg-[var(--bg-overlay)] border border-[var(--border)]
+                   rounded-lg text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+      >
+        <Activity size={12} />
+        Columns
+        <ChevronDown size={10} className={open ? 'rotate-180' : ''} style={{ transition: 'transform 0.15s' }} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-50 bg-[var(--bg-surface)] border border-[var(--border)]
+                        rounded-xl shadow-xl p-3 min-w-[220px] space-y-1">
+          <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider mb-2 px-1">Toggle columns</div>
+          {toggleable.map(col => (
+            <label key={col.key}
+              className="flex items-start gap-2 px-1 py-1 rounded hover:bg-[var(--bg-overlay)] cursor-pointer"
+              title={col.hint}>
+              <input
+                type="checkbox"
+                checked={visible.has(col.key)}
+                onChange={() => {
+                  const next = new Set(visible)
+                  next.has(col.key) ? next.delete(col.key) : next.add(col.key)
+                  onChange(next)
+                }}
+                className="mt-0.5 accent-[var(--accent)]"
+              />
+              <div>
+                <div className="text-xs text-[var(--text-primary)]">{col.label}</div>
+                {col.hint && <div className="text-[10px] text-[var(--text-secondary)] leading-tight mt-0.5">{col.hint}</div>}
+              </div>
+            </label>
+          ))}
+          <button
+            onClick={() => onChange(GENRE_DEFAULT_VISIBLE)}
+            className="mt-2 w-full text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] py-1 border-t border-[var(--bg-overlay)] transition-colors"
+          >
+            Reset to default
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Genre Table ───────────────────────────────────────────────────────────────
+
+function GenreTable({ userId }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [sort, setSort] = useState('affinity_score')
+  const [order, setOrder] = useState('desc')
+  const [searchInput, setSearchInput] = useState('')
+  const [searchFilter, setSearchFilter] = useState('')
+  const [visibleCols, setVisibleCols] = useState(() => loadSavedGenreCols())
+
+  const gcol = (key) => visibleCols.has(key)
+
+  const doFetch = (uid, sb, ord, sf) => {
+    if (!uid) return
+    setLoading(true)
+    const params = new URLSearchParams({ user_id: uid, sort_by: sb, order: ord })
+    if (sf) params.set('search_filter', sf)
+    api.get(`/api/insights/genres?${params}`)
+      .then(d => { setData(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    doFetch(userId, sort, order, searchFilter)
+  }, [userId, sort, order, searchFilter])
+
+  const handleSearch = (e) => {
+    e.preventDefault()
+    setSearchFilter(searchInput)
+  }
+
+  const clearSearch = () => {
+    setSearchFilter('')
+    setSearchInput('')
+  }
+
+  const handleSort = (field) => {
+    const newOrder = sort === field ? (order === 'desc' ? 'asc' : 'desc') : 'desc'
+    setSort(field)
+    setOrder(newOrder)
+  }
+
+  return (
+    <div>
+      <div className="flex flex-wrap justify-between items-center gap-2 mb-4">
+        {data && <span className="text-xs text-[var(--text-secondary)]">{data.length} genres tracked</span>}
+        <div className="flex items-center gap-2 ml-auto flex-wrap">
+          <form onSubmit={handleSearch} className="flex items-center gap-1">
+            <div className="relative">
+              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" />
+              <input
+                type="text"
+                value={searchInput}
+                onChange={e => setSearchInput(e.target.value)}
+                placeholder="Search genre…"
+                className="pl-6 pr-2 py-1.5 text-xs bg-[var(--bg-overlay)] border border-[var(--border)]
+                           rounded-lg text-[var(--text-primary)] placeholder-[var(--text-secondary)]
+                           focus:outline-none focus:border-[var(--accent)] w-36"
+              />
+            </div>
+            <button type="submit"
+              className="px-2 py-1.5 text-xs bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-opacity">
+              Find
+            </button>
+            {searchFilter && (
+              <button type="button" onClick={clearSearch}
+                className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                title="Clear search">
+                <X size={12} />
+              </button>
+            )}
+          </form>
+          <GenreColumnPicker visible={visibleCols} onChange={cols => { setVisibleCols(cols); saveGenreCols(cols) }} />
+        </div>
+      </div>
+      {searchFilter && (
+        <div className="mb-3 text-xs text-[var(--text-secondary)]">
+          Showing results for <span className="text-[var(--text-primary)] font-medium">"{searchFilter}"</span>
+          {data && ` — ${data.length} match${data.length !== 1 ? 'es' : ''}`}
+        </div>
+      )}
+      <div className="card p-0 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-[var(--bg-overlay)]">
+                <th className="px-4 py-2.5 w-8 text-[10px] text-[var(--text-secondary)]">#</th>
+                <th className="px-2 py-2.5">
+                  <SortHeader label="Genre" field="genre" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                </th>
+                <th className="px-2 py-2.5">
+                  <SortHeader label="Affinity" field="affinity_score" currentSort={sort} currentOrder={order} onSort={handleSort}
+                    hint="Genre affinity score (0–100) built from play frequency, recency, and favorites." />
+                </th>
+                {gcol('normalized_affinity') && (
+                  <th className="px-2 py-2.5 hidden sm:table-cell">
+                    <SortHeader label="Norm. affinity" field="normalized_affinity" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Affinity normalized relative to your top genre. Your #1 genre = 100. This is what playlist blocks actually use." />
+                  </th>
+                )}
+                {gcol('trend_direction') && (
+                  <th className="px-2 py-2.5 hidden sm:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Trend</th>
+                )}
+                {gcol('recent_plays') && (
+                  <th className="px-2 py-2.5 hidden sm:table-cell">
+                    <SortHeader label="Recent (30d)" field="recent_plays" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Tracks played in this genre in the last 30 days." />
+                  </th>
+                )}
+                {gcol('total_plays') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell">
+                    <SortHeader label="Total plays" field="total_plays" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                  </th>
+                )}
+                {gcol('total_tracks_played') && (
+                  <th className="px-2 py-2.5 hidden md:table-cell">
+                    <SortHeader label="Tracks" field="total_tracks_played" currentSort={sort} currentOrder={order} onSort={handleSort}
+                      hint="Unique tracks played in this genre." />
+                  </th>
+                )}
+                {gcol('skip_rate') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Skip rate" field="skip_rate" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                  </th>
+                )}
+                {gcol('total_skips') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell">
+                    <SortHeader label="Skips" field="total_skips" currentSort={sort} currentOrder={order} onSort={handleSort} />
+                  </th>
+                )}
+                {gcol('has_favorite') && (
+                  <th className="px-2 py-2.5 hidden lg:table-cell text-[10px] text-[var(--text-secondary)] uppercase tracking-wider">Fav</th>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {loading && (
+                <tr><td colSpan={10} className="px-4 py-8 text-center">
+                  <Loader2 size={16} className="animate-spin text-[var(--text-secondary)] mx-auto" />
+                </td></tr>
+              )}
+              {!loading && data?.length === 0 && (
+                <tr><td colSpan={10} className="px-4 py-8 text-center text-xs text-[var(--text-secondary)]">
+                  No genre data yet — play some music to build your taste profile.
+                </td></tr>
+              )}
+              {!loading && data?.map((g, i) => (
+                <tr key={g.genre}
+                  className="border-b border-[var(--bg-overlay)] hover:bg-[var(--bg-surface)] transition-colors">
+                  <td className="px-4 py-2.5 text-[10px] text-[var(--text-secondary)]">{i + 1}</td>
+                  <td className="px-2 py-2.5">
+                    <div className="flex items-center gap-1.5">
+                      {g.has_favorite && <Heart size={10} className="text-[var(--danger)] flex-shrink-0" />}
+                      <span className="text-xs font-medium text-[var(--text-primary)] capitalize">{g.genre}</span>
+                    </div>
+                  </td>
+                  <td className="px-2 py-2.5">
+                    <div className="flex items-center gap-2 min-w-[80px]">
+                      <span className="text-xs font-bold tabular-nums"
+                            style={{ color: g.affinity_score >= 60 ? 'var(--accent)' : g.affinity_score >= 30 ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
+                        {g.affinity_score.toFixed(1)}
+                      </span>
+                      <ScoreBar value={g.affinity_score} color={g.affinity_score >= 60 ? 'var(--accent)' : 'var(--text-secondary)'} />
+                    </div>
+                  </td>
+                  {gcol('normalized_affinity') && (
+                    <td className="px-2 py-2.5 hidden sm:table-cell">
+                      <div className="flex items-center gap-2 min-w-[80px]">
+                        <span className="text-xs font-bold tabular-nums"
+                              style={{ color: g.normalized_affinity >= 60 ? 'var(--accent)' : g.normalized_affinity >= 30 ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
+                          {g.normalized_affinity.toFixed(1)}
+                        </span>
+                        <ScoreBar value={g.normalized_affinity} color={g.normalized_affinity >= 60 ? 'var(--accent)' : 'var(--text-secondary)'} />
+                      </div>
+                    </td>
+                  )}
+                  {gcol('trend_direction') && (
+                    <td className="px-2 py-2.5 hidden sm:table-cell text-xs">
+                      {g.trend_direction === 'rising'  && <span className="text-green-400 flex items-center gap-1"><TrendingUp size={11} /> Rising</span>}
+                      {g.trend_direction === 'falling' && <span className="text-[var(--danger)] flex items-center gap-1"><TrendingDown size={11} /> Falling</span>}
+                      {g.trend_direction === 'stable'  && <span className="text-[var(--text-secondary)]">Stable</span>}
+                    </td>
+                  )}
+                  {gcol('recent_plays') && (
+                    <td className="px-2 py-2.5 hidden sm:table-cell text-xs tabular-nums"
+                        style={{ color: g.recent_plays > 0 ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
+                      {g.recent_plays > 0 ? g.recent_plays : '—'}
+                    </td>
+                  )}
+                  {gcol('total_plays') && (
+                    <td className="px-2 py-2.5 hidden md:table-cell text-xs text-[var(--text-secondary)] tabular-nums">{g.total_plays}</td>
+                  )}
+                  {gcol('total_tracks_played') && (
+                    <td className="px-2 py-2.5 hidden md:table-cell text-xs text-[var(--text-secondary)] tabular-nums">{g.total_tracks_played}</td>
+                  )}
+                  {gcol('skip_rate') && (
+                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs tabular-nums"
+                        style={{ color: g.skip_rate > 0.3 ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                      {g.skip_rate > 0 ? `${(g.skip_rate * 100).toFixed(0)}%` : '—'}
+                    </td>
+                  )}
+                  {gcol('total_skips') && (
+                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs tabular-nums"
+                        style={{ color: g.total_skips > 0 ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                      {g.total_skips > 0 ? g.total_skips : '—'}
+                    </td>
+                  )}
+                  {gcol('has_favorite') && (
+                    <td className="px-2 py-2.5 hidden lg:table-cell text-xs">
+                      {g.has_favorite ? <Heart size={11} className="text-[var(--danger)]" /> : <span className="text-[var(--border)]">—</span>}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   )
@@ -1746,6 +2078,7 @@ export default function Insights() {
             {[
               { key: 'tracks',   label: 'Tracks',   icon: Music2 },
               { key: 'artists',  label: 'Artists',  icon: Mic2 },
+              { key: 'genres',   label: 'Genres',   icon: Tag },
               { key: 'holiday',  label: 'Holiday',  icon: Snowflake },
               { key: 'universe', label: 'Universe', icon: Globe },
             ].map(({ key, label, icon: Icon }) => (
@@ -1762,6 +2095,7 @@ export default function Insights() {
 
           {tab === 'tracks'   && <TrackTable userId={selectedUser} key={selectedUser} />}
           {tab === 'artists'  && <ArtistTable userId={selectedUser} key={selectedUser} />}
+          {tab === 'genres'   && <GenreTable userId={selectedUser} key={selectedUser} />}
           {tab === 'holiday'  && <HolidayTable />}
           {tab === 'universe' && (
             <div className="card" style={{ height: 680, padding: 0, overflow: 'hidden', borderRadius: '0.75rem' }}>
