@@ -53,6 +53,7 @@ from services.scoring_engine import (
     FAVORITE_ARTIST_BOOST,
     RECENTLY_ADDED_BOOST_MAX,
     RECENTLY_ADDED_BOOST_DAYS,
+    POPULARITY_UNPLAYED_MAX,
 )
 from services.library_scanner import scan_library
 
@@ -113,7 +114,8 @@ def _make_artist_profile(artist_name, primary_genre="", canonical_genres=None):
     return ap
 
 
-def _make_db(library_tracks=None, plays=None, skip_penalties=None, artist_profiles=None):
+def _make_db(library_tracks=None, plays=None, skip_penalties=None, artist_profiles=None,
+             enrichments=None, global_pop=None):
     """
     Build a mock DB session for scoring tests.
 
@@ -121,17 +123,36 @@ def _make_db(library_tracks=None, plays=None, skip_penalties=None, artist_profil
       Injected so rebuild_genre_profiles() and rebuild_track_scores() can test
       the canonical genre path.  When omitted (None → []), both functions fall
       back to the Jellyfin genre (norm_genre(Play.genre / LibraryTrack.genre)).
-    """
-    from models import LibraryTrack, Play, SkipPenalty, ArtistProfile, GenreProfile, TrackScore
 
-    lib = library_tracks or []
-    pl  = plays or []
-    sk  = skip_penalties or []
-    aps = artist_profiles or []
+    enrichments: list of ArtistEnrichment-like objects (must have .artist_name_lower
+      and .tags attributes).  Used by rebuild_artist_profiles library-only stub pass.
+
+    global_pop: dict mapping jellyfin_item_id → popularity_score (float 0-100).
+      Injected into TrackEnrichment query so popularity nudge is applied during
+      rebuild_track_scores.
+    """
+    from models import LibraryTrack, Play, SkipPenalty, ArtistProfile, GenreProfile, TrackScore, ArtistEnrichment
+
+    lib  = library_tracks or []
+    pl   = plays or []
+    sk   = skip_penalties or []
+    aps  = artist_profiles or []
+    enrs = enrichments or []
+    pop  = global_pop or {}
+
+    # Build mock TrackEnrichment rows for global_pop injection
+    mock_enrichment_rows = []
+    if pop:
+        for item_id, pop_score in pop.items():
+            row = MagicMock()
+            row.jellyfin_item_id = item_id
+            row.popularity_score = pop_score
+            mock_enrichment_rows.append(row)
 
     db = MagicMock()
 
-    def query_dispatch(model):
+    def query_dispatch(*args):
+        model = args[0] if args else None
         if model is LibraryTrack:
             q = MagicMock()
             q.filter.return_value.all.return_value = lib
@@ -152,11 +173,37 @@ def _make_db(library_tracks=None, plays=None, skip_penalties=None, artist_profil
             q.filter_by.return_value.delete.return_value = None
             q.filter_by.return_value.all.return_value = aps
             return q
-        if model in (GenreProfile, TrackScore):
+        if model is ArtistEnrichment:
+            q = MagicMock()
+            q.all.return_value = enrs
+            return q
+        if model is GenreProfile or model is TrackScore:
             q = MagicMock()
             q.filter_by.return_value.delete.return_value = None
             q.filter_by.return_value.all.return_value = []
             return q
+        # Column-level query for LibraryTrack columns (library-only stubs pass)
+        # e.g. db.query(LibraryTrack.artist_name, LibraryTrack.genre).filter(...).all()
+        try:
+            if any(hasattr(a, "class_") and a.class_ is LibraryTrack for a in args):
+                q = MagicMock()
+                # lib rows already have .artist_name and .genre attributes
+                q.filter.return_value.all.return_value = lib
+                return q
+        except Exception:
+            pass
+        # Column-level query for TrackEnrichment (popularity) — check by class name
+        try:
+            from models import TrackEnrichment
+            if any(
+                hasattr(a, "class_") and a.class_ is TrackEnrichment
+                for a in args
+            ):
+                q = MagicMock()
+                q.all.return_value = mock_enrichment_rows
+                return q
+        except Exception:
+            pass
         return MagicMock()
 
     db.query.side_effect = query_dispatch
@@ -289,6 +336,94 @@ class TestArtistProfiles:
         result = rebuild_artist_profiles(db, "user1")
         for artist, score in result.items():
             assert 0.0 <= score <= 100.0, f"{artist} score {score} out of range"
+
+    # ── v7 regression tests ───────────────────────────────────────────────────
+
+    # ── Library-only stubs (v10) ──────────────────────────────────────────────
+
+    def test_library_only_artist_gets_stub_with_lastfm_genre(self):
+        """
+        An artist in the library with no plays gets a stub ArtistProfile whose
+        primary_genre comes from Last.fm enrichment, not the Jellyfin file tag.
+        Without this stub, rebuild_track_scores falls back to the Jellyfin tag
+        ("Alternative") which may not match any key in genre_affinity
+        ("alternative rock"), setting genre_affinity=0 and hiding the track from
+        genre-filtered playlist blocks like "New For You".
+        """
+        import json as _json
+        from models import ArtistProfile as _AP
+
+        # Build a minimal enrichment object with raw JSON tags (same format as
+        # ArtistEnrichment.tags stored in the DB).
+        enr = MagicMock()
+        enr.artist_name_lower = "newartist"
+        enr.tags = _json.dumps(["alternative rock", "indie rock", "rock"])
+
+        lib = [_make_library_track("t1", artist="NewArtist", genre="Alternative")]
+        db = _make_db(library_tracks=lib, plays=[], enrichments=[enr])
+
+        # Capture every ArtistProfile passed to db.add().
+        added: list = []
+        db.add.side_effect = lambda obj: added.append(obj)
+
+        result = rebuild_artist_profiles(db, "user1")
+
+        assert "NewArtist" in result or "newartist" in result, (
+            "Library-only artist must appear in affinity_map with score 0.0 so "
+            "rebuild_track_scores can look up their artist_affinity."
+        )
+        ap_rows = [x for x in added if isinstance(x, _AP) and getattr(x, "artist_name", "") == "NewArtist"]
+        assert ap_rows, "ArtistProfile stub was not created for library-only artist"
+        ap = ap_rows[0]
+        assert ap.total_plays == 0
+        assert ap.primary_genre == "alternative rock", (
+            f"Expected primary_genre='alternative rock' (from Last.fm tag), "
+            f"got '{ap.primary_genre}'"
+        )
+
+    def test_library_only_artist_falls_back_to_jellyfin_genre_when_not_enriched(self):
+        """When no Last.fm enrichment exists the stub uses the normalized Jellyfin genre."""
+        from models import ArtistProfile as _AP
+
+        lib = [_make_library_track("t1", artist="UnknownBand", genre="Bluegrass")]
+        db = _make_db(library_tracks=lib, plays=[], enrichments=[])
+
+        added: list = []
+        db.add.side_effect = lambda obj: added.append(obj)
+
+        rebuild_artist_profiles(db, "user1")
+
+        ap_rows = [x for x in added if isinstance(x, _AP) and getattr(x, "artist_name", "") == "UnknownBand"]
+        assert ap_rows, "Stub should still be created even without enrichment"
+        assert ap_rows[0].primary_genre == "bluegrass"  # _norm_genre("Bluegrass") → "bluegrass"
+
+    def test_library_only_stub_does_not_overwrite_played_artist_profile(self):
+        """
+        A played artist's profile must not be overwritten by the library-only pass.
+        The already_profiled guard ensures the two passes are mutually exclusive.
+        Each pass calls db.add once — there must be exactly one ArtistProfile added
+        for Eagles (from the played-artists pass), with total_plays=15.
+        """
+        from models import ArtistProfile as _AP
+
+        plays = [_make_play("t1", artist="Eagles", play_count=15)]
+        lib   = [_make_library_track("t2", artist="Eagles", genre="Classic Rock")]
+        db = _make_db(library_tracks=lib, plays=plays, enrichments=[])
+
+        added: list = []
+        db.add.side_effect = lambda obj: added.append(obj)
+
+        rebuild_artist_profiles(db, "user1")
+
+        eagles_profiles = [
+            x for x in added
+            if isinstance(x, _AP) and getattr(x, "artist_name", "").lower() == "eagles"
+        ]
+        assert len(eagles_profiles) == 1, (
+            f"Eagles should have exactly one ArtistProfile added (got {len(eagles_profiles)}). "
+            "The library-only stub pass must not duplicate played-artist profiles."
+        )
+        assert eagles_profiles[0].total_plays == 15
 
     # ── v7 regression tests ───────────────────────────────────────────────────
 
@@ -718,11 +853,18 @@ class TestRecentlyAddedBoost:
         )
 
     def test_boost_decays_with_age(self):
-        """A track added 10 days ago scores higher than one added 60 days ago."""
-        lib_10 = [_make_library_track("t10", artist="Eagles", genre="Rock")]
+        """A track added 10 days ago scores higher than one added 60 days ago.
+
+        Uses low artist/genre affinity (20/10) so the base unplayed score
+        is well below UNPLAYED_CAP, leaving headroom for the recently-added
+        boost to produce a measurable difference between the two ages.
+        High affinities (e.g. 80/70) already push the base to UNPLAYED_CAP
+        (78.0) before the boost runs, so both would cap identically.
+        """
+        lib_10 = [_make_library_track("t10", artist="NewAct", genre="Rock")]
         lib_10[0].date_added = datetime.utcnow() - timedelta(days=10)
 
-        lib_60 = [_make_library_track("t60", artist="Eagles", genre="Rock")]
+        lib_60 = [_make_library_track("t60", artist="NewAct", genre="Rock")]
         lib_60[0].date_added = datetime.utcnow() - timedelta(days=60)
 
         added_10, added_60 = [], []
@@ -731,8 +873,15 @@ class TestRecentlyAddedBoost:
         db_10.add = lambda obj: added_10.append(obj)
         db_60.add = lambda obj: added_60.append(obj)
 
-        rebuild_track_scores(db_10, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
-        rebuild_track_scores(db_60, "user1", {"Eagles": 80.0}, {"Rock": 70.0})
+        # Low affinities keep base score below UNPLAYED_CAP so boost has room.
+        # Include a high-affinity anchor so "NewAct" normalises to ~20/100 rather
+        # than 100/100 (the engine normalises relative to max in the passed dict).
+        rebuild_track_scores(db_10, "user1",
+                             {"NewAct": 20.0, "Anchor": 100.0},
+                             {"Rock": 10.0, "Pop": 100.0})
+        rebuild_track_scores(db_60, "user1",
+                             {"NewAct": 20.0, "Anchor": 100.0},
+                             {"Rock": 10.0, "Pop": 100.0})
 
         score_10 = next(float(s.final_score) for s in added_10 if hasattr(s, "final_score"))
         score_60 = next(float(s.final_score) for s in added_60 if hasattr(s, "final_score"))
@@ -753,6 +902,54 @@ class TestRecentlyAddedBoost:
         scores = [float(s.final_score) for s in added if hasattr(s, "final_score")]
         assert all(s <= UNPLAYED_CAP for s in scores), (
             f"Score(s) exceeded UNPLAYED_CAP={UNPLAYED_CAP}: {scores}"
+        )
+
+
+# ── Unit tests: popularity signal (v11) ──────────────────────────────────────
+
+class TestPopularityUnplayedWeight:
+    """
+    v11: POPULARITY_UNPLAYED_MAX raised 10 → 15 so globally popular stranger
+    tracks score meaningfully higher.  A 90-popularity stranger should score
+    at least 5 pts above the UNPLAYED_BASE+novelty floor.
+    """
+
+    def test_popular_unplayed_scores_above_base_floor(self):
+        """A track with global_popularity=90 scores clearly above the base floor."""
+        lib = [_make_library_track("pop_track", artist="Classic Act", genre="Rock")]
+        db = _make_db(library_tracks=lib, plays=[], global_pop={"pop_track": 90.0})
+        added = []
+        db.add = lambda obj: added.append(obj)
+        rebuild_track_scores(db, "user1", {"Classic Act": 0.0}, {"Rock": 0.0})
+        score = next(float(s.final_score) for s in added if hasattr(s, "final_score"))
+        # Base: UNPLAYED_BASE(35) + novelty(2) = 37; popularity should add > 5 pts
+        assert score > 42, (
+            f"Popular stranger track scored {score:.2f}, expected > 42. "
+            "POPULARITY_UNPLAYED_MAX may be too low."
+        )
+
+    def test_popular_unplayed_scores_higher_than_unpopular(self):
+        """A popular stranger track should outscore an identical unpopular stranger."""
+        lib_pop  = [_make_library_track("popular",   artist="Classic Act", genre="Rock")]
+        lib_none = [_make_library_track("unpopular", artist="Classic Act", genre="Rock")]
+        db_pop  = _make_db(library_tracks=lib_pop,  plays=[], global_pop={"popular":   90.0})
+        db_none = _make_db(library_tracks=lib_none, plays=[], global_pop={"unpopular": 0.0})
+        added_pop, added_none = [], []
+        db_pop.add  = lambda obj: added_pop.append(obj)
+        db_none.add = lambda obj: added_none.append(obj)
+        rebuild_track_scores(db_pop,  "user1", {"Classic Act": 0.0}, {"Rock": 0.0})
+        rebuild_track_scores(db_none, "user1", {"Classic Act": 0.0}, {"Rock": 0.0})
+        score_pop  = next(float(s.final_score) for s in added_pop  if hasattr(s, "final_score"))
+        score_none = next(float(s.final_score) for s in added_none if hasattr(s, "final_score"))
+        assert score_pop > score_none, (
+            f"Popular stranger scored {score_pop:.2f}, unpopular scored {score_none:.2f}."
+        )
+
+    def test_popularity_unplayed_max_is_at_least_15(self):
+        """v11 constant guard — regression test so the value is never lowered back."""
+        assert POPULARITY_UNPLAYED_MAX >= 15.0, (
+            f"POPULARITY_UNPLAYED_MAX={POPULARITY_UNPLAYED_MAX} is below 15. "
+            "v11 raised this to ensure popular stranger tracks surface in discovery."
         )
 
 
@@ -1160,3 +1357,54 @@ class TestCanonicalGenrePipeline:
         assert "hip hop" in result, "Enriched artist should contribute canonical genre"
         assert "country" in result, "Unenriched artist should fall back to Jellyfin genre"
         assert "pop"     not in result, "Jellyfin 'Pop' tag must not appear for enriched artist"
+
+    def test_genre_affinity_uses_best_matching_canonical_genre(self):
+        """
+        v10 fix: genre_affinity lookup must use max() across ALL canonical genres,
+        not just primary_genre.
+
+        Scenario: new library-only artist "Eagles" has
+          canonical_genres = [{"genre": "classic rock", "weight": 0.5},
+                               {"genre": "rock", "weight": 0.25}]
+        User has played many "rock" artists → genre_affinity["rock"] = 90.
+        User has played NO "classic rock" artists → genre_affinity["classic rock"] = 0.
+
+        Before fix: primary_genre = "classic rock" → raw_genre = 0 → g_aff = 0.0.
+          Eagles fails genre_affinity_min=40 and never surfaces in "New For You".
+        After fix: max("classic rock"=0, "rock"=90) = 90 → g_aff > 0 → Eagles passes.
+        """
+        from models import TrackScore as _TS
+
+        lib = [_make_library_track("t1", artist="Eagles", genre="Classic Rock")]
+        aps = [
+            _make_artist_profile(
+                "Eagles",
+                primary_genre="classic rock",
+                canonical_genres=[
+                    {"genre": "classic rock", "weight": 0.5},
+                    {"genre": "rock",         "weight": 0.25},
+                    {"genre": "country rock", "weight": 0.25},
+                ],
+            )
+        ]
+        db = _make_db(library_tracks=lib, plays=[], artist_profiles=aps)
+        added = []
+        db.add.side_effect = lambda obj: added.append(obj)
+
+        # User has "rock" affinity but no "classic rock" affinity
+        genre_aff = {"rock": 90.0}
+        rebuild_track_scores(db, "user1", {}, genre_aff)
+
+        ts_rows = [x for x in added if isinstance(x, _TS) and getattr(x, "artist_name", "") == "Eagles"]
+        assert ts_rows, "TrackScore must be created for Eagles"
+        g_aff = float(ts_rows[0].genre_affinity)
+        assert g_aff > 0.0, (
+            f"genre_affinity should be > 0 because Eagles has 'rock' as a secondary "
+            f"canonical genre and user has rock affinity 90. Got g_aff={g_aff}. "
+            "The v10 max() fix is not working."
+        )
+        assert g_aff >= 40.0, (
+            f"genre_affinity={g_aff} should be >= 40 so Eagles passes the "
+            "genre_affinity_min=40 filter in 'New For You'."
+        )
+

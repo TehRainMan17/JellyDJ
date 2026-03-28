@@ -159,6 +159,29 @@ def _find_jitter(nodes: list[dict]) -> float:
     return 0.0
 
 
+def _apply_artist_cap_strict(
+    id_list: list[str],
+    artist_map: dict[str, str],
+    cap: int,
+) -> list[str]:
+    """
+    Filter id_list to at most `cap` tracks per artist — no relaxation pass.
+
+    Used for the global cross-block artist dedup after interleaving, where
+    a relaxed second pass would re-introduce the very duplicates we're
+    removing.  Accepts fewer than len(id_list) tracks when artists are
+    over-represented; callers should not expect a guaranteed count.
+    """
+    counts: dict[str, int] = {}
+    result = []
+    for iid in id_list:
+        artist = (artist_map.get(iid) or "").lower()
+        if counts.get(artist, 0) < cap:
+            result.append(iid)
+            counts[artist] = counts.get(artist, 0) + 1
+    return result
+
+
 def _apply_artist_cap(
     id_list: list[str],
     artist_map: dict[str, str],  # item_id → artist_name
@@ -280,6 +303,17 @@ async def generate_from_template(
     chain_results: list[tuple[int, list[str]]] = []  # (weight, ordered_ids)
 
     seen_ids: set[str] = set()
+    # Cross-block artist tracking: when a block uses a strict per-artist cap
+    # (max_per_artist <= 2), we also prevent later blocks from re-selecting
+    # artists already claimed.  This stops an artist like Kelsea Ballerini
+    # from appearing once in Block 0 (liked genre), once in Block 1 (adjacent
+    # genre), and once in Block 3 (popularity) just because each block's
+    # per-block cap was independently satisfied.
+    #
+    # Using a pre-allocation approach (exclude at candidate-pool time) rather
+    # than a post-hoc strip means the _interleave drain loop can still fill the
+    # full total_tracks from Block 0's deeper pool — total count is preserved.
+    seen_artists: set[str] = set()
 
     sorted_blocks = sorted(blocks, key=lambda b: b.weight, reverse=True)
 
@@ -313,24 +347,54 @@ async def generate_from_template(
             log.error("Block id=%d tree evaluation failed: %s", block.id, exc, exc_info=True)
             matched_ids = set()
 
-        # Exclude already-claimed IDs (dedup across chains)
+        # Exclude already-claimed track IDs (dedup across chains)
         fresh_ids = matched_ids - seen_ids
 
-        # Score-sort the remaining IDs so best tracks come first within this chain
-        # Apply jitter if a jitter node exists anywhere in this chain's tree
-        chain_jitter = _find_jitter(filter_tree)
-        score_map = _build_score_map(fresh_ids, user_id, db, jitter_pct=chain_jitter)
-        sorted_ids = sorted(fresh_ids, key=lambda iid: score_map.get(iid, 0), reverse=True)
+        # Build artist map once for this block's candidate pool so we can apply
+        # both cross-block exclusion and per-block artist cap from the same data.
+        artist_map = _build_artist_map(fresh_ids, user_id, db)
+
+        # Cross-block artist exclusion (strict-cap blocks only).
+        # For blocks with max_per_artist <= 2, also filter out tracks from any
+        # artist already selected by a previous (higher-weight) block.  This
+        # prevents the same artist consuming a slot in every block while still
+        # letting the interleave drain fill the full quota from the leading
+        # block's deeper pool.
+        if seen_artists and max_per_artist <= 2:
+            before_xblock = len(fresh_ids)
+            fresh_ids = {
+                iid for iid in fresh_ids
+                if (artist_map.get(iid) or "").lower() not in seen_artists
+            }
+            artist_map = {k: v for k, v in artist_map.items() if k in fresh_ids}
+            if len(fresh_ids) < before_xblock:
+                log.debug(
+                    "Block id=%d: cross-block artist exclusion removed %d tracks "
+                    "(%d → %d fresh)",
+                    block.id, before_xblock - len(fresh_ids),
+                    before_xblock, len(fresh_ids),
+                )
+
+        # Shuffle the qualifying pool so all candidates have equal selection
+        # probability regardless of final_score.  Viability is determined by the
+        # filter tree; random ordering ensures familiar artists don't crowd out
+        # strangers and that each generation produces a varied result.
+        sorted_ids = list(fresh_ids)
+        random.shuffle(sorted_ids)
 
         # Compute target count for this chain proportional to its weight
         normalised_w  = block.weight / weight_sum
         chain_target  = max(1, round(total_tracks * normalised_w))
 
-        # Apply artist cap
-        artist_map = _build_artist_map(fresh_ids, user_id, db)
-        capped_ids = _apply_artist_cap(sorted_ids, artist_map, max_per_artist, chain_target)
+        # Apply artist cap — use total_tracks (not chain_target) as the stop
+        # limit so each chain can hold more tracks than its proportional share.
+        # The _interleave drain loop then pulls from that excess to fill any gap
+        # left by a chain that genuinely under-delivers.  Without this, every
+        # chain is capped exactly at its quota and the drain has nothing to use.
+        capped_ids = _apply_artist_cap(sorted_ids, artist_map, max_per_artist, total_tracks)
 
         seen_ids.update(capped_ids)
+        seen_artists.update((artist_map.get(iid) or "").lower() for iid in capped_ids)
         chain_results.append((block.weight, capped_ids))
 
         log.debug(

@@ -88,6 +88,17 @@ Changes in v8 (skip penalty overhaul):
      applying a proportional discount to unplayed scores when skip_rate > 0.2.
      This ensures that new tracks by a heavily-skipped artist start at a lower
      score rather than appearing as equally attractive as a loved artist.
+
+Changes in v11 (popularity signal strengthening):
+
+  7. POPULAR STRANGER TRACKS UNDER-SCORED — globally popular unplayed tracks
+     by artists with zero play history scored only ~43-47/100 even with 90%
+     global popularity, because POPULARITY_UNPLAYED_MAX=10 gave only 12.8% of
+     the 78-pt unplayed cap as a nudge.  Meanwhile higher-affinity (but less
+     popular) tracks filled the 2000-row FETCH_LIMIT pool, crowding out
+     bangers like Aretha Franklin "Respect" or Rick Springfield "Jessie's Girl".
+     Fixed: POPULARITY_UNPLAYED_MAX raised 10 → 15 so a 90%-popular stranger
+     track now reaches ~51-55 pts, competitive with acquaintance-level tracks.
 """
 from __future__ import annotations
 
@@ -145,7 +156,7 @@ FAVORITE_ARTIST_BOOST = 15.0
 REPLAY_BOOST_CAP      = 12.0
 
 POPULARITY_PLAYED_MAX   = 5.0
-POPULARITY_UNPLAYED_MAX = 10.0
+POPULARITY_UNPLAYED_MAX = 15.0  # v11: raised 10→15 so globally popular stranger tracks score higher
 
 # v10: recently-added boost — surface fresh library additions in discovery.
 # Linear decay from RECENTLY_ADDED_BOOST_MAX (added today) to 0 at RECENTLY_ADDED_BOOST_DAYS.
@@ -566,6 +577,64 @@ def rebuild_artist_profiles(db: Session, user_id: str) -> dict[str, float]:
             canonical_genres=None,
         ))
 
+    # ── Library-only stubs ────────────────────────────────────────────────────
+    # Create lightweight stubs for all library artists that have neither plays
+    # nor skips.  Without a profile row, rebuild_track_scores falls back to the
+    # Jellyfin file-tag genre (e.g. "Alternative") as the canonical genre.  That
+    # string often doesn't match any key in genre_affinity, which is keyed on
+    # Last.fm canonical genres (e.g. "alternative rock") — so those tracks get
+    # genre_affinity=0 and fail the genre_affinity_min=40 filter in
+    # execute_genre_block, making brand-new library additions invisible to
+    # "New For You" and every other genre-gated playlist block.
+    #
+    # Stubs use Last.fm enrichment data (if available) for canonical genres;
+    # fall back to the normalized Jellyfin file-tag genre otherwise.  All
+    # engagement fields stay at zero so the discovery block correctly classifies
+    # these artists as strangers (total_plays=0).
+    already_profiled: set[str] = set(artist_agg.keys()) | set(artist_skips.keys())
+
+    lib_track_rows = (
+        db.query(LibraryTrack.artist_name, LibraryTrack.genre)
+        .filter(LibraryTrack.missing_since.is_(None))
+        .all()
+    )
+    seen_lib_keys: set[str] = set()
+    for row in lib_track_rows:
+        if not row.artist_name:
+            continue
+        key = row.artist_name.lower().strip()
+        if key in already_profiled or key in seen_lib_keys:
+            continue
+        seen_lib_keys.add(key)
+
+        enrichment = enrichment_map.get(key)
+        tags_raw: Optional[str] = enrichment.tags if enrichment else None
+
+        jf_genre = _norm_genre(row.genre) if row.genre else ""
+        # Pass the raw JSON string — _derive_canonical_genres calls json.loads internally.
+        canonical_genres_list = _derive_canonical_genres(tags_raw, jf_genre)
+        canonical_genres_json = json.dumps(canonical_genres_list) if canonical_genres_list else None
+        primary_genre = _dominant_genre(canonical_genres_list)
+
+        affinity_map[row.artist_name] = 0.0
+        affinity_map[key] = 0.0  # lowercase alias for case-insensitive lookups
+
+        db.add(ArtistProfile(
+            user_id=user_id,
+            artist_name=row.artist_name,
+            total_plays=0,
+            total_tracks_played=0,
+            total_skips=0,
+            skip_rate="0.0",
+            has_favorite=False,
+            primary_genre=primary_genre,
+            affinity_score="0.0",
+            updated_at=now,
+            replay_boost=0.0,
+            canonical_genres=canonical_genres_json,
+            tags=tags_raw,
+        ))
+
     db.flush()
     return affinity_map
 
@@ -831,9 +900,22 @@ def rebuild_track_scores(
     # Falls back to norm_genre(LibraryTrack.genre) when artist has no profile
     # (rare — only affects artists with 0 plays and no enrichment).
     artist_primary_genre_map: dict[str, str] = {}
+    # v10: full canonical genre list per artist for best-match affinity lookup.
+    # Using only primary_genre misses cases where an artist's secondary genre
+    # (e.g. "rock" on a "classic rock" artist) has high user affinity while the
+    # primary genre has none.  max() across all canonical genres ensures any
+    # genre connection in the artist's Last.fm profile surfaces the track.
+    artist_canonical_genres_map: dict[str, list] = {}
     for ap in db.query(ArtistProfile).filter_by(user_id=user_id).all():
         if ap.artist_name:
             artist_primary_genre_map[ap.artist_name.lower()] = ap.primary_genre or ""
+            if ap.canonical_genres:
+                try:
+                    cgs = json.loads(ap.canonical_genres)
+                    if isinstance(cgs, list) and cgs:
+                        artist_canonical_genres_map[ap.artist_name.lower()] = cgs
+                except Exception:
+                    pass
 
     max_plays = max((p.play_count for p in plays.values() if p.play_count), default=1) or 1
 
@@ -897,7 +979,16 @@ def rebuild_track_scores(
         if canonical_genre is None:
             canonical_genre = _norm_genre(track.genre) if track.genre else ""
 
-        raw_genre = genre_affinity.get(canonical_genre, 0.0)
+        # v10: use max affinity across all canonical genres, not just primary_genre.
+        # An artist tagged ["classic rock", "rock"] gets the user's full "rock"
+        # affinity even when "classic rock" itself has zero affinity (unplayed).
+        cgs = artist_canonical_genres_map.get(
+            track.artist_name.lower() if track.artist_name else ""
+        )
+        if cgs:
+            raw_genre = max(genre_affinity.get(g["genre"], 0.0) for g in cgs)
+        else:
+            raw_genre = genre_affinity.get(canonical_genre, 0.0)
         a_aff = round((raw_artist / max_artist_aff) * 100, 2)
         g_aff = round((raw_genre / max_genre_aff) * 100, 2)
 

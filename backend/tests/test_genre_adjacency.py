@@ -136,6 +136,30 @@ class TestBidirectionality:
         assert "indie pop" in GENRE_ADJACENCY["pop"]
         assert "pop" in GENRE_ADJACENCY["indie pop"]
 
+    def test_classic_rock_and_pop_rock_bidirectional(self):
+        """pop rock ↔ classic rock: Rick Springfield / Billy Joel era crossover."""
+        assert "pop rock" in GENRE_ADJACENCY["classic rock"]
+        assert "classic rock" in GENRE_ADJACENCY["pop rock"]
+
+    def test_pop_and_soul_bidirectional(self):
+        """pop ↔ soul: Aretha Franklin and Motown-era artists should surface for pop fans."""
+        assert "soul" in GENRE_ADJACENCY["pop"]
+        assert "pop" in GENRE_ADJACENCY["soul"]
+
+    def test_pop_and_motown_bidirectional(self):
+        """pop ↔ motown: Motown was commercial pop of its era."""
+        assert "motown" in GENRE_ADJACENCY["pop"]
+        assert "pop" in GENRE_ADJACENCY["motown"]
+
+    def test_soft_rock_is_reachable_from_classic_rock(self):
+        """soft rock sits at the classic-rock / pop crossover."""
+        assert "soft rock" in GENRE_ADJACENCY["classic rock"]
+        assert "classic rock" in GENRE_ADJACENCY["soft rock"]
+
+    def test_soft_rock_is_reachable_from_pop(self):
+        assert "soft rock" in GENRE_ADJACENCY["pop"]
+        assert "pop" in GENRE_ADJACENCY["soft rock"]
+
 
 # ── GENRE_ADJACENCY: Hip-Hop isolation ────────────────────────────────────────
 

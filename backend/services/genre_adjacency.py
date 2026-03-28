@@ -48,9 +48,9 @@ GENRE_ADJACENCY: dict[str, list[str]] = {
         "alternative rock", "progressive rock", "psychedelic rock",
         "indie rock", "garage rock",
     ],
-    "classic rock": ["rock", "hard rock", "blues rock", "psychedelic rock"],
+    "classic rock": ["rock", "hard rock", "blues rock", "psychedelic rock", "pop rock", "soft rock"],
     "hard rock": ["rock", "heavy metal", "classic rock", "glam rock"],
-    "pop rock": ["rock", "pop", "alternative rock", "indie rock", "power pop"],
+    "pop rock": ["rock", "pop", "alternative rock", "indie rock", "power pop", "classic rock", "soft rock"],
     "alternative rock": [
         "rock", "indie rock", "pop rock", "grunge", "post punk", "new wave", "garage rock",
     ],
@@ -77,13 +77,14 @@ GENRE_ADJACENCY: dict[str, list[str]] = {
     "folk rock": ["rock", "folk", "americana", "singer songwriter", "indie folk"],
     "country rock": ["rock", "country", "americana", "alt country"],
     "power pop": ["pop rock", "indie pop", "rock", "alternative rock"],
+    "soft rock": ["pop rock", "classic rock", "pop", "singer songwriter", "easy listening"],
     "pop punk": ["punk", "pop rock", "alternative rock", "indie pop"],
     "emo": ["punk", "post punk", "pop punk", "alternative rock"],
 
     # ── POP ─────────────────────────────────────────────────────────────────
     "pop": [
         "pop rock", "dance pop", "indie pop", "synth pop", "electro pop",
-        "r&b", "country pop", "latin pop", "new wave",
+        "r&b", "country pop", "latin pop", "new wave", "soul", "motown", "soft rock",
     ],
     "dance pop": ["pop", "electronic", "electro pop", "house", "synth pop"],
     "indie pop": [
@@ -156,7 +157,7 @@ GENRE_ADJACENCY: dict[str, list[str]] = {
     "latin jazz": ["jazz", "latin", "salsa", "bossa nova"],
     "soul jazz": ["jazz", "soul", "funk", "hard bop"],
     "nu jazz": ["jazz", "electronic", "downtempo", "acid jazz", "trip hop"],
-    "easy listening": ["smooth jazz", "pop", "soul", "new age"],
+    "easy listening": ["smooth jazz", "pop", "soul", "new age", "soft rock"],
     "new age": ["ambient", "classical", "easy listening", "folk"],
 
     # ── BLUES ───────────────────────────────────────────────────────────────
@@ -176,7 +177,7 @@ GENRE_ADJACENCY: dict[str, list[str]] = {
     ],
     "soul": [
         "r&b", "blues", "jazz", "gospel", "funk",
-        "neo soul", "motown", "soul jazz",
+        "neo soul", "motown", "soul jazz", "pop",
     ],
     "funk": ["soul", "r&b", "disco", "jazz", "blues", "acid jazz"],
     "neo soul": ["soul", "r&b", "jazz", "funk", "hip hop soul", "trip hop"],
@@ -213,7 +214,7 @@ GENRE_ADJACENCY: dict[str, list[str]] = {
     ],
     "celtic folk": ["folk", "folk rock", "world"],
     "singer songwriter": [
-        "folk", "indie folk", "americana", "pop", "indie pop", "acoustic",
+        "folk", "indie folk", "americana", "pop", "indie pop", "acoustic", "soft rock",
     ],
     "acoustic": ["folk", "singer songwriter", "indie folk", "country"],
     "world": ["folk", "latin", "reggae", "celtic folk", "jazz"],

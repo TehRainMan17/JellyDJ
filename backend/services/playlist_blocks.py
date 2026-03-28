@@ -422,12 +422,16 @@ def execute_played_status_block(
     db: Session,
     excluded_item_ids: frozenset,
 ) -> set[str]:
-    """Filter by played/unplayed status only (for use as a refine node)."""
+    """Filter by played/unplayed status only (for use as a refine node).
+
+    No FETCH_LIMIT — used as a qualifier child node; capping it would silently
+    exclude newly added tracks that sit beyond the 2000-row insertion window.
+    """
     from models import TrackScore
     played_filter = params.get("played_filter", "played")
     query = db.query(TrackScore).filter(TrackScore.user_id == user_id)
     query = _apply_played_filter(query, played_filter)
-    rows = query.limit(FETCH_LIMIT).all()
+    rows = query.all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 
@@ -442,12 +446,14 @@ def execute_artist_cap_block(
     The engine applies artist_cap as a post-processing step when it sees
     this node type.  Returning the full set here means it acts as a passthrough
     in AND-intersection.
+
+    No FETCH_LIMIT — passthrough blocks must return every track so the
+    AND-intersection does not silently exclude newly added or lower-ranked tracks.
     """
     from models import TrackScore
     rows = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
-        .limit(FETCH_LIMIT)
         .all()
     )
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
@@ -473,15 +479,15 @@ def execute_jitter_block(
 
     Implementation note:
       This block is a pass-through — it returns the entire library so it does
-      not narrow the AND-intersection at all. Its effect is purely in ordering:
-      the engine will find this node in the tree and apply score jitter when
-      building score_map for this chain.
+      not narrow the AND-intersection at all.
+
+    No FETCH_LIMIT — passthrough blocks must return every track so the
+    AND-intersection does not silently exclude newly added or lower-ranked tracks.
     """
     from models import TrackScore
     rows = (
         db.query(TrackScore)
         .filter(TrackScore.user_id == user_id)
-        .limit(FETCH_LIMIT)
         .all()
     )
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
@@ -521,7 +527,9 @@ def execute_cooldown_block(
             (TrackScore.cooldown_until <= now)
         )
 
-    rows = query.limit(FETCH_LIMIT).all()
+    # No FETCH_LIMIT — cooldown is a near-passthrough; capping it would silently
+    # exclude newly added tracks that happen to sit beyond the 2000-row window.
+    rows = query.all()
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 

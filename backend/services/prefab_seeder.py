@@ -52,6 +52,66 @@ v8 change — "New For You" affinity-first rework:
     Block 2 — "Familiar Anchors" (weight 15)
       Unchanged from v7: a small slice of recently played, high-scoring tracks
       to keep the playlist listenable and prevent cold-start overwhelm.
+
+v11 fix — "New For You" genre_affinity_min lowered 40→25:
+  Root cause: genre_affinity_min=40 is a RELATIVE threshold — it means "genres
+  where you've listened at least 40% as much as your top genre."  A user with
+  500 pop plays and 150 classic rock plays has classic rock at g_aff=30, which
+  FAILS the 40 threshold → classic rock is completely excluded from Block 0/1.
+  Secondary genres the user genuinely likes end up invisible.
+
+  Fix: lowered to 25, meaning "at least 25% of your top genre's engagement."
+  With the example above, classic rock (g_aff=30) now qualifies.  The threshold
+  still excludes truly peripheral genres (g_aff<25) while including any genre
+  where the user has meaningful but not dominant listening history.
+
+v11 fix — "New For You" cross-block artist dedup (playlist_engine.py):
+  Root cause: per-block artist_cap=1 prevents an artist from taking more than
+  1 slot WITHIN a single block, but the same artist can appear once in Block 0
+  (liked genre), once in Block 1 (adjacent genre), and once in Block 3
+  (popularity) — potentially 3+ tracks from Kelsea Ballerini in one playlist.
+  The fix is in playlist_engine.py: after interleaving, a strict global artist
+  cap (minimum per-block cap across all blocks) removes duplicates.
+
+v10 fix — "New For You" popular discoveries block added:
+  Root cause: highly popular unplayed tracks by stranger artists (e.g. Aretha
+  Franklin "Respect", Rick Springfield "Jessie's Girl") were invisible because:
+    1. Their Last.fm genre ("soul", "pop rock") sat outside or one extra hop from
+       the user's genre affinity path — no direct route through Block 0/1.
+    2. POPULARITY_UNPLAYED_MAX was only 10 pts (12.8% of the 78-pt cap), too weak
+       to lift zero-affinity strangers above higher-affinity tracks in the 2000-row
+       pool, so they were cut before the engine ever saw them.
+
+  Fix: adds Block 3 "Popular Discoveries" (weight 15%) — unplayed tracks with
+  global_popularity >= 65, restricted to stranger/acquaintance artists, 1 per
+  artist with high jitter.  This is a direct "bangers you haven't heard" path
+  that bypasses genre filtering entirely.
+
+  Weights rebalanced: Block 0 55→50, Block 1 30→25, Block 2 15→10, Block 3 new 15.
+
+v9 fix — "New For You" discovery constraint was silently bypassed:
+  Root cause: artist_cap and jitter nodes were siblings of discovery inside the
+  genre node's children list.  The tree evaluator OR-unions siblings before
+  AND-ing with the parent:
+
+    evaluate([discovery, artist_cap, jitter])
+      = OR(stranger+acq tracks, ALL tracks, ALL tracks)
+      = ALL tracks           ← familiar artists' unplayed tracks included!
+
+    genre_result AND ALL = genre_result   ← discovery constraint vanishes
+
+  Fix: artist_cap and jitter are now children of discovery, not siblings:
+
+    evaluate([artist_cap, jitter])         = OR(ALL, ALL) = ALL
+    discovery_result AND ALL               = discovery_result  (stranger+acq only)
+    genre_result AND discovery_result      = correct intersection ✓
+
+  Before: familiar artists with 10+ plays could fill Block 0/1 with their
+  high-scoring (UNPLAYED_CAP = 78) unplayed tracks, starving true strangers
+  (final_score ≈ 37–50) of any playlist slots.
+
+  After: only stranger (0 plays) and acquaintance (1–9 plays) artists are
+  eligible for Blocks 0/1; familiar artists are reserved for Block 2 (anchors).
 """
 
 from __future__ import annotations
@@ -83,11 +143,18 @@ def _artist_cap(n: int = 3) -> dict:
 # ── Canonical block builders ──────────────────────────────────────────────────
 
 def _blocks_for_you() -> list[dict]:
-    """65% recently played + high score | 35% affinity-matched, not-recently-played."""
+    """65% recently played + high score | 35% affinity-matched, not-recently-played.
+
+    v12: raised quality floors now that random selection is in effect.
+      Block 0: score_min 63 → 75 — filters out mediocre played tracks that
+               previously only appeared through score-sort luck.
+      Block 1: affinity_min 60 → 70 — tightens the taste signal without
+               meaningfully shrinking the large unplayed candidate pool.
+    """
     return [
         dict(block_type="final_score", weight=65, position=0,
              params=_tree([
-                 _node("final_score", {"score_min": 63, "score_max": 99}, children=[
+                 _node("final_score", {"score_min": 75, "score_max": 99}, children=[
                      _node("play_recency", {"mode": "within", "days": 60}),
                      _cooldown(),
                      _artist_cap(3),
@@ -96,14 +163,14 @@ def _blocks_for_you() -> list[dict]:
              ])),
         dict(block_type="affinity", weight=35, position=1,
              params=_tree([
-                 _node("affinity", {"affinity_min": 60, "affinity_max": 100, "played_filter": "all"}, children=[
+                 _node("affinity", {"affinity_min": 70, "affinity_max": 100, "played_filter": "all"}, children=[
                      _node("global_popularity", {"popularity_min": 40, "popularity_max": 100}),
                      _node("play_recency", {"mode": "older", "days": 60}),
                      _cooldown(),
                      _artist_cap(2),
                      _jitter(0.15),
                  ]),
-                 _node("affinity", {"affinity_min": 60, "affinity_max": 100, "played_filter": "unplayed"}, children=[
+                 _node("affinity", {"affinity_min": 70, "affinity_max": 100, "played_filter": "unplayed"}, children=[
                      _node("global_popularity", {"popularity_min": 40, "popularity_max": 100}),
                      _artist_cap(2),
                      _jitter(0.15),
@@ -115,53 +182,78 @@ def _blocks_for_you() -> list[dict]:
 def _blocks_new_for_you() -> list[dict]:
     """
     Affinity-first discovery: pool from genres/artists the user likes,
-    ranked by score within that pool, with a genre-branching slot.
+    ranked by score within that pool, with a genre-branching slot and a
+    popularity-first catch-all for globally popular unheard tracks.
 
-      55% — Liked Genre Discovery
+      50% — Liked Genre Discovery
         Unplayed tracks in genres the user has affinity >= 40 for, from
         artists they don't know well yet (stranger + acquaintance tiers,
         familiar_pct=0).  Ranked by final_score (genre/artist affinity +
         popularity nudge baked in), 1 track per artist for breadth.
 
-      30% — Adjacent Genre Discovery
+      25% — Adjacent Genre Discovery
         Unplayed tracks in genres adjacent to the user's high-affinity
         genres, sourced via the GENRE_ADJACENCY map.  Same familiarity
         constraint as Block 0.  Slightly higher jitter for variety.
         Source genres (already liked) are excluded so this block branches
         outward, not backward.
 
-      15% — Familiar Anchors
+      10% — Familiar Anchors
         Small slice of recently played, high-scoring tracks so the
         playlist stays listenable.
+
+      15% — Popular Discoveries
+        Highly popular (global_popularity >= 65) unplayed tracks from
+        stranger/acquaintance artists, regardless of genre.  Directly
+        surfaces "bangers you haven't heard" that might be invisible to
+        the affinity path because their genre is an extra hop away or
+        their artist has no play history.
+
+    v9 node structure note:
+      artist_cap and jitter are children of discovery, not siblings.
+      Siblings are OR'd before AND-ing with their parent; if artist_cap/jitter
+      (which return ALL tracks) were siblings of discovery, the OR would
+      expand the set to ALL and completely negate the familiarity constraint.
+      Nesting them inside discovery ensures only stranger+acquaintance tracks
+      survive the AND-intersection with the parent genre block.
     """
     return [
         # Block 0: Liked genre discovery — affinity-first main engine
-        dict(block_type="genre", weight=55, position=0,
+        # Chain: genre (unplayed, affinity≥40) → discovery (stranger+acq) → [cap, jitter]
+        dict(block_type="genre", weight=50, position=0,
              params=_tree([
                  _node("genre", {
                      # No genre list = all genres; affinity_min narrows to only
                      # genres the user has meaningfully engaged with.
+                     # v12: raised 25→40. Distribution is bimodal (tracks either
+                     # match well or not at all), so pool size is nearly identical
+                     # but the intent is cleaner: require real genre affinity.
                      "genre_affinity_min": 40,
                      "played_filter": "unplayed",
                  }, children=[
-                     # Familiarity gate: strangers and acquaintances only.
-                     # familiar_pct=0 keeps heavy-rotation artists out entirely.
+                     # v9: discovery is the SOLE child so the AND-intersection
+                     # with genre enforces the familiarity gate properly.
+                     # artist_cap and jitter are nested inside so their ALL-track
+                     # returns don't OR-expand the sibling set.
                      _node("discovery", {
                          "stranger_pct": 55,
                          "acquaintance_pct": 45,
                          "familiar_pct": 0,
-                     }),
-                     _artist_cap(1),
-                     _jitter(0.15),
+                     }, children=[
+                         _artist_cap(1),
+                         _jitter(0.15),
+                     ]),
                  ]),
              ])),
 
         # Block 1: Adjacent genre discovery — genre branching slot
-        dict(block_type="genre_adjacent", weight=30, position=1,
+        # Chain: genre_adjacent (unplayed, affinity≥40) → discovery → [cap, jitter]
+        dict(block_type="genre_adjacent", weight=25, position=1,
              params=_tree([
                  _node("genre_adjacent", {
                      # Finds genres adjacent to those with affinity >= 40,
                      # automatically excluding the source genres themselves.
+                     # v12: raised 25→40 to match Block 0.
                      "genre_affinity_min": 40,
                      "played_filter": "unplayed",
                  }, children=[
@@ -169,20 +261,51 @@ def _blocks_new_for_you() -> list[dict]:
                          "stranger_pct": 60,
                          "acquaintance_pct": 40,
                          "familiar_pct": 0,
-                     }),
-                     _artist_cap(1),
-                     _jitter(0.18),
+                     }, children=[
+                         _artist_cap(1),
+                         _jitter(0.18),
+                     ]),
                  ]),
              ])),
 
         # Block 2: Familiar anchors — keeps the playlist listenable
-        dict(block_type="final_score", weight=15, position=2,
+        # Chain: final_score (70-99) → play_recency → cooldown → [cap, jitter]
+        # Each filter is a child of the previous so all three AND-narrow the result.
+        dict(block_type="final_score", weight=10, position=2,
              params=_tree([
-                 _node("final_score", {"score_min": 70, "score_max": 99}, children=[
-                     _node("play_recency", {"mode": "within", "days": 60}),
-                     _cooldown(),
-                     _artist_cap(2),
-                     _jitter(0.12),
+                 _node("final_score", {"score_min": 78, "score_max": 99}, children=[
+                     _node("play_recency", {"mode": "within", "days": 60}, children=[
+                         _node("cooldown", {"mode": "exclude_active"}, children=[
+                             _artist_cap(2),
+                             _jitter(0.12),
+                         ]),
+                     ]),
+                 ]),
+             ])),
+
+        # Block 3: Popular discoveries — "bangers you haven't heard" catch-all
+        # v10: directly surfaces globally popular unplayed tracks that may be invisible
+        # to Blocks 0/1 because their genre sits an extra hop from the user's affinity
+        # path (e.g. "soul" when user likes "pop", or "pop rock" when user likes
+        # "classic rock").  Popularity >= 65 ensures only well-regarded tracks surface.
+        # High jitter keeps the selection varied across playlist generations.
+        dict(block_type="global_popularity", weight=15, position=3,
+             params=_tree([
+                 _node("global_popularity", {
+                     # v12: raised 65→75 — slightly higher bar for "bangers you
+                     # haven't heard" so the random pick pulls from better tracks.
+                     "popularity_min": 75,
+                     "popularity_max": 100,
+                     "played_filter": "unplayed",
+                 }, children=[
+                     _node("discovery", {
+                         "stranger_pct": 70,
+                         "acquaintance_pct": 30,
+                         "familiar_pct": 0,
+                     }, children=[
+                         _artist_cap(1),
+                         _jitter(0.22),
+                     ]),
                  ]),
              ])),
     ]
@@ -299,9 +422,9 @@ def migrate_system_templates(db) -> None:
     - Never changes template.id — UserPlaylist.template_id foreign keys
       remain valid; no user playlists are affected.
     - Never touches user-created templates (is_system=False).
-    - Idempotent: "New For You" migration is detected by checking whether
-      any block uses block_type="global_popularity" at position=1 (the v7
-      mega-hits slot).  If already present, the template is skipped.
+    - Idempotent: "New For You" v10 migration checks whether any block has
+      block_type == "global_popularity".  If present, already v10 — skipped.
+      Upgrades v7/v8/v9 installations to v10 in one pass.
     - Per-template transactions: failure on one rolls back; others complete.
     """
     from models import PlaylistTemplate, PlaylistBlock
@@ -334,24 +457,86 @@ def migrate_system_templates(db) -> None:
             PlaylistBlock.template_id == template.id
         ).all()
 
-        # v8 sentinel: the new "New For You" design is identified by having a
-        # genre_adjacent block at position 1.  Prior designs used:
-        #   discovery (v5), novelty (v6), global_popularity (v7).
+        # ── Per-template latest-design sentinels ─────────────────────────────
+        # Each sentinel checks a value that changes with every design revision so
+        # the migrator runs exactly once per version bump and no-ops thereafter.
         if name == "New For You":
-            has_v8_design = any(
-                b.block_type == "genre_adjacent" and b.position == 1
-                for b in existing_blocks
+            def _genre_aff_min(blocks) -> float:
+                """Return genre_affinity_min from the first genre block, or 0 if absent."""
+                for b in blocks:
+                    if b.block_type == "genre":
+                        try:
+                            chain_data = (json.loads(b.params) if isinstance(b.params, str)
+                                          else (b.params or {}))
+                            ft = chain_data.get("filter_tree") or []
+                            if ft:
+                                return float(ft[0].get("params", {}).get("genre_affinity_min", 0))
+                        except Exception:
+                            pass
+                return 0.0
+
+            def _nfy_anchor_floor(blocks) -> float:
+                """Return score_min from the final_score anchor block (Block 2), or 0."""
+                for b in blocks:
+                    if b.block_type == "final_score":
+                        try:
+                            chain_data = (json.loads(b.params) if isinstance(b.params, str)
+                                          else (b.params or {}))
+                            ft = chain_data.get("filter_tree") or []
+                            if ft:
+                                return float(ft[0].get("params", {}).get("score_min", 0))
+                        except Exception:
+                            pass
+                return 0.0
+
+            # v12: genre_affinity_min raised back to 40 (distribution is bimodal
+            # so pool size is unchanged), anchor floor raised 70→78.
+            # Composite sentinel: both must match to be considered current.
+            is_latest = (
+                _genre_aff_min(existing_blocks) >= 40
+                and _nfy_anchor_floor(existing_blocks) >= 78
             )
-            if has_v8_design:
+            if is_latest:
                 log.debug(
-                    "migrate_system_templates: '%s' already on v8 design — skipping.", name
+                    "migrate_system_templates: '%s' already on latest design — skipping.", name
                 )
                 skipped += 1
                 continue
             log.info(
-                "migrate_system_templates: '%s' (id=%d) — upgrading to v8 "
-                "affinity-first design.", name, template.id,
+                "migrate_system_templates: '%s' (id=%d) — upgrading to v12 "
+                "(genre_affinity_min→40, anchor floor→78, pop discoveries→75).",
+                name, template.id,
             )
+
+        elif name == "For You":
+            def _fy_score_min(blocks) -> float:
+                """Return score_min from the final_score block (Block 0), or 0."""
+                for b in blocks:
+                    if b.block_type == "final_score":
+                        try:
+                            chain_data = (json.loads(b.params) if isinstance(b.params, str)
+                                          else (b.params or {}))
+                            ft = chain_data.get("filter_tree") or []
+                            if ft:
+                                return float(ft[0].get("params", {}).get("score_min", 0))
+                        except Exception:
+                            pass
+                return 0.0
+
+            # v12: score_min raised 63→75, affinity_min raised 60→70.
+            is_latest = _fy_score_min(existing_blocks) >= 75
+            if is_latest:
+                log.debug(
+                    "migrate_system_templates: '%s' already on latest design — skipping.", name
+                )
+                skipped += 1
+                continue
+            log.info(
+                "migrate_system_templates: '%s' (id=%d) — upgrading to v12 "
+                "(score_min 63→75, affinity_min 60→70).",
+                name, template.id,
+            )
+
         else:
             already_migrated = any(
                 "filter_tree" in (
