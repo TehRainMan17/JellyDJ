@@ -12,12 +12,11 @@
 // user doesn't need to manually refresh Spotify/Tidal/YTM pages.
 chrome.runtime.onInstalled.addListener(() => {
   const patterns = [
-    'https://open.spotify.com/playlist/*',
-    'https://open.spotify.com/collection/tracks',
-    'https://tidal.com/browse/playlist/*',
-    'https://listen.tidal.com/playlist/*',
-    'https://music.youtube.com/playlist*',
-    'https://www.youtube.com/playlist*',
+    'https://open.spotify.com/*',
+    'https://tidal.com/*',
+    'https://listen.tidal.com/*',
+    'https://music.youtube.com/*',
+    'https://www.youtube.com/*',
   ];
   for (const pattern of patterns) {
     chrome.tabs.query({ url: pattern }, (tabs) => {

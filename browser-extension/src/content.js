@@ -495,9 +495,11 @@
 
   // Debounced MutationObserver — Spotify's SPA fires thousands of mutations;
   // we only need to check once after things settle down.
+  // Uses trailing-edge debounce so tryInject fires after the last mutation,
+  // giving Spotify's React time to fully render the new page.
   let debounceTimer = null;
   const observer = new MutationObserver(() => {
-    if (debounceTimer) return;
+    clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
       tryInject();
@@ -505,6 +507,21 @@
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // Also re-check on popstate for SPA navigation
+  // popstate fires on browser back/forward, but Spotify's in-app navigation
+  // uses history.pushState — patch it so we detect those URL changes too.
+  const _origPushState = history.pushState.bind(history);
+  history.pushState = function (...args) {
+    _origPushState(...args);
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => { debounceTimer = null; tryInject(); }, 500);
+  };
+  const _origReplaceState = history.replaceState.bind(history);
+  history.replaceState = function (...args) {
+    _origReplaceState(...args);
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => { debounceTimer = null; tryInject(); }, 500);
+  };
+
+  // Also re-check on popstate for browser back/forward navigation
   window.addEventListener('popstate', tryInject);
 })();
