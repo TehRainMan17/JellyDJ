@@ -10,6 +10,7 @@ import { useJobStatus } from '../hooks/useJobStatus.js'
 import JobProgress from '../components/JobProgress.jsx'
 import { api } from '../lib/api.js'
 import { useAuth } from '../contexts/AuthContext.jsx'
+import UserAvatar from '../components/UserAvatar.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
@@ -562,16 +563,18 @@ function StatCard({ icon: Icon, label, value, sub, color = 'var(--accent)', dela
 // ── User card ─────────────────────────────────────────────────────────────────
 function UserCard({ user }) {
   const ok = user.status === 'ok'
-  const initial = user.username?.[0]?.toUpperCase() || '?'
   const hue = user.username.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 360
   const avatarColor = `hsl(${hue},60%,55%)`
   return (
     <div className="card space-y-3 anim-fade-up">
       <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold flex-shrink-0"
-             style={{ background:`${avatarColor}20`, border:`1.5px solid ${avatarColor}40`, color:avatarColor }}>
-          {initial}
-        </div>
+        <UserAvatar
+          jellyfinUserId={user.user_id}
+          username={user.username}
+          className="w-10 h-10"
+          style={{ border:`1.5px solid ${avatarColor}40` }}
+          fallbackStyle={{ background:`${avatarColor}20`, color:avatarColor }}
+        />
         <div className="flex-1 min-w-0">
           <div className="font-semibold truncate" style={{ color:'var(--text-primary)' }}>{user.username}</div>
           <div className={`text-xs ${ok ? 'text-[var(--accent)]' : user.status === 'error' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
@@ -723,7 +726,7 @@ export default function Dashboard() {
                 <Loader2 size={20} className="animate-spin" />
               </div>
             : <div className="space-y-3 stagger">
-                {users.map(u => <UserCard key={u.jellyfin_user_id} user={u} />)}
+                {users.map(u => <UserCard key={u.user_id} user={u} />)}
               </div>
           }
 

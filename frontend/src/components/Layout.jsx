@@ -3,11 +3,12 @@ import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, ListMusic, Telescope, Settings,
-  Plug, BarChart2, Menu, X, ChevronRight, Ban, LogOut, User, UserCog,
+  Plug, BarChart2, Menu, X, ChevronRight, Ban, LogOut, UserCog,
   DatabaseBackup, ArrowDownToLine,
 } from 'lucide-react'
 import logoUrl from '/logo-64.png'
 import { useAuth } from '../contexts/AuthContext.jsx'
+import UserAvatar from './UserAvatar.jsx'
 
 // Nav items — mark admin-only ones
 const NAV = [
@@ -85,10 +86,13 @@ function SidebarContent({ onClose }) {
         {user && (
           <div className="flex items-center gap-2 px-3 py-2 rounded-xl"
                style={{ background: 'rgba(255,255,255,0.03)' }}>
-            <div className="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0"
-                 style={{ background: 'var(--accent-soft)', border: '1px solid rgba(83,236,252,0.2)' }}>
-              <User size={11} style={{ color: 'var(--accent)' }} />
-            </div>
+            <UserAvatar
+              jellyfinUserId={user.user_id}
+              username={user.username}
+              className="w-6 h-6"
+              style={{ border: '1px solid rgba(83,236,252,0.2)' }}
+              fallbackStyle={{ background: 'var(--accent-soft)', color: 'var(--accent)', fontSize: 10 }}
+            />
             <div className="flex-1 min-w-0">
               <div className="text-xs font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
                 {user.username}

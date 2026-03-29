@@ -14,6 +14,7 @@ import {
   Settings2, Save, X, ShieldCheck, Shield,
 } from 'lucide-react'
 import { api } from '../lib/api'
+import UserAvatar from '../components/UserAvatar.jsx'
 
 // ── Interval options ──────────────────────────────────────────────────────────
 
@@ -468,10 +469,13 @@ function UserRow({ user, onDeleted }) {
       onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
 
       {/* Avatar */}
-      <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
-        style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
-        {(user.jellyfin_username || user.jellydj_username || '?')[0]?.toUpperCase()}
-      </div>
+      <UserAvatar
+        jellyfinUserId={user.jellyfin_user_id}
+        username={user.jellyfin_username || user.jellydj_username}
+        className="w-8 h-8"
+        style={{ border: '1px solid var(--border)' }}
+        fallbackStyle={{ background: 'var(--bg-overlay)', color: 'var(--text-secondary)' }}
+      />
 
       {/* Name + meta */}
       <div className="flex-1 min-w-0">

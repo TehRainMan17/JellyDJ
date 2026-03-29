@@ -311,7 +311,6 @@ def get_billboard(limit: int = 5, _: UserContext = Depends(get_current_user), db
     from services.indexer import _normalise_for_match
 
     def _artist_in_library(artist: str) -> bool:
-        norm = _normalise_for_match(artist)
         # Direct match first
         match = db.query(LibraryTrack.id).filter(
             LibraryTrack.missing_since.is_(None),
@@ -326,6 +325,24 @@ def get_billboard(limit: int = 5, _: UserContext = Depends(get_current_user), db
         ).first()
         return bool(match2)
 
+    def _track_in_library(artist: str, title: str) -> bool:
+        """Check if a specific track title is in the library, using normalised matching."""
+        norm_title = _normalise_for_match(title)
+        norm_artist = _normalise_for_match(artist)
+        candidates = (
+            db.query(LibraryTrack.track_name, LibraryTrack.artist_name, LibraryTrack.album_artist)
+            .filter(LibraryTrack.missing_since.is_(None))
+            .filter(LibraryTrack.track_name.ilike(f"%{title}%"))
+            .all()
+        )
+        for row in candidates:
+            if _normalise_for_match(row.track_name) == norm_title:
+                if (norm_artist in _normalise_for_match(row.artist_name)
+                        or norm_artist in _normalise_for_match(row.album_artist)
+                        or _normalise_for_match(row.artist_name) in norm_artist):
+                    return True
+        return False
+
     result = []
     for r in rows:
         # Try iTunes first, fall back to artist cache
@@ -339,7 +356,10 @@ def get_billboard(limit: int = 5, _: UserContext = Depends(get_current_user), db
             position_change = r.last_week_position - r.rank  # +ve = improved
 
         # Live library check — more accurate than the weekly sync match
-        in_library = bool(r.jellyfin_item_id) or _artist_in_library(r.artist)
+        # _track_in_library catches cases where the artist name doesn't match
+        # exactly (feat. variations, slight spelling differences) but the song
+        # title is present in the library.
+        in_library = bool(r.jellyfin_item_id) or _artist_in_library(r.artist) or _track_in_library(r.artist, r.title)
 
         result.append({
             "rank":               r.rank,

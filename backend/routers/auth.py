@@ -41,7 +41,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import io
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from collections import defaultdict
@@ -562,4 +565,42 @@ def me(user: UserContext = Depends(get_current_user)):
         user_id=user.user_id,
         username=user.username,
         is_admin=user.is_admin,
+    )
+
+
+@router.get("/avatar/{jellyfin_user_id}")
+async def user_avatar(
+    jellyfin_user_id: str,
+    _user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Proxy the Jellyfin profile image for the given user.
+    Returns the image bytes on success, 404 if the user has no profile image.
+    """
+    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+    if not row or not row.base_url or not row.api_key_encrypted:
+        raise HTTPException(status_code=404, detail="Jellyfin not configured")
+
+    base_url = row.base_url.rstrip("/")
+    api_key = decrypt(row.api_key_encrypted)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{base_url}/Users/{jellyfin_user_id}/Images/Primary",
+                headers={"X-Emby-Token": api_key},
+                params={"maxWidth": 128, "quality": 80},
+            )
+    except httpx.RequestError:
+        raise HTTPException(status_code=404, detail="No profile image")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=404, detail="No profile image")
+
+    content_type = resp.headers.get("content-type", "image/jpeg")
+    return StreamingResponse(
+        io.BytesIO(resp.content),
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=3600"},
     )
