@@ -483,6 +483,10 @@
   //
   // NOTE: YouTube serves audio at 128–160 kbps; the 320 kbps MP3 is a
   // re-encode at a higher container bitrate, not a true quality gain.
+  //
+  // Placement: tries to embed inline to the left of the thumbs up/down buttons.
+  // Falls back to a floating bottom-right button if the actions bar isn't ready.
+  // Hidden while the player is in fullscreen mode.
 
   function resetRipButton(btn) {
     btn.innerHTML = JELLYDJ_LOGO_SRC
@@ -496,12 +500,24 @@
     btn.innerHTML = JELLYDJ_ICON + '<span>' + text + '</span>';
   }
 
-  function injectRipButton() {
-    if (document.getElementById('jellydj-rip-btn')) return;
+  // Locate the container holding YouTube's like/dislike buttons.
+  function findYouTubeActionsBar() {
+    // Modern YouTube: #top-level-buttons-computed holds the like/dislike group
+    const topLevel = document.querySelector('#top-level-buttons-computed');
+    if (topLevel) return topLevel;
 
-    const btn = document.createElement('button');
-    btn.id = 'jellydj-rip-btn';
-    btn.innerHTML = JELLYDJ_ICON + '<span>Rip to JellyDJ</span>';
+    // Older / alternate structure
+    const likeRenderer = document.querySelector('ytd-like-button-renderer');
+    if (likeRenderer?.parentElement) return likeRenderer.parentElement;
+
+    // Newer segmented like/dislike widget
+    const segmented = document.querySelector('segmented-like-dislike-button-view-model');
+    if (segmented?.parentElement) return segmented.parentElement;
+
+    return null;
+  }
+
+  function applyRipFloatingStyle(btn) {
     btn.style.cssText = `
       position: fixed;
       bottom: 24px;
@@ -520,10 +536,104 @@
       box-shadow: 0 4px 12px rgba(0,0,0,0.3);
       transition: background 0.15s;
     `;
+  }
+
+  function injectIntoYouTubeActions(btn) {
+    const container = findYouTubeActionsBar();
+    if (!container) return false;
+
+    btn.style.cssText = `
+      display: inline-flex;
+      align-items: center;
+      padding: 0 16px;
+      margin-right: 8px;
+      background: #7c3aed;
+      color: white;
+      border: none;
+      border-radius: 18px;
+      font-size: 14px;
+      font-weight: 500;
+      font-family: "YouTube Sans", "Roboto", sans-serif;
+      cursor: pointer;
+      height: 36px;
+      white-space: nowrap;
+      transition: background 0.15s;
+      flex-shrink: 0;
+    `;
     btn.onmouseenter = () => { if (!btn.disabled) btn.style.background = '#6d28d9'; };
     btn.onmouseleave = () => { if (!btn.disabled) btn.style.background = '#7c3aed'; };
+
+    // Insert as first child so it sits to the left of the thumbs buttons
+    container.insertBefore(btn, container.firstChild);
+    return true;
+  }
+
+  // Show/hide the rip button based on fullscreen state.
+  function updateRipButtonVisibility() {
+    const btn = document.getElementById('jellydj-rip-btn');
+    if (!btn) return;
+    const moviePlayer = document.getElementById('movie_player');
+    const isFullscreen = !!document.fullscreenElement ||
+      moviePlayer?.classList.contains('ytp-fullscreen');
+    btn.style.display = isFullscreen ? 'none' : 'inline-flex';
+  }
+
+  // Attach fullscreen listener once per page load.
+  if (!window.__jellydj_fullscreen_wired) {
+    window.__jellydj_fullscreen_wired = true;
+    document.addEventListener('fullscreenchange', updateRipButtonVisibility);
+    // YouTube fires ytp-fullscreen class changes without triggering the native
+    // fullscreen API when the mini-player or cinema mode is used, so also poll
+    // via a class observer on #movie_player once it exists.
+    const wireFSObserver = () => {
+      const player = document.getElementById('movie_player');
+      if (!player) return;
+      new MutationObserver(updateRipButtonVisibility)
+        .observe(player, { attributeFilter: ['class'] });
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', wireFSObserver);
+    } else {
+      wireFSObserver();
+    }
+  }
+
+  function injectRipButton() {
+    const existing = document.getElementById('jellydj-rip-btn');
+
+    if (existing && existing.isConnected) {
+      // Already inline and still properly placed — nothing to do
+      if (existing.dataset.inline === 'true') {
+        if (existing.closest('#top-level-buttons-computed, ytd-like-button-renderer, segmented-like-dislike-button-view-model')) {
+          return;
+        }
+        // Container was destroyed by YT re-render — remove and re-inject below
+        existing.remove();
+      } else {
+        // Currently floating — try to upgrade to inline
+        if (injectIntoYouTubeActions(existing)) {
+          existing.dataset.inline = 'true';
+        }
+        return;
+      }
+    } else if (existing) {
+      existing.remove();
+    }
+
+    const btn = document.createElement('button');
+    btn.id = 'jellydj-rip-btn';
+    btn.innerHTML = JELLYDJ_ICON + '<span>Rip to JellyDJ</span>';
     btn.onclick = handleRip;
-    document.body.appendChild(btn);
+
+    if (injectIntoYouTubeActions(btn)) {
+      btn.dataset.inline = 'true';
+    } else {
+      // Actions bar not rendered yet — use floating fallback
+      applyRipFloatingStyle(btn);
+      btn.onmouseenter = () => { if (!btn.disabled) btn.style.background = '#6d28d9'; };
+      btn.onmouseleave = () => { if (!btn.disabled) btn.style.background = '#7c3aed'; };
+      document.body.appendChild(btn);
+    }
   }
 
   async function handleRip() {
@@ -541,7 +651,7 @@
     }
 
     // POST to JellyDJ via background.js to get a job ID
-    let jobId, base, token;
+    let jobId;
     try {
       const result = await new Promise((resolve, reject) => {
         const tid = setTimeout(() => reject(new Error('Timed out — is JellyDJ running?')), 15000);
@@ -561,11 +671,6 @@
       return;
     }
 
-    // Retrieve config so we can poll the status endpoint directly
-    const cfg = await new Promise(r => chrome.storage.local.get(['jellydjUrl', 'jellydjToken'], r));
-    base  = (cfg.jellydjUrl || '').replace(/\/$/, '');
-    token = cfg.jellydjToken || '';
-
     const STATUS_LABELS = {
       queued:       'Queued…',
       fetching_info:'Reading metadata…',
@@ -574,7 +679,10 @@
       scanning:     'Updating Jellyfin library…',
     };
 
-    // Poll every 3 s for up to 3 minutes
+    // Poll every 3 s for up to 3 minutes.
+    // Routing through background.js avoids mixed-content blocks: YouTube is
+    // served over HTTPS and a direct fetch() to an HTTP JellyDJ URL is blocked
+    // by Chrome.  The service worker has no such restriction.
     let attempts = 0;
     const MAX = 60;
 
@@ -587,32 +695,45 @@
         return;
       }
 
+      let result;
       try {
-        const resp = await fetch(`${base}/api/import/youtube-rip/status/${jobId}`, {
-          headers: token ? { 'X-JellyDJ-Key': token } : {},
+        result = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ action: 'pollRipStatus', jobId }, (resp) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(resp);
+          });
         });
-        const job = await resp.json();
-
-        if (job.status === 'done') {
-          const label = job.title ? `Ripped: ${job.title}` : 'Ripped!';
-          setRipText(btn, label);
-          btn.style.background = '#16a34a';
-          btn.disabled = false;
-          setTimeout(() => resetRipButton(btn), 8000);
-        } else if (job.status === 'error') {
-          setRipText(btn, 'Failed — check JellyDJ logs');
-          btn.style.background = '#dc2626';
-          btn.disabled = false;
-          setTimeout(() => resetRipButton(btn), 6000);
-        } else {
-          setRipText(btn, STATUS_LABELS[job.status] || 'Processing…');
-          setTimeout(poll, 3000);
-        }
       } catch {
+        setRipText(btn, 'Extension error — refresh page');
+        btn.style.background = '#dc2626';
+        btn.disabled = false;
+        setTimeout(() => resetRipButton(btn), 4000);
+        return;
+      }
+
+      if (!result.ok) {
         setRipText(btn, 'Connection lost');
         btn.style.background = '#dc2626';
         btn.disabled = false;
         setTimeout(() => resetRipButton(btn), 4000);
+        return;
+      }
+
+      const job = result.job;
+      if (job.status === 'done') {
+        const label = job.title ? `Ripped: ${job.title}` : 'Ripped!';
+        setRipText(btn, label);
+        btn.style.background = '#16a34a';
+        btn.disabled = false;
+        setTimeout(() => resetRipButton(btn), 8000);
+      } else if (job.status === 'error') {
+        setRipText(btn, 'Failed — check JellyDJ logs');
+        btn.style.background = '#dc2626';
+        btn.disabled = false;
+        setTimeout(() => resetRipButton(btn), 6000);
+      } else {
+        setRipText(btn, STATUS_LABELS[job.status] || 'Processing…');
+        setTimeout(poll, 3000);
       }
     };
 

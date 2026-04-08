@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import urllib.parse
 import uuid
@@ -47,6 +49,17 @@ _CONTAINER_RIP_DIR = Path("/music/youtube-rips")
 # In-memory job store (lives for the process lifetime; survives requests but
 # not container restarts).  Keys are UUID job IDs.
 _jobs: dict[str, dict] = {}
+
+# Maximum number of concurrent yt-dlp/ffmpeg workers.  Each rip is CPU- and
+# memory-intensive; allowing unbounded parallelism can OOM the container or
+# overload Jellyfin with back-to-back library refresh calls.
+_MAX_CONCURRENT_RIPS = 2
+_rip_semaphore = threading.Semaphore(_MAX_CONCURRENT_RIPS)
+
+# Maps a clean video URL → job_id for any job that is still in-flight.
+# Prevents the same video from being queued multiple times simultaneously.
+_active_urls: dict[str, str] = {}
+_active_urls_lock = threading.Lock()
 
 # ── URL validation ────────────────────────────────────────────────────────────
 
@@ -143,6 +156,22 @@ def start_rip(
             f"expected container path: {_CONTAINER_RIP_DIR}",
         )
 
+    # Deduplicate: if this exact video is already being ripped, return the
+    # existing job so the caller can poll it instead of spawning a duplicate.
+    with _active_urls_lock:
+        existing_job_id = _active_urls.get(clean_url)
+        if existing_job_id and existing_job_id in _jobs:
+            log.info("YouTube rip already in progress: job=%s url=%s", existing_job_id, clean_url)
+            return {"job_id": existing_job_id, "status": _jobs[existing_job_id]["status"]}
+
+    # Enforce concurrency cap — reject rather than queue unboundedly.
+    if not _rip_semaphore.acquire(blocking=False):
+        raise HTTPException(
+            429,
+            f"Too many rips in progress (max {_MAX_CONCURRENT_RIPS}). "
+            "Wait for a current job to finish before starting another.",
+        )
+
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {
         "status": "queued",
@@ -151,6 +180,9 @@ def start_rip(
         "path":   None,
         "error":  None,
     }
+
+    with _active_urls_lock:
+        _active_urls[clean_url] = job_id
 
     t = threading.Thread(
         target=_run_rip,
@@ -177,6 +209,17 @@ def rip_status(job_id: str, _: UserContext = Depends(get_user_from_api_key_or_jw
 def _run_rip(job_id: str, url: str) -> None:
     job = _jobs[job_id]
 
+    try:
+        _run_rip_inner(job_id, url, job)
+    finally:
+        # Always release the concurrency slot and deregister the URL so future
+        # requests for the same video are accepted again.
+        _rip_semaphore.release()
+        with _active_urls_lock:
+            _active_urls.pop(url, None)
+
+
+def _run_rip_inner(job_id: str, url: str, job: dict) -> None:
     try:
         import yt_dlp  # already in requirements.txt
     except ImportError:
@@ -217,77 +260,86 @@ def _run_rip(job_id: str, url: str) -> None:
     job["artist"] = artist
     job["title"]  = title
 
-    # ── Phase 2: download + convert ───────────────────────────────────────────
+    # ── Phase 2: download + convert to a temp directory ──────────────────────
+    # We intentionally write to /tmp first so that Jellyfin never sees a
+    # partial or in-progress file.  The completed MP3 is moved atomically into
+    # the bind-mounted library directory only after yt-dlp + ffmpeg finish.
     job["status"] = "downloading"
 
-    artist_dir = _CONTAINER_RIP_DIR / artist
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"yt-rip-{job_id[:8]}-"))
     try:
-        artist_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        job["status"] = "error"
-        job["error"] = f"Cannot create output directory {artist_dir}: {exc}"
-        return
+        out_template = str(tmp_dir / f"{title}.%(ext)s")
+        tmp_mp3      = tmp_dir / f"{title}.mp3"
 
-    # yt-dlp writes a temp file then renames; the final MP3 name is known.
-    out_template = str(artist_dir / f"{title}.%(ext)s")
-    final_mp3    = artist_dir / f"{title}.mp3"
+        dl_opts: dict = {
+            "format":      "bestaudio/best",
+            "outtmpl":     out_template,
+            "noplaylist":  True,
+            "quiet":       True,
+            "no_warnings": True,
+            # postprocessors run in order:
+            #   1. Extract audio and re-encode to 320 kbps MP3 CBR via ffmpeg
+            #   2. Write ID3 tags (title, artist, uploader URL) into the MP3
+            "postprocessors": [
+                {
+                    "key":              "FFmpegExtractAudio",
+                    "preferredcodec":   "mp3",
+                    # "320" → fixed 320 kbps CBR.  Note: source audio from YouTube
+                    # is typically 128–160 kbps opus; this is a re-encode at a higher
+                    # container bitrate, not a quality gain from the source stream.
+                    "preferredquality": "320",
+                },
+                {
+                    "key":          "FFmpegMetadata",
+                    "add_metadata": True,
+                },
+            ],
+        }
 
-    dl_opts: dict = {
-        "format":      "bestaudio/best",
-        "outtmpl":     out_template,
-        "noplaylist":  True,
-        "quiet":       True,
-        "no_warnings": True,
-        # postprocessors run in order:
-        #   1. Extract audio and re-encode to 320 kbps MP3 CBR via ffmpeg
-        #   2. Write ID3 tags (title, artist, uploader URL) into the MP3
-        "postprocessors": [
-            {
-                "key":              "FFmpegExtractAudio",
-                "preferredcodec":   "mp3",
-                # "320" → fixed 320 kbps CBR.  Note: source audio from YouTube
-                # is typically 128–160 kbps opus; this is a re-encode at a higher
-                # container bitrate, not a quality gain from the source stream.
-                "preferredquality": "320",
-            },
-            {
-                "key":          "FFmpegMetadata",
-                "add_metadata": True,
-            },
-        ],
-    }
-
-    try:
-        job["status"] = "converting"
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-            ydl.download([url])
-    except yt_dlp.utils.DownloadError as exc:
-        log.warning("yt-dlp download failed for %s: %s", url, exc)
-        job["status"] = "error"
-        job["error"] = str(exc)
-        return
-    except Exception as exc:
-        log.exception("Unexpected error ripping %s", url)
-        job["status"] = "error"
-        job["error"] = f"Unexpected error: {exc}"
-        return
-
-    if not final_mp3.exists():
-        # yt-dlp may have chosen a slightly different filename; list the dir
-        # to find the actual output.
-        candidates = list(artist_dir.glob(f"{title}.*"))
-        if candidates:
-            final_mp3 = candidates[0]
-        else:
+        try:
+            job["status"] = "converting"
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                ydl.download([url])
+        except yt_dlp.utils.DownloadError as exc:
+            log.warning("yt-dlp download failed for %s: %s", url, exc)
             job["status"] = "error"
-            job["error"] = "Download appeared to succeed but no output file found"
+            job["error"] = str(exc)
+            return
+        except Exception as exc:
+            log.exception("Unexpected error ripping %s", url)
+            job["status"] = "error"
+            job["error"] = f"Unexpected error: {exc}"
             return
 
-    job["path"] = str(final_mp3)
+        if not tmp_mp3.exists():
+            # yt-dlp may have chosen a slightly different filename.
+            candidates = list(tmp_dir.glob(f"{title}.*"))
+            if candidates:
+                tmp_mp3 = candidates[0]
+            else:
+                job["status"] = "error"
+                job["error"] = "Download appeared to succeed but no output file found"
+                return
 
-    # ── Phase 3: trigger Jellyfin library refresh ─────────────────────────────
-    job["status"] = "scanning"
-    _trigger_jellyfin_refresh()
+        # ── Phase 3: move completed file into the Jellyfin-watched directory ──
+        # Only after a successful encode do we touch the bind mount, so Jellyfin
+        # will never scan an incomplete file.
+        artist_dir = _CONTAINER_RIP_DIR / artist
+        try:
+            artist_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            job["status"] = "error"
+            job["error"] = f"Cannot create output directory {artist_dir}: {exc}"
+            return
+
+        final_mp3 = artist_dir / tmp_mp3.name
+        shutil.move(str(tmp_mp3), str(final_mp3))
+
+    finally:
+        # Always clean up the temp directory, even on error paths.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    job["path"] = str(final_mp3)
 
     job["status"] = "done"
     log.info("YouTube rip complete: %s / %s → %s", artist, title, final_mp3)

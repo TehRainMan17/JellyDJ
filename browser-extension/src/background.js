@@ -39,6 +39,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleRip(message.url).then(sendResponse);
     return true;
   }
+  if (message.action === 'pollRipStatus') {
+    handlePollRipStatus(message.jobId).then(sendResponse);
+    return true;
+  }
   if (message.action === 'saveConfig') {
     chrome.storage.local.set({ jellydjUrl: message.url, jellydjToken: message.token }, () => {
       sendResponse({ ok: true });
@@ -52,6 +56,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 });
+
+async function handlePollRipStatus(jobId) {
+  const { jellydjUrl, jellydjToken } = await chrome.storage.local.get(['jellydjUrl', 'jellydjToken']);
+  const base = (jellydjUrl || '').replace(/\/$/, '');
+  if (!base) return { ok: false, error: 'JellyDJ URL not configured' };
+
+  try {
+    const resp = await fetch(`${base}/api/import/youtube-rip/status/${jobId}`, {
+      headers: jellydjToken ? { 'X-JellyDJ-Key': jellydjToken } : {},
+    });
+    if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+    const job = await resp.json();
+    return { ok: true, job };
+  } catch (err) {
+    return { ok: false, error: err.message || 'Network error' };
+  }
+}
 
 async function handleRip(url) {
   const { jellydjUrl, jellydjToken } = await chrome.storage.local.get(['jellydjUrl', 'jellydjToken']);
