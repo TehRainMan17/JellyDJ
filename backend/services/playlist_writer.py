@@ -13,10 +13,15 @@ helpers below to write the result to Jellyfin.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
 import httpx
+
+# Brief pause between Jellyfin write requests (playlist batches, item deletes)
+# to avoid saturating Jellyfin's thread pool during bulk operations.
+_WRITE_SLEEP_SECS = 0.25
 from sqlalchemy.orm import Session
 
 from models import ConnectionSettings
@@ -154,6 +159,7 @@ async def _clear_playlist(
             if r.status_code not in (200, 204):
                 log.warning(f"  Single delete failed for entry {eid}: HTTP {r.status_code}")
                 all_ok = False
+            await asyncio.sleep(_WRITE_SLEEP_SECS)
         return all_ok
 
 
@@ -177,6 +183,8 @@ async def _add_to_playlist(
             if resp.status_code not in (200, 204):
                 log.warning(f"Add to playlist batch failed: {resp.status_code} — {resp.text[:200]}")
                 return False
+            if i + 100 < len(item_ids):
+                await asyncio.sleep(_WRITE_SLEEP_SECS)
     return True
 
 

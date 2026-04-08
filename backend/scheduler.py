@@ -443,6 +443,10 @@ async def _run_user_playlist_autopush():
                     playlist.id, jf_name, len(track_ids), action,
                 )
 
+                # Brief pause between playlist pushes so Jellyfin can handle
+                # other requests (auth, playback) between bulk write operations.
+                await asyncio.sleep(0.5)
+
             except Exception as exc:
                 log.error(
                     "UserPlaylist autopush failed for id=%d: %s", playlist.id, exc, exc_info=True

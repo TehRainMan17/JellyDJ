@@ -501,17 +501,27 @@
   }
 
   // Locate the container holding YouTube's like/dislike buttons.
+  // MUST be scoped to the primary video section — YouTube renders the same
+  // #top-level-buttons-computed element inside every sidebar video card too,
+  // and document.querySelector() returns the first one in DOM order, which is
+  // often a sidebar card rather than the main video action bar.
   function findYouTubeActionsBar() {
-    // Modern YouTube: #top-level-buttons-computed holds the like/dislike group
-    const topLevel = document.querySelector('#top-level-buttons-computed');
+    // Scope to the primary column of the watch page so we never pick up a
+    // sidebar/recommendation card's action menu.
+    const scope = document.querySelector('ytd-watch-flexy #primary, ytd-watch-flexy') ||
+                  document.querySelector('#primary-inner') ||
+                  document;
+
+    // Modern YouTube: ytd-menu-renderer inside the video info section
+    const topLevel = scope.querySelector('#top-level-buttons-computed');
     if (topLevel) return topLevel;
 
-    // Older / alternate structure
-    const likeRenderer = document.querySelector('ytd-like-button-renderer');
+    // Older structure: ytd-like-button-renderer's parent row
+    const likeRenderer = scope.querySelector('ytd-like-button-renderer');
     if (likeRenderer?.parentElement) return likeRenderer.parentElement;
 
     // Newer segmented like/dislike widget
-    const segmented = document.querySelector('segmented-like-dislike-button-view-model');
+    const segmented = scope.querySelector('segmented-like-dislike-button-view-model');
     if (segmented?.parentElement) return segmented.parentElement;
 
     return null;
@@ -598,6 +608,41 @@
     }
   }
 
+  // Targeted observer that fires the moment YouTube's action bar appears in the
+  // DOM.  No debounce — we inject inline as soon as the container is ready.
+  // Kept separate from the general MutationObserver so YouTube's constant DOM
+  // churn (player progress, recommendations) cannot delay or prevent injection.
+  let ytActionsWaiter = null;
+
+  function cancelYtActionsWaiter() {
+    if (ytActionsWaiter) { ytActionsWaiter.disconnect(); ytActionsWaiter = null; }
+  }
+
+  function waitForYouTubeActionsBar(btn) {
+    cancelYtActionsWaiter();
+    ytActionsWaiter = new MutationObserver(() => {
+      const container = findYouTubeActionsBar();
+      if (!container) return;
+      cancelYtActionsWaiter();
+      // Re-check we're still on a watch page and the button hasn't been placed yet
+      if (!isYouTubeWatchPage()) {
+        return;
+      }
+      const current = document.getElementById('jellydj-rip-btn');
+      if (current?.dataset.inline === 'true' && current.isConnected) {
+        return;
+      }
+      if (current && current !== btn) { current.remove(); }
+      if (injectIntoYouTubeActions(btn)) {
+        btn.dataset.inline = 'true';
+        stopObserver();
+        watchRipButtonContainer(btn);
+      } else {
+      }
+    });
+    ytActionsWaiter.observe(document.body, { childList: true, subtree: true });
+  }
+
   function injectRipButton() {
     const existing = document.getElementById('jellydj-rip-btn');
 
@@ -610,9 +655,13 @@
         // Container was destroyed by YT re-render — remove and re-inject below
         existing.remove();
       } else {
-        // Currently floating — try to upgrade to inline
+        // Pending inline placement — try again now
         if (injectIntoYouTubeActions(existing)) {
+          cancelYtActionsWaiter();
           existing.dataset.inline = 'true';
+          stopObserver();
+          watchRipButtonContainer(existing);
+        } else {
         }
         return;
       }
@@ -620,19 +669,23 @@
       existing.remove();
     }
 
+    cancelYtActionsWaiter();
+
     const btn = document.createElement('button');
     btn.id = 'jellydj-rip-btn';
     btn.innerHTML = JELLYDJ_ICON + '<span>Rip to JellyDJ</span>';
     btn.onclick = handleRip;
 
+
     if (injectIntoYouTubeActions(btn)) {
+      // Actions bar already in DOM — place inline immediately
       btn.dataset.inline = 'true';
+      stopObserver();
+      watchRipButtonContainer(btn);
     } else {
-      // Actions bar not rendered yet — use floating fallback
-      applyRipFloatingStyle(btn);
-      btn.onmouseenter = () => { if (!btn.disabled) btn.style.background = '#6d28d9'; };
-      btn.onmouseleave = () => { if (!btn.disabled) btn.style.background = '#7c3aed'; };
-      document.body.appendChild(btn);
+      // Actions bar not rendered yet.  Watch for it to appear without debounce
+      // so we inject the moment it's ready, regardless of ongoing DOM activity.
+      waitForYouTubeActionsBar(btn);
     }
   }
 
@@ -777,11 +830,27 @@
   // Initial injection
   tryInject();
 
-  // Debounced MutationObserver — Spotify's SPA fires thousands of mutations;
-  // we only need to check once after things settle down.
-  // Uses trailing-edge debounce so tryInject fires after the last mutation,
-  // giving Spotify's React time to fully render the new page.
+  // ── MutationObserver (mutation-driven debounce) ────────────────────────────
+  //
+  // Watches for DOM changes so we can detect when a SPA has finished rendering
+  // a new page and inject the button.  Uses a TRAILING-edge debounce so
+  // tryInject fires after things settle, giving React/Polymer time to finish.
+  //
+  // IMPORTANT: this timer is driven ONLY by mutations.  Navigation event
+  // handlers use a separate navTimer so that constant YouTube DOM activity
+  // (player progress bar, recommendations loading, etc.) cannot indefinitely
+  // delay the post-navigation injection.
+  //
+  // On YouTube watch pages the video player mutates its DOM dozens of times
+  // per second.  To avoid starving YouTube's rendering pipeline we disconnect
+  // this observer once the rip button is placed inline and replace it with a
+  // slim per-container watcher.  The full observer is re-enabled on every
+  // navigation event.
   let debounceTimer = null;
+  let navTimer = null;          // separate timer for navigation-triggered injects
+  let observerActive = false;
+  let parentWatcher = null;     // narrow watcher on the rip button's parent only
+
   const observer = new MutationObserver(() => {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
@@ -789,23 +858,77 @@
       tryInject();
     }, 500);
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+
+  function startObserver() {
+    if (observerActive) return;
+    observer.observe(document.body, { childList: true, subtree: true });
+    observerActive = true;
+  }
+
+  function stopObserver() {
+    if (!observerActive) return;
+    observer.disconnect();
+    observerActive = false;
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+
+  // Schedule a navigation-triggered inject.  Uses navTimer, which is NOT
+  // shared with debounceTimer, so MutationObserver callbacks cannot cancel it.
+  function scheduleNavInject(delay) {
+    clearTimeout(navTimer);
+    navTimer = setTimeout(() => { navTimer = null; tryInject(); }, delay);
+  }
+
+  // Watch only the rip button's direct parent for child removal.
+  // When the button is evicted (YouTube re-renders the action bar), resume the
+  // full observer so we detect the new action bar and re-inject.
+  function watchRipButtonContainer(btn) {
+    if (parentWatcher) { parentWatcher.disconnect(); parentWatcher = null; }
+    const parent = btn.parentElement;
+    if (!parent) return;
+    parentWatcher = new MutationObserver(() => {
+      if (!btn.isConnected) {
+        parentWatcher.disconnect();
+        parentWatcher = null;
+        startObserver();
+      }
+    });
+    parentWatcher.observe(parent, { childList: true });
+  }
+
+  startObserver();
 
   // popstate fires on browser back/forward, but Spotify's in-app navigation
   // uses history.pushState — patch it so we detect those URL changes too.
   const _origPushState = history.pushState.bind(history);
   history.pushState = function (...args) {
     _origPushState(...args);
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => { debounceTimer = null; tryInject(); }, 500);
+    scheduleNavInject(600);
   };
   const _origReplaceState = history.replaceState.bind(history);
   history.replaceState = function (...args) {
     _origReplaceState(...args);
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => { debounceTimer = null; tryInject(); }, 500);
+    scheduleNavInject(600);
   };
 
   // Also re-check on popstate for browser back/forward navigation
-  window.addEventListener('popstate', tryInject);
+  window.addEventListener('popstate', () => scheduleNavInject(300));
+
+  // YouTube fires yt-navigate-finish on document when its SPA navigation fully
+  // completes (page content rendered).  This is the most reliable signal for
+  // in-page YouTube navigation — pushState fires too early, and the
+  // MutationObserver debounce can be continuously reset by YouTube's own DOM
+  // activity, preventing it from ever settling.
+  //
+  // navTimer is independent of debounceTimer, so this call is guaranteed to
+  // fire even while YouTube keeps mutating the DOM.
+  function onYtNavigateFinish() {
+    cancelYtActionsWaiter();
+    if (parentWatcher) { parentWatcher.disconnect(); parentWatcher = null; }
+    startObserver();
+    scheduleNavInject(500);
+  }
+  document.addEventListener('yt-navigate-finish', onYtNavigateFinish);
+  window.addEventListener('yt-navigate-finish', onYtNavigateFinish);
 })();

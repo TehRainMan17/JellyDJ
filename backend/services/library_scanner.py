@@ -34,7 +34,7 @@ BATCH_SIZE = 500
 # playback is happening.  At 500 items/page a 10,000-track library takes
 # ~20 pages; 0.25 s/page adds only ~5 seconds total but gives Jellyfin's
 # HTTP thread pool time to breathe between bursts.
-_PAGE_SLEEP_SECS = 0.25
+_PAGE_SLEEP_SECS = 0.5
 
 
 def _get_jellyfin_creds(db: Session) -> tuple[str, str]:

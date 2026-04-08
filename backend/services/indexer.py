@@ -110,6 +110,12 @@ def _resolve_track_artist(item: dict) -> str:
 
 log = logging.getLogger(__name__)
 
+# Pause between Jellyfin page requests to avoid saturating its thread pool.
+# Matches the same constant in library_scanner.py.  At 500 items/page a
+# 5,000-track play history takes ~10 pages; 0.5s/page adds only ~5 seconds
+# but gives Jellyfin room to handle auth and playback requests in between.
+_PAGE_SLEEP_SECS = 0.5
+
 # Weighting constants for affinity score calculation
 # Legacy taste-profile weights (used by _rebuild_taste_profile below).
 # The primary scoring path is scoring_engine.py → rebuild_track_scores();
@@ -225,7 +231,7 @@ async def _fetch_played_items(
 
             # Yield to Jellyfin between pages so its thread pool can handle
             # other requests (e.g. playback, auth) without returning 500.
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(_PAGE_SLEEP_SECS)
 
     return all_items
 
