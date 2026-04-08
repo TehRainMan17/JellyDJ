@@ -14,6 +14,11 @@ services:
       - TZ=${TZ:-UTC}
     volumes:
       - jellydj-config:/config
+      # YouTube Rips: set YOUTUBE_RIPS_PATH in your .env to a host folder that your
+      # Jellyfin music library also reads from. The backend writes downloaded MP3s
+      # here; Jellyfin picks them up on its next library scan.
+      # Example (.env): YOUTUBE_RIPS_PATH=D:/StreamingVault/Youtube
+      - ${YOUTUBE_RIPS_PATH:-jellydj-youtube-rips}:/music/youtube-rips
     networks:
       - jellydj-net
     healthcheck:
@@ -48,6 +53,10 @@ services:
 volumes:
   jellydj-config:
     name: jellydj-config
+  # Fallback anonymous volume used when YOUTUBE_RIPS_PATH is not set in .env.
+  # Files land here but Jellyfin won't see them — configure YOUTUBE_RIPS_PATH
+  # to a real shared path for the feature to work end-to-end.
+  jellydj-youtube-rips:
 
 networks:
   jellydj-net:

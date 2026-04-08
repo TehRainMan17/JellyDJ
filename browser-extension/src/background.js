@@ -35,6 +35,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleImport(message.data).then(sendResponse);
     return true; // Keep channel open for async response
   }
+  if (message.action === 'ripYouTube') {
+    handleRip(message.url).then(sendResponse);
+    return true;
+  }
   if (message.action === 'saveConfig') {
     chrome.storage.local.set({ jellydjUrl: message.url, jellydjToken: message.token }, () => {
       sendResponse({ ok: true });
@@ -48,6 +52,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 });
+
+async function handleRip(url) {
+  const { jellydjUrl, jellydjToken } = await chrome.storage.local.get(['jellydjUrl', 'jellydjToken']);
+
+  if (!jellydjUrl) {
+    return { ok: false, error: 'JellyDJ URL not configured. Click the extension icon to set it.' };
+  }
+
+  const endpoint = jellydjUrl.replace(/\/$/, '') + '/api/import/youtube-rip';
+
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(jellydjToken ? { 'X-JellyDJ-Key': jellydjToken } : {}),
+      },
+      body: JSON.stringify({ url }),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      return { ok: false, error: body.detail || `HTTP ${resp.status}` };
+    }
+
+    const data = await resp.json();
+    return { ok: true, job_id: data.job_id };
+  } catch (err) {
+    return { ok: false, error: err.message || 'Network error — is JellyDJ running?' };
+  }
+}
 
 async function handleImport(data) {
   const { jellydjUrl, jellydjToken } = await chrome.storage.local.get(['jellydjUrl', 'jellydjToken']);

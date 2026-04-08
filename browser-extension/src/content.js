@@ -24,12 +24,16 @@
 
   const hostname = location.hostname;
   const platform =
-    hostname === 'open.spotify.com'                            ? 'spotify'
+    hostname === 'open.spotify.com'                               ? 'spotify'
     : hostname === 'tidal.com' || hostname === 'listen.tidal.com' ? 'tidal'
-    : hostname === 'music.youtube.com' || hostname === 'www.youtube.com' ? 'youtube_music'
+    : hostname === 'music.youtube.com'                            ? 'youtube_music'
+    : hostname === 'www.youtube.com'                              ? 'youtube'
     : null;
 
   if (!platform) return;
+
+  // youtube_music: playlist import only.
+  // youtube (regular YouTube): rip button on /watch pages only.
 
   // ── JellyDJ logo as inline image (the actual jellyfish DJ icon) ─────────────
 
@@ -471,6 +475,150 @@
     }
   }
 
+  // ── YouTube Rip Button ────────────────────────────────────────────────────
+  //
+  // Appears on regular YouTube watch pages (/watch?v=...).
+  // Sends the video URL to the JellyDJ backend, which downloads the audio via
+  // yt-dlp and saves it as a 320 kbps MP3 in the configured library folder.
+  //
+  // NOTE: YouTube serves audio at 128–160 kbps; the 320 kbps MP3 is a
+  // re-encode at a higher container bitrate, not a true quality gain.
+
+  function resetRipButton(btn) {
+    btn.innerHTML = JELLYDJ_LOGO_SRC
+      ? JELLYDJ_ICON + '<span>Rip to JellyDJ</span>'
+      : '<span>Rip to JellyDJ</span>';
+    btn.style.background = '#7c3aed';
+    btn.disabled = false;
+  }
+
+  function setRipText(btn, text) {
+    btn.innerHTML = JELLYDJ_ICON + '<span>' + text + '</span>';
+  }
+
+  function injectRipButton() {
+    if (document.getElementById('jellydj-rip-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'jellydj-rip-btn';
+    btn.innerHTML = JELLYDJ_ICON + '<span>Rip to JellyDJ</span>';
+    btn.style.cssText = `
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 99999;
+      display: inline-flex;
+      align-items: center;
+      background: #7c3aed;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      transition: background 0.15s;
+    `;
+    btn.onmouseenter = () => { if (!btn.disabled) btn.style.background = '#6d28d9'; };
+    btn.onmouseleave = () => { if (!btn.disabled) btn.style.background = '#7c3aed'; };
+    btn.onclick = handleRip;
+    document.body.appendChild(btn);
+  }
+
+  async function handleRip() {
+    const btn = document.getElementById('jellydj-rip-btn');
+    if (!btn || btn.disabled) return;
+
+    btn.disabled = true;
+    setRipText(btn, 'Starting…');
+
+    if (!chrome?.runtime?.id) {
+      setRipText(btn, 'Extension reloaded — refresh page');
+      btn.style.background = '#dc2626';
+      setTimeout(() => resetRipButton(btn), 4000);
+      return;
+    }
+
+    // POST to JellyDJ via background.js to get a job ID
+    let jobId, base, token;
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const tid = setTimeout(() => reject(new Error('Timed out — is JellyDJ running?')), 15000);
+        chrome.runtime.sendMessage({ action: 'ripYouTube', url: location.href }, (resp) => {
+          clearTimeout(tid);
+          if (chrome.runtime.lastError) reject(new Error('Extension error — refresh page'));
+          else resolve(resp);
+        });
+      });
+
+      if (!result.ok) throw new Error(result.error || 'Failed to queue rip');
+      jobId = result.job_id;
+    } catch (err) {
+      setRipText(btn, err.message);
+      btn.style.background = '#dc2626';
+      setTimeout(() => resetRipButton(btn), 5000);
+      return;
+    }
+
+    // Retrieve config so we can poll the status endpoint directly
+    const cfg = await new Promise(r => chrome.storage.local.get(['jellydjUrl', 'jellydjToken'], r));
+    base  = (cfg.jellydjUrl || '').replace(/\/$/, '');
+    token = cfg.jellydjToken || '';
+
+    const STATUS_LABELS = {
+      queued:       'Queued…',
+      fetching_info:'Reading metadata…',
+      downloading:  'Downloading audio…',
+      converting:   'Converting to MP3…',
+      scanning:     'Updating Jellyfin library…',
+    };
+
+    // Poll every 3 s for up to 3 minutes
+    let attempts = 0;
+    const MAX = 60;
+
+    const poll = async () => {
+      if (attempts++ >= MAX) {
+        setRipText(btn, 'Timed out — check JellyDJ logs');
+        btn.style.background = '#dc2626';
+        btn.disabled = false;
+        setTimeout(() => resetRipButton(btn), 6000);
+        return;
+      }
+
+      try {
+        const resp = await fetch(`${base}/api/import/youtube-rip/status/${jobId}`, {
+          headers: token ? { 'X-JellyDJ-Key': token } : {},
+        });
+        const job = await resp.json();
+
+        if (job.status === 'done') {
+          const label = job.title ? `Ripped: ${job.title}` : 'Ripped!';
+          setRipText(btn, label);
+          btn.style.background = '#16a34a';
+          btn.disabled = false;
+          setTimeout(() => resetRipButton(btn), 8000);
+        } else if (job.status === 'error') {
+          setRipText(btn, 'Failed — check JellyDJ logs');
+          btn.style.background = '#dc2626';
+          btn.disabled = false;
+          setTimeout(() => resetRipButton(btn), 6000);
+        } else {
+          setRipText(btn, STATUS_LABELS[job.status] || 'Processing…');
+          setTimeout(poll, 3000);
+        }
+      } catch {
+        setRipText(btn, 'Connection lost');
+        btn.style.background = '#dc2626';
+        btn.disabled = false;
+        setTimeout(() => resetRipButton(btn), 4000);
+      }
+    };
+
+    setTimeout(poll, 3000);
+  }
+
   // ── Watch for SPA navigation and inject button ────────────────────────────
 
   function isPlaylistPage() {
@@ -481,12 +629,27 @@
     );
   }
 
+  function isYouTubeWatchPage() {
+    return platform === 'youtube'
+      && location.pathname === '/watch'
+      && /[?&]v=/.test(location.search);
+  }
+
   function tryInject() {
+    // Playlist import button (Spotify / Tidal / YouTube Music playlists)
     if (isPlaylistPage()) {
       injectButton();
     } else {
       const existing = document.getElementById('jellydj-import-btn');
       if (existing) existing.remove();
+    }
+
+    // Rip button (regular YouTube watch pages only)
+    if (isYouTubeWatchPage()) {
+      injectRipButton();
+    } else {
+      const ripBtn = document.getElementById('jellydj-rip-btn');
+      if (ripBtn) ripBtn.remove();
     }
   }
 

@@ -37,6 +37,7 @@ from routers.user_playlists import router as user_playlists_router
 from routers.admin_defaults import router as admin_defaults_router
 from routers.playlist_backups import router as playlist_backups_router
 from routers.playlist_import import router as playlist_import_router
+from routers.youtube_rip import router as youtube_rip_router
 
 
 def _run_migrations():
@@ -664,6 +665,7 @@ app.include_router(user_playlists_router)      # /api/user-playlists     — use
 app.include_router(admin_defaults_router)      # /api/admin/default-playlists — admin default playlist config
 app.include_router(playlist_backups_router)    # /api/playlist-backups   — playlist backup + restore
 app.include_router(playlist_import_router)     # /api/import             — external playlist import
+app.include_router(youtube_rip_router)         # /api/import/youtube-rip — YouTube audio → MP3 → Jellyfin
 
 
 @app.get("/api/health")
