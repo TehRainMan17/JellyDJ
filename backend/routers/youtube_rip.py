@@ -137,9 +137,6 @@ def start_rip(
     Accept a YouTube video URL, queue a background download job, and return a
     job ID the caller can use to poll /status/{job_id}.
     """
-    if not user.is_admin:
-        raise HTTPException(403, "Administrator access required to rip YouTube audio")
-
     url = payload.url.strip()
     if not _YOUTUBE_RE.match(url):
         raise HTTPException(400, "URL must be a YouTube video URL (youtube.com/watch or youtu.be)")
