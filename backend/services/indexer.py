@@ -223,6 +223,10 @@ async def _fetch_played_items(
             if start_index >= total or not items:
                 break
 
+            # Yield to Jellyfin between pages so its thread pool can handle
+            # other requests (e.g. playback, auth) without returning 500.
+            await asyncio.sleep(0.25)
+
     return all_items
 
 
