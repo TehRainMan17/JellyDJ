@@ -126,13 +126,14 @@ class RipRequest(BaseModel):
     # Optional user-provided metadata (from the browser extension's pre-rip modal).
     # When supplied, these override the YouTube video title / channel name for the
     # output filename, folder structure, and ID3 tags.
-    user_title:     str | None = None
-    user_artist:    str | None = None
-    user_album:     str | None = None
-    user_year:      str | None = None
-    recording_mbid: str | None = None   # MusicBrainz recording MBID
-    artist_mbid:    str | None = None   # MusicBrainz artist MBID
-    release_mbid:   str | None = None   # MusicBrainz release MBID (for Cover Art Archive)
+    user_title:         str | None = None
+    user_artist:        str | None = None
+    user_album:         str | None = None
+    user_year:          str | None = None
+    recording_mbid:     str | None = None   # MusicBrainz recording MBID
+    artist_mbid:        str | None = None   # MusicBrainz artist MBID
+    release_mbid:       str | None = None   # MusicBrainz release MBID (for Cover Art Archive)
+    release_group_mbid: str | None = None   # MusicBrainz release-group MBID (CAA fallback)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -361,8 +362,9 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
         # Embed into the MP3 as an ID3 APIC frame AND save cover.jpg in the
         # destination directory so Jellyfin finds art via both paths.
         cover_bytes = _fetch_cover_art(
-            release_mbid  = payload.release_mbid,
-            thumbnail_url = _best_thumbnail(info),
+            release_mbid       = payload.release_mbid,
+            release_group_mbid = payload.release_group_mbid,
+            thumbnail_url      = _best_thumbnail(info),
         )
         if cover_bytes:
             _embed_cover_art(final_mp3, cover_bytes)
@@ -434,48 +436,77 @@ def _crop_to_square(img_bytes: bytes) -> bytes:
         return img_bytes
 
 
-def _fetch_cover_art(release_mbid: str | None, thumbnail_url: str | None) -> bytes | None:
+def _fetch_cover_art(
+    release_mbid: str | None,
+    release_group_mbid: str | None,
+    thumbnail_url: str | None,
+) -> bytes | None:
     """
     Fetch cover art for the ripped track.
 
     Resolution order
     ────────────────
-    1. MusicBrainz Cover Art Archive (front image for the matched release).
-       Requires a valid release_mbid from the user's MusicBrainz selection.
-    2. YouTube video thumbnail, center-cropped from 16:9 to square via Pillow.
+    1. Cover Art Archive — front image for the matched MusicBrainz release.
+    2. Cover Art Archive — front image for the matched MusicBrainz release-group.
+       Release-groups aggregate all editions of an album and have broader CAA
+       coverage than individual release MBIDs.
+    3. YouTube video thumbnail, center-cropped from 16:9 to square via Pillow.
 
-    Returns JPEG bytes, or None if both sources fail.
+    Returns JPEG bytes, or None if all sources fail.
     """
     import httpx
 
-    # ── Option 1: Cover Art Archive ───────────────────────────────────────────
-    if release_mbid:
+    def _try_caa(mbid: str, label: str) -> bytes | None:
+        """Attempt to fetch a front image from the Cover Art Archive."""
+        # /release/{mbid}/front and /release-group/{mbid}/front both return a
+        # 307 redirect to the actual image on archive.org; follow_redirects
+        # handles that transparently.
+        url = f"https://coverartarchive.org/{label}/{mbid}/front"
         try:
             resp = httpx.get(
-                f"https://coverartarchive.org/release/{release_mbid}/front",
+                url,
                 follow_redirects=True,
                 timeout=20.0,
                 headers={"User-Agent": "JellyDJ/1.0 (self-hosted; github.com/TehRainMan17)"},
             )
             if resp.status_code == 200 and resp.content:
-                log.info("Cover art fetched from Cover Art Archive for release %s", release_mbid)
+                log.info("Cover art fetched from Cover Art Archive (%s %s)", label, mbid)
                 return resp.content
-            log.debug("Cover Art Archive returned HTTP %s for release %s", resp.status_code, release_mbid)
+            log.warning(
+                "Cover Art Archive returned HTTP %s for %s %s",
+                resp.status_code, label, mbid,
+            )
         except Exception as exc:
-            log.debug("Cover Art Archive request failed for %s: %s", release_mbid, exc)
+            log.warning("Cover Art Archive request failed for %s %s: %s", label, mbid, exc)
+        return None
 
-    # ── Option 2: YouTube thumbnail (cropped to square) ───────────────────────
+    # ── Option 1: release MBID ────────────────────────────────────────────────
+    if release_mbid:
+        result = _try_caa(release_mbid, "release")
+        if result:
+            return result
+
+    # ── Option 2: release-group MBID ─────────────────────────────────────────
+    if release_group_mbid:
+        result = _try_caa(release_group_mbid, "release-group")
+        if result:
+            return result
+
+    # ── Option 3: YouTube thumbnail (cropped to square) ───────────────────────
     if thumbnail_url:
         try:
             resp = httpx.get(thumbnail_url, follow_redirects=True, timeout=15.0)
             if resp.status_code == 200 and resp.content:
                 log.info("Cover art fetched from YouTube thumbnail, cropping to square")
                 return _crop_to_square(resp.content)
-            log.debug("YouTube thumbnail fetch returned HTTP %s", resp.status_code)
+            log.warning("YouTube thumbnail fetch returned HTTP %s", resp.status_code)
         except Exception as exc:
-            log.debug("YouTube thumbnail fetch failed: %s", exc)
+            log.warning("YouTube thumbnail fetch failed: %s", exc)
 
-    log.debug("No cover art source succeeded for release_mbid=%s thumbnail=%s", release_mbid, thumbnail_url)
+    log.warning(
+        "No cover art source succeeded for release_mbid=%s release_group_mbid=%s",
+        release_mbid, release_group_mbid,
+    )
     return None
 
 

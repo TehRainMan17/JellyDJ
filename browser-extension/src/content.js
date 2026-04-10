@@ -680,7 +680,10 @@
         </div>
       `;
 
-      document.body.appendChild(wrapper);
+      // Attach to <html> rather than <body> so YouTube's SPA body re-renders
+      // (which fire during the first 1-2 seconds after navigation) cannot
+      // remove the modal by clearing body content.
+      document.documentElement.appendChild(wrapper);
 
       const titleInput  = shadow.getElementById('title-input');
       const artistInput = shadow.getElementById('artist-input');
@@ -700,14 +703,23 @@
 
       function closeModal(result) {
         wrapper.remove();
-        document.removeEventListener('keydown', onEscape);
         resolve(result);
       }
 
-      function onEscape(e) {
-        if (e.key === 'Escape') closeModal(null);
-      }
-      document.addEventListener('keydown', onEscape);
+      // Intercept ALL key and pointer events at the shadow-root boundary so
+      // they never reach YouTube's global handlers:
+      //   - keydown/up/press: backspace = back, space = play, k/f/m/etc.
+      //   - click/mousedown/mouseup: YouTube doc-level click handlers that
+      //     can trigger navigation or SPA state changes while the modal is open.
+      ['keydown', 'keyup', 'keypress'].forEach(type => {
+        shadow.addEventListener(type, (e) => {
+          e.stopPropagation();
+          if (type === 'keydown' && e.key === 'Escape') closeModal(null);
+        });
+      });
+      ['click', 'mousedown', 'mouseup'].forEach(type => {
+        shadow.addEventListener(type, (e) => e.stopPropagation());
+      });
 
       function renderResults(recordings) {
         mbResults.innerHTML = '';
@@ -749,13 +761,14 @@
             titleInput.value  = rec.title;
             artistInput.value = artistStr;
             selectedMbData = {
-              user_title:     rec.title,
-              user_artist:    artistStr,
-              user_album:     album,
-              user_year:      year,
-              recording_mbid: rec.id || '',
-              artist_mbid:    rec['artist-credit']?.[0]?.artist?.id || '',
-              release_mbid:   release?.id || '',
+              user_title:         rec.title,
+              user_artist:        artistStr,
+              user_album:         album,
+              user_year:          year,
+              recording_mbid:     rec.id || '',
+              artist_mbid:        rec['artist-credit']?.[0]?.artist?.id || '',
+              release_mbid:       release?.id || '',
+              release_group_mbid: release?.['release-group']?.id || '',
             };
           });
 
@@ -1029,7 +1042,9 @@
     const btn = document.createElement('button');
     btn.id = 'jellydj-rip-btn';
     btn.innerHTML = JELLYDJ_ICON + '<span>Rip to JellyDJ</span>';
-    btn.onclick = handleRip;
+    // stopPropagation prevents the click from reaching YouTube's document-level
+    // handlers (which can trigger navigation or other state changes mid-modal).
+    btn.addEventListener('click', (e) => { e.stopPropagation(); handleRip(); });
 
 
     if (injectIntoYouTubeActions(btn)) {
