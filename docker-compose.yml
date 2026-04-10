@@ -19,6 +19,10 @@ services:
       # here; Jellyfin picks them up on its next library scan.
       # Example (.env): YOUTUBE_RIPS_PATH=D:/StreamingVault/Youtube
       - ${YOUTUBE_RIPS_PATH:-jellydj-youtube-rips}:/music/youtube-rips
+      # YouTube Cookies (optional): required for geo-restricted / VEVO / Disney videos.
+      # Export a cookies.txt from your browser while logged into YouTube, then copy it:
+      #   docker cp cookies.txt jellydj-backend:/config/youtube-cookies.txt
+      # JellyDJ will auto-detect it there. No restart or env change required.
     networks:
       - jellydj-net
     healthcheck:

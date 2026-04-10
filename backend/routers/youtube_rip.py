@@ -28,6 +28,14 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+# Optional cookie file for age-restricted / geo-restricted / VEVO-blocked videos.
+# Resolution order:
+#   1. YOUTUBE_COOKIES_FILE env var (explicit container path)
+#   2. /config/youtube-cookies.txt  (auto-discovery inside the config volume)
+# If neither exists, yt-dlp proceeds without authentication (most public videos work).
+_COOKIES_FILE_ENV  = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+_COOKIES_FILE_AUTO = "/config/youtube-cookies.txt"
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -212,6 +220,47 @@ def rip_status(job_id: str, _: UserContext = Depends(get_user_from_api_key_or_jw
     return job
 
 
+# ── Error helpers ─────────────────────────────────────────────────────────────
+
+def _get_cookies_file() -> str | None:
+    """Return the path to a valid yt-dlp cookies file, or None."""
+    if _COOKIES_FILE_ENV and Path(_COOKIES_FILE_ENV).is_file():
+        return _COOKIES_FILE_ENV
+    if Path(_COOKIES_FILE_AUTO).is_file():
+        return _COOKIES_FILE_AUTO
+    return None
+
+
+def _friendly_rip_error(raw: str) -> str:
+    """
+    Convert a raw yt-dlp error string into a message the UI can show directly.
+    The raw messages are often accurate but contain internal noise; we surface
+    the most actionable version.
+    """
+    low = raw.lower()
+    if "not available" in low or "unavailable" in low:
+        return (
+            "This video is not available — it may be geo-restricted or "
+            "blocked by the copyright owner (e.g. Disney VEVO). "
+            "To rip restricted videos, export a YouTube cookies.txt from "
+            "your browser and place it at /config/youtube-cookies.txt inside "
+            "the container (see the README for instructions)."
+        )
+    if "private video" in low:
+        return "This video is private and cannot be downloaded."
+    if "age" in low and ("restricted" in low or "confirm" in low or "verification" in low):
+        return (
+            "This video requires age verification. "
+            "Add a YouTube cookies.txt at /config/youtube-cookies.txt to allow ripping."
+        )
+    if "sign in" in low or "login" in low:
+        return (
+            "YouTube requires you to be signed in to access this video. "
+            "Add a YouTube cookies.txt at /config/youtube-cookies.txt to allow ripping."
+        )
+    return raw
+
+
 # ── Background worker ─────────────────────────────────────────────────────────
 
 def _run_rip(job_id: str, url: str, payload: RipRequest) -> None:
@@ -237,19 +286,25 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
 
     # ── Phase 1: extract metadata without downloading ─────────────────────────
     job["status"] = "fetching_info"
+    cookies_file = _get_cookies_file()
+    if cookies_file:
+        log.info("Using YouTube cookies file: %s", cookies_file)
     try:
         info_opts: dict = {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "extract_flat": False,
+            "geo_bypass": True,
         }
+        if cookies_file:
+            info_opts["cookiefile"] = cookies_file
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         log.warning("yt-dlp metadata extraction failed for %s: %s", url, exc)
         job["status"] = "error"
-        job["error"] = f"Could not fetch video info: {exc}"
+        job["error"] = _friendly_rip_error(str(exc))
         return
 
     # Resolve artist and title: prefer user-supplied values from the extension's
@@ -291,6 +346,7 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
             "noplaylist":  True,
             "quiet":       True,
             "no_warnings": True,
+            "geo_bypass":  True,
             # postprocessors run in order:
             #   1. Extract audio and re-encode to 320 kbps MP3 CBR via ffmpeg
             #   2. Write ID3 tags (title, artist, uploader URL) into the MP3
@@ -309,6 +365,8 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
                 },
             ],
         }
+        if cookies_file:
+            dl_opts["cookiefile"] = cookies_file
 
         try:
             job["status"] = "converting"
@@ -317,7 +375,7 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
         except yt_dlp.utils.DownloadError as exc:
             log.warning("yt-dlp download failed for %s: %s", url, exc)
             job["status"] = "error"
-            job["error"] = str(exc)
+            job["error"] = _friendly_rip_error(str(exc))
             return
         except Exception as exc:
             log.exception("Unexpected error ripping %s", url)
