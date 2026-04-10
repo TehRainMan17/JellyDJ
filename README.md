@@ -14,7 +14,7 @@
 
 <p align="center">
   <strong>A self-hosted music recommendation engine that turns your static Jellyfin library into a living, breathing music ecosystem.</strong><br/>
-  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration &nbsp;·&nbsp; Playlist import &nbsp;·&nbsp; Playlist backups
+  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration &nbsp;·&nbsp; Playlist import &nbsp;·&nbsp; Playlist backups &nbsp;·&nbsp; YouTube ripping
 </p>
 
 <br/>
@@ -42,6 +42,12 @@ services:
       - TZ=${TZ:-UTC}
     volumes:
       - jellydj-config:/config
+      # YouTube Rips: set YOUTUBE_RIPS_PATH in .env to a folder your Jellyfin
+      # music library also watches. JellyDJ writes downloaded MP3s here;
+      # Jellyfin picks them up on its next library scan.
+      # If YOUTUBE_RIPS_PATH is not set, files land in an anonymous volume
+      # that Jellyfin cannot see — configure this for the feature to work.
+      - ${YOUTUBE_RIPS_PATH:-jellydj-youtube-rips}:/music/youtube-rips
     networks:
       - jellydj
 
@@ -57,6 +63,7 @@ services:
 
 volumes:
   jellydj-config:
+  jellydj-youtube-rips:    # fallback — replace with YOUTUBE_RIPS_PATH for real use
 
 networks:
   jellydj:
@@ -68,6 +75,12 @@ networks:
 JELLYDJ_PORT=7879
 TZ=America/New_York
 SECRET_KEY=your_generated_key_here
+
+# YouTube Rip — set to a folder your Jellyfin music library watches.
+# JellyDJ writes ripped MP3s here so Jellyfin indexes them automatically.
+# Example (Windows host with Docker Desktop): D:/Music/YoutubeRips
+# Example (Linux host): /mnt/media/music/youtube-rips
+YOUTUBE_RIPS_PATH=/path/to/your/music/youtube-rips
 
 # First-time setup account (remove after Jellyfin is connected — see step 5)
 SETUP_USERNAME=admin
@@ -156,8 +169,9 @@ This is early days on this project and, as such, large portions are unfinished, 
 | 🌌 | **Music Universe Map** | Interactive zoom-driven graph of your taste — genres, artists, connections, skip signals, drift, and track orbits |
 | 🎸 | **Multi-Source Enrichment** | Spotify, Last.fm, MusicBrainz, Billboard — layered signals, no single point of failure |
 | 📥 | **Playlist Import** | Import any Spotify, Tidal, or YouTube Music playlist — JellyDJ matches tracks to your library and flags missing ones for Lidarr |
+| 🎵 | **YouTube Rip** | Rip any YouTube video to a 320 kbps MP3, auto-tagged and album-art matched, saved directly into your Jellyfin-watched folder |
 | 💾 | **Playlist Backups** | Rolling revision history for every JellyDJ playlist — browse, diff, and restore any prior version with one click |
-| 🧩 | **Browser Extension** | Clip a Spotify or YouTube Music playlist URL directly from your browser and send it to JellyDJ for import |
+| 🧩 | **Browser Extension** | Clip a Spotify or YouTube Music playlist URL directly from your browser, or rip individual YouTube videos — all sent straight to JellyDJ |
 | ⏱️ | **Artist Timeouts** | Skip 5+ songs from the same artist in 2 days and they're benched for a week — escalating to 14d and 30d on repeat offences |
 | 🏠 | **Truly Self-Hosted** | No cloud, no accounts, no tracking. Your data stays on your hardware |
 
@@ -215,7 +229,7 @@ This is early days on this project and, as such, large portions are unfinished, 
 </p>
 
 ### Browser Extension
-*Clip a playlist URL from Spotify or YouTube Music and send it straight to JellyDJ for import*
+*Clip a playlist URL from Spotify or YouTube Music and send it straight to JellyDJ — or rip individual YouTube videos*
 
 <p align="center">
   <img src=".github/images/screenshot-ChromeExtension.PNG" alt="JellyDJ Browser Extension" width="40%" />
@@ -313,7 +327,78 @@ JellyDJ can import playlists from **Spotify**, **Tidal**, and **YouTube Music** 
 
 The **JellyDJ Browser Extension** lets you clip a playlist from Spotify or YouTube Music without leaving your browser — hit the extension button on any playlist page, confirm the import, and JellyDJ handles the rest. No copy-pasting URLs required.
 
+The extension also adds a **Rip to JellyDJ** button on any YouTube watch page. See [YouTube Rip](#-rip-from-youtube) below for details.
+
 The extension communicates with your self-hosted JellyDJ instance directly. You configure your server URL and a personal API key (generated in **Settings → API Keys**) once, and it works from then on.
+
+---
+
+## 🎵 Rip from YouTube
+
+JellyDJ can rip any YouTube video to a properly tagged, album-art-matched MP3 and save it directly into your Jellyfin-watched music folder — no third-party tools or manual file moves required.
+
+### How It Works
+
+1. You submit a YouTube URL (via the browser extension's **Rip to JellyDJ** button, or from the JellyDJ UI).
+2. JellyDJ downloads the best available audio stream via yt-dlp and re-encodes it to **320 kbps MP3 CBR** using ffmpeg.
+3. If you confirmed a MusicBrainz match in the pre-rip modal, JellyDJ fetches proper album art from the **Cover Art Archive** and writes correct ID3 tags (title, artist, album, year, MusicBrainz IDs). Otherwise it falls back to the YouTube thumbnail, center-cropped to a square.
+4. The finished MP3 is saved into your configured rips folder, organised as `Artist/Album/Title.mp3` (or `Artist/Title.mp3` when no album is set).
+5. A `cover.jpg` is also written alongside the MP3 so Jellyfin finds art via both file-based and tag-based scanning.
+6. Jellyfin triggers a library rescan automatically after each successful rip.
+
+> **Audio quality note:** YouTube serves audio at 128–160 kbps. The 320 kbps MP3 output is a re-encode at a higher container bitrate — it does not recover quality that wasn't in the source stream.
+
+### Setup
+
+**1. Point `YOUTUBE_RIPS_PATH` at a folder Jellyfin watches**
+
+Add this to your `.env` — it must be a path that exists on your Docker host **and** is already part of your Jellyfin music library:
+
+```env
+# Windows example (Docker Desktop)
+YOUTUBE_RIPS_PATH=D:/Music/YoutubeRips
+
+# Linux example
+YOUTUBE_RIPS_PATH=/mnt/media/music/youtube-rips
+```
+
+**2. Verify your docker-compose mounts that path**
+
+The `docker-compose.yml` already has the binding — just make sure `YOUTUBE_RIPS_PATH` is set before you bring the stack up:
+
+```yaml
+volumes:
+  - ${YOUTUBE_RIPS_PATH:-jellydj-youtube-rips}:/music/youtube-rips
+```
+
+**3. Restart the stack**
+
+```bash
+docker compose up -d
+```
+
+**4. Verify it's working**
+
+Try a rip from the JellyDJ UI or browser extension. After a successful rip, check that the file appears in your configured folder. Trigger a Jellyfin library scan if the track doesn't appear automatically within a minute.
+
+### Geo-restricted and age-gated videos
+
+Some videos (VEVO, Disney, age-restricted content) require a YouTube login cookie to download. JellyDJ supports this via a standard `cookies.txt` file:
+
+1. While logged into YouTube in your browser, export your cookies using a browser extension such as **Get cookies.txt LOCALLY** (Chrome) or **cookies.txt** (Firefox). Save the file as `cookies.txt`.
+2. Copy it into the running container:
+
+```bash
+docker cp cookies.txt jellydj-backend:/config/youtube-cookies.txt
+```
+
+JellyDJ auto-detects `/config/youtube-cookies.txt` at startup — no restart or env change required. Alternatively, set `YOUTUBE_COOKIES_FILE` in your `.env` to an explicit path inside the container.
+
+> ⚠️ Your cookies.txt grants full access to your YouTube account. Treat it like a password — don't share it and don't commit it to version control.
+
+### Concurrency
+
+JellyDJ allows up to **2 simultaneous rip jobs**. Submitting a third will return an HTTP 429 until a slot opens. Submitting the same URL twice while a job is in progress returns the existing job ID instead of starting a duplicate.
 
 ---
 
@@ -351,9 +436,39 @@ Approved discoveries are automatically sent to Lidarr for download.
 
 ---
 
+## 🧩 Browser Extension
+
+The JellyDJ browser extension adds a **Send to JellyDJ** button to Spotify, Tidal, and YouTube Music playlist pages, and a **Rip to JellyDJ** button on individual YouTube watch pages. It is not published to the Chrome Web Store — install it as an unpacked extension:
+
+### Installation (Chrome / Edge / Brave)
+
+1. Download or clone this repository so you have the `browser-extension/` folder on your machine.
+2. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
+3. Enable **Developer mode** (toggle in the top-right corner).
+4. Click **Load unpacked** and select the `browser-extension/` folder.
+5. The JellyDJ icon appears in your toolbar.
+
+### First-time configuration
+
+1. Click the JellyDJ toolbar icon.
+2. Enter your **JellyDJ URL** (e.g. `http://192.168.1.100:7879`).
+3. Enter your **API key** — generate one in JellyDJ under **Settings → API Keys**.
+4. Click **Save settings**. The extension verifies the connection and shows your username if everything is correct.
+
+### What it does on each site
+
+| Site | What happens |
+|---|---|
+| **Spotify** playlist page | Injects a **Send to JellyDJ** button into the action bar. Click it to scrape the visible track list and send it to JellyDJ for matching against your library. Long playlists are auto-scrolled to capture all tracks. |
+| **Tidal** playlist page | Same as Spotify — floating **Send to JellyDJ** button scrapes and sends the track list. |
+| **YouTube Music** playlist page | Same as above — works on YTM playlist and album pages. |
+| **YouTube** watch page (`/watch`) | Shows a **Rip to JellyDJ** button below the video. Clicking it opens a pre-rip modal where you can confirm or correct the song metadata (title, artist, album, year) via MusicBrainz search before the rip starts. |
+
+---
+
 ## ⚙️ Configuration
 
-All settings are managed from the web UI. The `.env` file only needs the secret key and port.
+All settings are managed from the web UI. The `.env` file only needs the secret key, port, and any paths.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -361,6 +476,8 @@ All settings are managed from the web UI. The `.env` file only needs the secret 
 | `SECRET_KEY` | *(required)* | Encrypts stored credentials — generate once, don't change |
 | `TZ` | `UTC` | Timezone for scheduled jobs and display |
 | `DATABASE_URL` | `sqlite:////config/jellydj.db` | SQLite (default) or PostgreSQL for larger libraries |
+| `YOUTUBE_RIPS_PATH` | *(unset)* | Host path to a folder your Jellyfin music library watches — ripped MP3s are written here |
+| `YOUTUBE_COOKIES_FILE` | *(auto-detected)* | Container path to a `cookies.txt` for age-gated / geo-restricted YouTube videos |
 
 ### External API Keys *(all optional)*
 
@@ -405,6 +522,19 @@ Make sure the Jellyfin API key has write permissions and that at least one libra
 
 **Discovery queue is empty**
 Run a full index first (Dashboard → Index Now), then trigger a Discovery Refresh from the Settings page.
+
+**YouTube rip fails with "not available" or "geo-restricted"**
+Export a `cookies.txt` from your browser while logged into YouTube and copy it into the container:
+```bash
+docker cp cookies.txt jellydj-backend:/config/youtube-cookies.txt
+```
+JellyDJ auto-detects it there — no restart needed.
+
+**Ripped MP3s don't appear in Jellyfin**
+Check that `YOUTUBE_RIPS_PATH` in your `.env` points to a folder that is already part of a Jellyfin music library. The path must exist on the Docker host before the stack starts. Run a manual library scan in Jellyfin if the file is present but not indexed.
+
+**YouTube rip returns "Too many rips in progress"**
+JellyDJ allows 2 concurrent rip jobs. Wait for a current rip to finish before submitting another.
 
 ---
 
