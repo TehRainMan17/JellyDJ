@@ -36,7 +36,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // Keep channel open for async response
   }
   if (message.action === 'ripYouTube') {
-    handleRip(message.url).then(sendResponse);
+    handleRip(message.url, message.metadata || {}).then(sendResponse);
+    return true;
+  }
+  if (message.action === 'searchMusicBrainz') {
+    handleMusicBrainzSearch(message.query).then(sendResponse);
     return true;
   }
   if (message.action === 'pollRipStatus') {
@@ -74,7 +78,7 @@ async function handlePollRipStatus(jobId) {
   }
 }
 
-async function handleRip(url) {
+async function handleRip(url, metadata = {}) {
   const { jellydjUrl, jellydjToken } = await chrome.storage.local.get(['jellydjUrl', 'jellydjToken']);
 
   if (!jellydjUrl) {
@@ -90,7 +94,7 @@ async function handleRip(url) {
         'Content-Type': 'application/json',
         ...(jellydjToken ? { 'X-JellyDJ-Key': jellydjToken } : {}),
       },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, ...metadata }),
     });
 
     if (!resp.ok) {
@@ -102,6 +106,28 @@ async function handleRip(url) {
     return { ok: true, job_id: data.job_id };
   } catch (err) {
     return { ok: false, error: err.message || 'Network error — is JellyDJ running?' };
+  }
+}
+
+async function handleMusicBrainzSearch(query) {
+  // MusicBrainz requires a descriptive User-Agent with contact info.
+  // Routing through the service worker avoids CORS issues from content scripts.
+  const searchUrl =
+    'https://musicbrainz.org/ws/2/recording/?' +
+    'query=' + encodeURIComponent(query) +
+    '&fmt=json&limit=8';
+  try {
+    const resp = await fetch(searchUrl, {
+      headers: {
+        'User-Agent': 'JellyDJ/1.0 (self-hosted music recommendation; github.com/TehRainMan17)',
+        'Accept': 'application/json',
+      },
+    });
+    if (!resp.ok) return { ok: false, error: `MusicBrainz HTTP ${resp.status}` };
+    const data = await resp.json();
+    return { ok: true, recordings: data.recordings || [] };
+  } catch (err) {
+    return { ok: false, error: err.message || 'Network error' };
   }
 }
 

@@ -23,3 +23,5 @@ pytest>=8.0.0
 python-jose[cryptography]>=3.3.0
 # Playlist Import — metadata fetch from Spotify/Tidal/YouTube Music without API keys
 yt-dlp>=2024.1.0
+# ID3 tag writing for YouTube rips with user-corrected metadata
+mutagen>=1.47.0

@@ -488,6 +488,360 @@
   // Falls back to a floating bottom-right button if the actions bar isn't ready.
   // Hidden while the player is in fullscreen mode.
 
+  // ── YouTube page metadata helpers ───────────────────────────────────────────
+
+  function getYouTubeVideoTitle() {
+    const selectors = [
+      '#title h1 yt-formatted-string',
+      'h1.ytd-watch-metadata yt-formatted-string',
+      '#above-the-fold #title yt-formatted-string',
+      'ytd-watch-metadata h1 yt-formatted-string',
+      '#title yt-formatted-string',
+    ];
+    for (const sel of selectors) {
+      const text = document.querySelector(sel)?.textContent?.trim();
+      if (text) return text;
+    }
+    return document.title.replace(/\s*[-–|]\s*YouTube\s*$/, '').trim() || 'Unknown Title';
+  }
+
+  function getYouTubeChannelName() {
+    const selectors = [
+      '#owner #channel-name a',
+      '#owner ytd-channel-name a',
+      'ytd-channel-name a.yt-formatted-string',
+      '#upload-info ytd-channel-name yt-formatted-string',
+    ];
+    for (const sel of selectors) {
+      const text = document.querySelector(sel)?.textContent?.trim();
+      if (text) return text;
+    }
+    return '';
+  }
+
+  // Strip "(Official Audio)", "[Lyrics]", etc. — same patterns as the server-side cleaner.
+  function _clientCleanTitle(s) {
+    return s
+      .replace(/\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:lyric\s*)?(?:audio\s*)?(?:video)?|lyrics?(?:\s*video)?|hd|4k|explicit|clean\s*version|remaster(?:ed)?(?:\s*\d{4})?|audio|video|mv|m\/v|vevo|amv)\s*[\)\]]\s*/gi, ' ')
+      .replace(/\s*[-|]\s*(?:official\s*(?:music\s*)?(?:lyric\s*)?(?:audio\s*)?(?:video)?|lyrics?)\s*$/i, '')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  // Parse "Artist – Title" from a YouTube video title, using the channel name as
+  // the fallback artist when no dash separator is found.
+  function parseVideoTitle(videoTitle, channelName) {
+    const cleaned = _clientCleanTitle(videoTitle);
+    const m = cleaned.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+    if (m) return { title: m[2].trim(), artist: m[1].trim() };
+    return { title: cleaned, artist: channelName || '' };
+  }
+
+  function _escHtml(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ── Pre-rip modal ─────────────────────────────────────────────────────────────
+  //
+  // Shown when the user clicks "Rip to JellyDJ".  Lets them verify / correct
+  // the song title and artist before the download starts, and optionally match
+  // the recording to MusicBrainz so the final MP3 gets accurate ID3 tags.
+
+  const _MODAL_CSS = `
+    :host { all: initial; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    .overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.78);
+      z-index: 2147483647;
+      display: flex; align-items: center; justify-content: center;
+      font-family: "YouTube Sans", "Roboto", system-ui, sans-serif;
+      font-size: 14px; color: #e2e2e6;
+    }
+    .modal {
+      background: #18181c; border: 1px solid #2a2a30; border-radius: 12px;
+      width: 500px; max-width: calc(100vw - 32px); max-height: calc(100vh - 48px);
+      overflow-y: auto; padding: 22px;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.75);
+    }
+    .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .modal-title {
+      font-size: 15px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .close-btn {
+      background: none; border: none; color: #555; cursor: pointer;
+      font-size: 22px; line-height: 1; padding: 0 2px; font-family: inherit;
+    }
+    .close-btn:hover { color: #e2e2e6; }
+    .video-hint {
+      font-size: 11px; color: #555; margin-bottom: 18px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    label { display: block; font-size: 11px; color: #777; margin-bottom: 4px; margin-top: 14px; }
+    input {
+      width: 100%; padding: 8px 10px; background: #111115;
+      border: 1px solid #2a2a30; border-radius: 6px;
+      color: #e2e2e6; font-size: 13px; outline: none; font-family: inherit;
+    }
+    input:focus { border-color: #7c3aed; }
+    .mb-section {
+      margin-top: 18px; border: 1px solid #222; border-radius: 8px;
+      padding: 12px; background: #111115;
+    }
+    .mb-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .mb-label { font-size: 12px; color: #7c3aed; font-weight: 600; letter-spacing: 0.03em; }
+    .mb-search-btn {
+      background: #222228; border: 1px solid #333; color: #aaa; border-radius: 5px;
+      padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+    }
+    .mb-search-btn:hover { background: #2a2a30; color: #e2e2e6; }
+    .mb-search-btn:disabled { opacity: 0.4; cursor: default; }
+    .mb-status { font-size: 12px; color: #555; min-height: 16px; }
+    .mb-results {
+      margin-top: 8px; max-height: 210px; overflow-y: auto;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .mb-result {
+      padding: 8px 10px; background: #18181c;
+      border: 1px solid #2a2a30; border-radius: 6px; cursor: pointer;
+      transition: border-color 0.1s;
+    }
+    .mb-result:hover { border-color: #7c3aed; }
+    .mb-result.selected { border-color: #7c3aed; background: #1e1535; }
+    .mb-result-title { font-size: 13px; font-weight: 500; }
+    .mb-result-sub { font-size: 11px; color: #777; margin-top: 3px; }
+    .footer {
+      display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px;
+    }
+    .btn-cancel {
+      background: transparent; border: 1px solid #2a2a30; color: #888;
+      padding: 8px 16px; border-radius: 6px; cursor: pointer;
+      font-size: 13px; font-family: inherit;
+    }
+    .btn-cancel:hover { border-color: #444; color: #e2e2e6; }
+    .btn-rip {
+      background: #7c3aed; border: none; color: white;
+      padding: 8px 20px; border-radius: 6px; cursor: pointer;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+    }
+    .btn-rip:hover { background: #6d28d9; }
+    .btn-rip:disabled { opacity: 0.5; cursor: default; }
+  `;
+
+  function showRipModal(videoTitle, channelName) {
+    return new Promise((resolve) => {
+      // Use Shadow DOM so YouTube's CSS cannot bleed into the modal.
+      const wrapper = document.createElement('div');
+      wrapper.id = 'jellydj-rip-modal';
+      const shadow = wrapper.attachShadow({ mode: 'open' });
+
+      const parsed = parseVideoTitle(videoTitle, channelName);
+
+      shadow.innerHTML = `
+        <style>${_MODAL_CSS}</style>
+        <div class="overlay" id="overlay">
+          <div class="modal">
+            <div class="modal-header">
+              <div class="modal-title">
+                <img src="${JELLYDJ_LOGO_SRC}" style="width:20px;height:20px;border-radius:50%;flex-shrink:0" alt="">
+                Rip to JellyDJ
+              </div>
+              <button class="close-btn" id="close-btn" aria-label="Close">✕</button>
+            </div>
+
+            <div class="video-hint" title="${_escHtml(videoTitle)}">Video: "${_escHtml(videoTitle)}"</div>
+
+            <label>Song Title</label>
+            <input id="title-input" type="text" placeholder="Song title" />
+
+            <label>Artist</label>
+            <input id="artist-input" type="text" placeholder="Artist name" />
+
+            <div class="mb-section">
+              <div class="mb-header">
+                <span class="mb-label">MusicBrainz Match</span>
+                <button class="mb-search-btn" id="mb-search-btn">Search again</button>
+              </div>
+              <div class="mb-status" id="mb-status">Searching…</div>
+              <div class="mb-results" id="mb-results"></div>
+            </div>
+
+            <div class="footer">
+              <button class="btn-cancel" id="cancel-btn">Cancel</button>
+              <button class="btn-rip" id="confirm-btn">Rip to JellyDJ →</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      document.body.appendChild(wrapper);
+
+      const titleInput  = shadow.getElementById('title-input');
+      const artistInput = shadow.getElementById('artist-input');
+      const mbStatus    = shadow.getElementById('mb-status');
+      const mbResults   = shadow.getElementById('mb-results');
+      const mbSearchBtn = shadow.getElementById('mb-search-btn');
+      const cancelBtn   = shadow.getElementById('cancel-btn');
+      const confirmBtn  = shadow.getElementById('confirm-btn');
+      const closeBtn    = shadow.getElementById('close-btn');
+      const overlay     = shadow.getElementById('overlay');
+
+      titleInput.value  = parsed.title;
+      artistInput.value = parsed.artist;
+
+      let selectedMbData = null;
+      let searchDebounce = null;
+
+      function closeModal(result) {
+        wrapper.remove();
+        document.removeEventListener('keydown', onEscape);
+        resolve(result);
+      }
+
+      function onEscape(e) {
+        if (e.key === 'Escape') closeModal(null);
+      }
+      document.addEventListener('keydown', onEscape);
+
+      function renderResults(recordings) {
+        mbResults.innerHTML = '';
+        if (!recordings || recordings.length === 0) {
+          mbStatus.textContent = 'No results — edit the fields and try again.';
+          return;
+        }
+        mbStatus.textContent =
+          recordings.length + ' result' + (recordings.length > 1 ? 's' : '') + ' — click to select';
+
+        recordings.forEach((rec) => {
+          const artistStr = (rec['artist-credit'] || [])
+            .map(c => c.artist?.name || c.name || '').filter(Boolean).join(', ');
+          const releases    = rec.releases || [];
+          const release     = releases[0];
+          const album       = release?.title || '';
+          const year        = (release?.date || '').slice(0, 4);
+          const albumType   = release?.['release-group']?.['primary-type'] || '';
+          const durationMs  = rec.length;
+          const durStr      = durationMs
+            ? Math.floor(durationMs / 60000) + ':' + String(Math.floor((durationMs % 60000) / 1000)).padStart(2, '0')
+            : '';
+
+          const subParts = [artistStr];
+          const releaseInfo = [album, albumType && albumType !== 'Album' ? albumType : '', year]
+            .filter(Boolean).join(', ');
+          if (releaseInfo) subParts.push(releaseInfo);
+          if (durStr)      subParts.push(durStr);
+
+          const el = document.createElement('div');
+          el.className = 'mb-result';
+          el.innerHTML =
+            '<div class="mb-result-title">' + _escHtml(rec.title) + '</div>' +
+            '<div class="mb-result-sub">'   + _escHtml(subParts.join(' · ')) + '</div>';
+
+          el.addEventListener('click', () => {
+            shadow.querySelectorAll('.mb-result').forEach(r => r.classList.remove('selected'));
+            el.classList.add('selected');
+            titleInput.value  = rec.title;
+            artistInput.value = artistStr;
+            selectedMbData = {
+              user_title:     rec.title,
+              user_artist:    artistStr,
+              user_album:     album,
+              user_year:      year,
+              recording_mbid: rec.id || '',
+              artist_mbid:    rec['artist-credit']?.[0]?.artist?.id || '',
+            };
+          });
+
+          mbResults.appendChild(el);
+        });
+      }
+
+      async function doSearch() {
+        const qTitle  = titleInput.value.trim();
+        const qArtist = artistInput.value.trim();
+        if (!qTitle && !qArtist) {
+          mbStatus.textContent = 'Enter a title or artist to search.';
+          return;
+        }
+
+        mbStatus.textContent = 'Searching MusicBrainz…';
+        mbResults.innerHTML  = '';
+        mbSearchBtn.disabled = true;
+        selectedMbData       = null;
+        shadow.querySelectorAll('.mb-result').forEach(r => r.classList.remove('selected'));
+
+        const query = (qTitle && qArtist)
+          ? 'recording:"' + qTitle + '" AND artist:"' + qArtist + '"'
+          : (qTitle || qArtist);
+
+        if (!chrome?.runtime?.id) {
+          mbStatus.textContent = 'Extension reloaded — refresh the page.';
+          mbSearchBtn.disabled = false;
+          return;
+        }
+
+        try {
+          const result = await new Promise((res, rej) => {
+            const tid = setTimeout(() => rej(new Error('Search timed out')), 12000);
+            chrome.runtime.sendMessage({ action: 'searchMusicBrainz', query }, (resp) => {
+              clearTimeout(tid);
+              if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
+              else res(resp);
+            });
+          });
+          if (!result.ok) {
+            mbStatus.textContent = 'Search failed: ' + result.error;
+          } else {
+            renderResults(result.recordings);
+          }
+        } catch (err) {
+          mbStatus.textContent = 'Search error: ' + err.message;
+        } finally {
+          mbSearchBtn.disabled = false;
+        }
+      }
+
+      // Buttons
+      cancelBtn.addEventListener('click',  () => closeModal(null));
+      closeBtn.addEventListener('click',   () => closeModal(null));
+      overlay.addEventListener('click',    (e) => { if (e.target === overlay) closeModal(null); });
+      mbSearchBtn.addEventListener('click', () => doSearch());
+
+      confirmBtn.addEventListener('click', () => {
+        const title  = titleInput.value.trim();
+        const artist = artistInput.value.trim();
+        if (!title) { titleInput.focus(); return; }
+        // If the user selected a MusicBrainz result, use its full metadata.
+        // If they edited the fields manually, send only what they typed.
+        const meta = selectedMbData
+          ? { ...selectedMbData, user_title: titleInput.value.trim(), user_artist: artistInput.value.trim() }
+          : { user_title: title, user_artist: artist };
+        closeModal(meta);
+      });
+
+      // Re-search with debounce when fields change (clears any MB selection)
+      [titleInput, artistInput].forEach(inp => {
+        inp.addEventListener('input', () => {
+          selectedMbData = null;
+          shadow.querySelectorAll('.mb-result').forEach(r => r.classList.remove('selected'));
+          clearTimeout(searchDebounce);
+          searchDebounce = setTimeout(() => doSearch(), 750);
+        });
+      });
+
+      // Auto-search on open
+      doSearch();
+    });
+  }
+
+  // ── Rip button helpers ────────────────────────────────────────────────────────
+
   function resetRipButton(btn) {
     btn.innerHTML = JELLYDJ_LOGO_SRC
       ? JELLYDJ_ICON + '<span>Rip to JellyDJ</span>'
@@ -693,9 +1047,6 @@
     const btn = document.getElementById('jellydj-rip-btn');
     if (!btn || btn.disabled) return;
 
-    btn.disabled = true;
-    setRipText(btn, 'Starting…');
-
     if (!chrome?.runtime?.id) {
       setRipText(btn, 'Extension reloaded — refresh page');
       btn.style.background = '#dc2626';
@@ -703,16 +1054,34 @@
       return;
     }
 
-    // POST to JellyDJ via background.js to get a job ID
+    // Show the pre-rip modal so the user can verify / correct metadata and
+    // optionally match the recording in MusicBrainz before downloading.
+    const videoTitle  = getYouTubeVideoTitle();
+    const channelName = getYouTubeChannelName();
+    const metadata    = await showRipModal(videoTitle, channelName);
+
+    // null means the user cancelled
+    if (!metadata) return;
+
+    btn.disabled = true;
+    setRipText(btn, 'Starting…');
+
+    // POST to JellyDJ via background.js to get a job ID.
+    // Routing through background.js avoids mixed-content blocks: YouTube is
+    // served over HTTPS and a direct fetch() to an HTTP JellyDJ URL is blocked
+    // by Chrome.  The service worker has no such restriction.
     let jobId;
     try {
       const result = await new Promise((resolve, reject) => {
         const tid = setTimeout(() => reject(new Error('Timed out — is JellyDJ running?')), 15000);
-        chrome.runtime.sendMessage({ action: 'ripYouTube', url: location.href }, (resp) => {
-          clearTimeout(tid);
-          if (chrome.runtime.lastError) reject(new Error('Extension error — refresh page'));
-          else resolve(resp);
-        });
+        chrome.runtime.sendMessage(
+          { action: 'ripYouTube', url: location.href, metadata },
+          (resp) => {
+            clearTimeout(tid);
+            if (chrome.runtime.lastError) reject(new Error('Extension error — refresh page'));
+            else resolve(resp);
+          }
+        );
       });
 
       if (!result.ok) throw new Error(result.error || 'Failed to queue rip');
@@ -732,10 +1101,6 @@
       scanning:     'Updating Jellyfin library…',
     };
 
-    // Poll every 3 s for up to 3 minutes.
-    // Routing through background.js avoids mixed-content blocks: YouTube is
-    // served over HTTPS and a direct fetch() to an HTTP JellyDJ URL is blocked
-    // by Chrome.  The service worker has no such restriction.
     let attempts = 0;
     const MAX = 60;
 
@@ -774,7 +1139,7 @@
 
       const job = result.job;
       if (job.status === 'done') {
-        const label = job.title ? `Ripped: ${job.title}` : 'Ripped!';
+        const label = job.title ? 'Ripped: ' + job.title : 'Ripped!';
         setRipText(btn, label);
         btn.style.background = '#16a34a';
         btn.disabled = false;

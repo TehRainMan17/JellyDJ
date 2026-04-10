@@ -123,6 +123,15 @@ def _safe_name(name: str) -> str:
 
 class RipRequest(BaseModel):
     url: str
+    # Optional user-provided metadata (from the browser extension's pre-rip modal).
+    # When supplied, these override the YouTube video title / channel name for the
+    # output filename, folder structure, and ID3 tags.
+    user_title:     str | None = None
+    user_artist:    str | None = None
+    user_album:     str | None = None
+    user_year:      str | None = None
+    recording_mbid: str | None = None   # MusicBrainz recording MBID
+    artist_mbid:    str | None = None   # MusicBrainz artist MBID
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -183,7 +192,7 @@ def start_rip(
 
     t = threading.Thread(
         target=_run_rip,
-        args=(job_id, clean_url),
+        args=(job_id, clean_url, payload),
         daemon=True,
         name=f"yt-rip-{job_id[:8]}",
     )
@@ -203,11 +212,11 @@ def rip_status(job_id: str, _: UserContext = Depends(get_user_from_api_key_or_jw
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
-def _run_rip(job_id: str, url: str) -> None:
+def _run_rip(job_id: str, url: str, payload: RipRequest) -> None:
     job = _jobs[job_id]
 
     try:
-        _run_rip_inner(job_id, url, job)
+        _run_rip_inner(job_id, url, job, payload)
     finally:
         # Always release the concurrency slot and deregister the URL so future
         # requests for the same video are accepted again.
@@ -216,7 +225,7 @@ def _run_rip(job_id: str, url: str) -> None:
             _active_urls.pop(url, None)
 
 
-def _run_rip_inner(job_id: str, url: str, job: dict) -> None:
+def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> None:
     try:
         import yt_dlp  # already in requirements.txt
     except ImportError:
@@ -241,18 +250,24 @@ def _run_rip_inner(job_id: str, url: str, job: dict) -> None:
         job["error"] = f"Could not fetch video info: {exc}"
         return
 
-    # Resolve artist: YouTube Music videos may carry an 'artist' tag; regular
-    # videos fall back to the uploader / channel name.
-    raw_artist = (
-        info.get("artist")
-        or info.get("uploader")
-        or info.get("channel")
-        or "Unknown Artist"
-    )
-    raw_title = info.get("title") or "Unknown Title"
+    # Resolve artist and title: prefer user-supplied values from the extension's
+    # pre-rip modal, fall back to YouTube metadata.
+    if payload.user_artist:
+        artist = _safe_name(payload.user_artist)
+    else:
+        raw_artist = (
+            info.get("artist")
+            or info.get("uploader")
+            or info.get("channel")
+            or "Unknown Artist"
+        )
+        artist = _safe_name(raw_artist)
 
-    artist = _safe_name(raw_artist)
-    title  = _safe_name(_clean_title(raw_title))
+    if payload.user_title:
+        title = _safe_name(payload.user_title)
+    else:
+        raw_title = info.get("title") or "Unknown Title"
+        title = _safe_name(_clean_title(raw_title))
 
     job["artist"] = artist
     job["title"]  = title
@@ -319,18 +334,43 @@ def _run_rip_inner(job_id: str, url: str, job: dict) -> None:
                 return
 
         # ── Phase 3: move completed file into the Jellyfin-watched directory ──
+        # Organise as Artist/Album/Title.mp3 when album is known, else Artist/Title.mp3.
         # Only after a successful encode do we touch the bind mount, so Jellyfin
         # will never scan an incomplete file.
-        artist_dir = _CONTAINER_RIP_DIR / artist
+        if payload.user_album:
+            safe_album = _safe_name(payload.user_album)
+            dest_dir   = _CONTAINER_RIP_DIR / artist / safe_album
+        else:
+            dest_dir = _CONTAINER_RIP_DIR / artist
+
         try:
-            artist_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             job["status"] = "error"
-            job["error"] = f"Cannot create output directory {artist_dir}: {exc}"
+            job["error"] = f"Cannot create output directory {dest_dir}: {exc}"
             return
 
-        final_mp3 = artist_dir / tmp_mp3.name
+        final_mp3 = dest_dir / tmp_mp3.name
         shutil.move(str(tmp_mp3), str(final_mp3))
+
+        # ── Phase 4: overwrite ID3 tags with correct metadata ────────────────
+        # yt-dlp's FFmpegMetadata wrote the raw YouTube title/channel into the
+        # tags; if the user confirmed different (MusicBrainz-matched) metadata,
+        # rewrite those tags now so Jellyfin indexes the song correctly.
+        has_user_meta = any([
+            payload.user_title, payload.user_artist, payload.user_album,
+            payload.recording_mbid,
+        ])
+        if has_user_meta:
+            _write_id3_tags(
+                final_mp3,
+                title          = payload.user_title or title,
+                artist         = payload.user_artist or artist,
+                album          = payload.user_album or "",
+                year           = payload.user_year or "",
+                recording_mbid = payload.recording_mbid or "",
+                artist_mbid    = payload.artist_mbid or "",
+            )
 
     finally:
         # Always clean up the temp directory, even on error paths.
@@ -340,6 +380,64 @@ def _run_rip_inner(job_id: str, url: str, job: dict) -> None:
 
     job["status"] = "done"
     log.info("YouTube rip complete: %s / %s → %s", artist, title, final_mp3)
+
+
+def _write_id3_tags(
+    path: Path,
+    title: str,
+    artist: str,
+    album: str = "",
+    year: str = "",
+    recording_mbid: str = "",
+    artist_mbid: str = "",
+) -> None:
+    """Overwrite ID3 tags on a completed MP3 with user-verified metadata."""
+    try:
+        from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TXXX
+        from mutagen.mp3 import MP3
+    except ImportError:
+        log.warning("mutagen not installed — ID3 tags not updated; add mutagen to requirements.txt")
+        return
+
+    try:
+        audio = MP3(str(path), ID3=ID3)
+        if audio.tags is None:
+            audio.add_tags()
+        tags = audio.tags
+
+        tags.delall("TIT2")
+        tags.add(TIT2(encoding=3, text=title))
+
+        tags.delall("TPE1")
+        tags.add(TPE1(encoding=3, text=artist))
+
+        if album:
+            tags.delall("TALB")
+            tags.add(TALB(encoding=3, text=album))
+
+        if year:
+            tags.delall("TDRC")
+            tags.add(TDRC(encoding=3, text=str(year)))
+
+        if recording_mbid:
+            for key in list(tags.keys()):
+                if key.startswith("TXXX:MusicBrainz Recording"):
+                    del tags[key]
+            tags.add(TXXX(encoding=3, desc="MusicBrainz Recording Id", text=recording_mbid))
+
+        if artist_mbid:
+            for key in list(tags.keys()):
+                if key.startswith("TXXX:MusicBrainz Artist"):
+                    del tags[key]
+            tags.add(TXXX(encoding=3, desc="MusicBrainz Artist Id", text=artist_mbid))
+
+        audio.save()
+        log.info(
+            "ID3 tags written: title=%r artist=%r album=%r mbid=%s",
+            title, artist, album, recording_mbid,
+        )
+    except Exception as exc:
+        log.warning("Failed to write ID3 tags for %s: %s", path, exc)
 
 
 # ── Jellyfin library refresh ──────────────────────────────────────────────────
