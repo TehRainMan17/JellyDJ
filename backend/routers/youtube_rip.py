@@ -285,26 +285,55 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
         return
 
     # ── Phase 1: extract metadata without downloading ─────────────────────────
+    # Try multiple YouTube player clients in order.  Some content (VEVO, Disney)
+    # that is unavailable to the default web client can be fetched via the iOS or
+    # Android clients, which go through different availability checks on YouTube's
+    # side.  We carry the winning extractor_args into Phase 2 so both phases use
+    # the same client.
     job["status"] = "fetching_info"
     cookies_file = _get_cookies_file()
     if cookies_file:
         log.info("Using YouTube cookies file: %s", cookies_file)
-    try:
-        info_opts: dict = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
+
+    _CLIENT_SEQUENCE = [
+        # (label, extractor_args or None)
+        ("web",     None),
+        ("ios",     {"youtube": {"player_client": ["ios"]}}),
+        ("android", {"youtube": {"player_client": ["android"]}}),
+    ]
+
+    info: dict | None = None
+    winning_extractor_args: dict | None = None
+    last_exc: Exception | None = None
+
+    for client_label, extractor_args in _CLIENT_SEQUENCE:
+        base_opts: dict = {
+            "quiet":        True,
+            "no_warnings":  True,
+            "noplaylist":   True,
             "extract_flat": False,
-            "geo_bypass": True,
+            "geo_bypass":   True,
         }
+        if extractor_args:
+            base_opts["extractor_args"] = extractor_args
         if cookies_file:
-            info_opts["cookiefile"] = cookies_file
-        with yt_dlp.YoutubeDL(info_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        log.warning("yt-dlp metadata extraction failed for %s: %s", url, exc)
+            base_opts["cookiefile"] = cookies_file
+        try:
+            with yt_dlp.YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            log.info("yt-dlp metadata OK via client=%s url=%s", client_label, url)
+            winning_extractor_args = extractor_args
+            break
+        except Exception as exc:
+            log.warning(
+                "yt-dlp metadata failed (client=%s) for %s: %s",
+                client_label, url, exc,
+            )
+            last_exc = exc
+
+    if info is None:
         job["status"] = "error"
-        job["error"] = _friendly_rip_error(str(exc))
+        job["error"] = _friendly_rip_error(str(last_exc))
         return
 
     # Resolve artist and title: prefer user-supplied values from the extension's
@@ -365,6 +394,8 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
                 },
             ],
         }
+        if winning_extractor_args:
+            dl_opts["extractor_args"] = winning_extractor_args
         if cookies_file:
             dl_opts["cookiefile"] = cookies_file
 
