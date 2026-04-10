@@ -755,6 +755,7 @@
               user_year:      year,
               recording_mbid: rec.id || '',
               artist_mbid:    rec['artist-credit']?.[0]?.artist?.id || '',
+              release_mbid:   release?.id || '',
             };
           });
 

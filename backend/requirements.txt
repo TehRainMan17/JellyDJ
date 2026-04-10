@@ -25,3 +25,5 @@ python-jose[cryptography]>=3.3.0
 yt-dlp>=2024.1.0
 # ID3 tag writing for YouTube rips with user-corrected metadata
 mutagen>=1.47.0
+# Image processing for YouTube rip cover art (crop thumbnail to square)
+Pillow>=10.0.0

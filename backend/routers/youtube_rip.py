@@ -132,6 +132,7 @@ class RipRequest(BaseModel):
     user_year:      str | None = None
     recording_mbid: str | None = None   # MusicBrainz recording MBID
     artist_mbid:    str | None = None   # MusicBrainz artist MBID
+    release_mbid:   str | None = None   # MusicBrainz release MBID (for Cover Art Archive)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -353,7 +354,21 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
         final_mp3 = dest_dir / tmp_mp3.name
         shutil.move(str(tmp_mp3), str(final_mp3))
 
-        # ── Phase 4: overwrite ID3 tags with correct metadata ────────────────
+        # ── Phase 4: cover art ───────────────────────────────────────────────
+        # Fetch cover art now that we have the final file path and both
+        # potential sources: the MusicBrainz release MBID (if the user matched
+        # in the pre-rip modal) and the YouTube video thumbnail (fallback).
+        # Embed into the MP3 as an ID3 APIC frame AND save cover.jpg in the
+        # destination directory so Jellyfin finds art via both paths.
+        cover_bytes = _fetch_cover_art(
+            release_mbid  = payload.release_mbid,
+            thumbnail_url = _best_thumbnail(info),
+        )
+        if cover_bytes:
+            _embed_cover_art(final_mp3, cover_bytes)
+            _save_cover_file(dest_dir, cover_bytes)
+
+        # ── Phase 5: overwrite ID3 tags with correct metadata ────────────────
         # yt-dlp's FFmpegMetadata wrote the raw YouTube title/channel into the
         # tags; if the user confirmed different (MusicBrainz-matched) metadata,
         # rewrite those tags now so Jellyfin indexes the song correctly.
@@ -380,6 +395,126 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
 
     job["status"] = "done"
     log.info("YouTube rip complete: %s / %s → %s", artist, title, final_mp3)
+
+
+def _best_thumbnail(info: dict) -> str | None:
+    """Return the highest-resolution thumbnail URL from a yt-dlp info dict."""
+    thumbnails = info.get("thumbnails") or []
+    ranked = sorted(
+        [t for t in thumbnails if t.get("url")],
+        key=lambda t: t.get("width", 0) * t.get("height", 0),
+        reverse=True,
+    )
+    if ranked:
+        return ranked[0]["url"]
+    return info.get("thumbnail")
+
+
+def _crop_to_square(img_bytes: bytes) -> bytes:
+    """
+    Center-crop image bytes to a square JPEG.
+    YouTube thumbnails are 16:9 — we crop the sides to make them square so
+    Jellyfin doesn't letterbox or distort the album art.
+    Returns original bytes unchanged if Pillow is unavailable or crop fails.
+    """
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = img.size
+        size = min(w, h)
+        left = (w - size) // 2
+        top  = (h - size) // 2
+        cropped = img.crop((left, top, left + size, top + size))
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except Exception as exc:
+        log.debug("Image crop to square failed (using original): %s", exc)
+        return img_bytes
+
+
+def _fetch_cover_art(release_mbid: str | None, thumbnail_url: str | None) -> bytes | None:
+    """
+    Fetch cover art for the ripped track.
+
+    Resolution order
+    ────────────────
+    1. MusicBrainz Cover Art Archive (front image for the matched release).
+       Requires a valid release_mbid from the user's MusicBrainz selection.
+    2. YouTube video thumbnail, center-cropped from 16:9 to square via Pillow.
+
+    Returns JPEG bytes, or None if both sources fail.
+    """
+    import httpx
+
+    # ── Option 1: Cover Art Archive ───────────────────────────────────────────
+    if release_mbid:
+        try:
+            resp = httpx.get(
+                f"https://coverartarchive.org/release/{release_mbid}/front",
+                follow_redirects=True,
+                timeout=20.0,
+                headers={"User-Agent": "JellyDJ/1.0 (self-hosted; github.com/TehRainMan17)"},
+            )
+            if resp.status_code == 200 and resp.content:
+                log.info("Cover art fetched from Cover Art Archive for release %s", release_mbid)
+                return resp.content
+            log.debug("Cover Art Archive returned HTTP %s for release %s", resp.status_code, release_mbid)
+        except Exception as exc:
+            log.debug("Cover Art Archive request failed for %s: %s", release_mbid, exc)
+
+    # ── Option 2: YouTube thumbnail (cropped to square) ───────────────────────
+    if thumbnail_url:
+        try:
+            resp = httpx.get(thumbnail_url, follow_redirects=True, timeout=15.0)
+            if resp.status_code == 200 and resp.content:
+                log.info("Cover art fetched from YouTube thumbnail, cropping to square")
+                return _crop_to_square(resp.content)
+            log.debug("YouTube thumbnail fetch returned HTTP %s", resp.status_code)
+        except Exception as exc:
+            log.debug("YouTube thumbnail fetch failed: %s", exc)
+
+    log.debug("No cover art source succeeded for release_mbid=%s thumbnail=%s", release_mbid, thumbnail_url)
+    return None
+
+
+def _embed_cover_art(path: Path, cover_bytes: bytes) -> None:
+    """Embed JPEG cover art as an ID3 APIC (Attached Picture) frame in an MP3."""
+    try:
+        from mutagen.id3 import ID3, APIC
+        from mutagen.mp3 import MP3
+        audio = MP3(str(path), ID3=ID3)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("APIC")
+        audio.tags.add(APIC(
+            encoding=3,          # UTF-8
+            mime="image/jpeg",
+            type=3,              # Front cover
+            desc="Cover",
+            data=cover_bytes,
+        ))
+        audio.save()
+        log.info("Cover art embedded in ID3 tags: %s", path)
+    except Exception as exc:
+        log.warning("Failed to embed cover art in %s: %s", path, exc)
+
+
+def _save_cover_file(dest_dir: Path, cover_bytes: bytes) -> None:
+    """
+    Write cover.jpg alongside the MP3 so Jellyfin's file-based art scanner
+    also picks it up (useful when ID3 embedding is not read for some reason).
+    Only writes if no cover.jpg already exists in the directory.
+    """
+    cover_path = dest_dir / "cover.jpg"
+    if cover_path.exists():
+        return  # don't overwrite art from a previous rip in the same album dir
+    try:
+        cover_path.write_bytes(cover_bytes)
+        log.info("cover.jpg saved: %s", cover_path)
+    except Exception as exc:
+        log.warning("Failed to write cover.jpg to %s: %s", dest_dir, exc)
 
 
 def _write_id3_tags(
