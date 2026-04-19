@@ -90,6 +90,11 @@ _JOB_DEFAULTS = {
         "sent": 0, "total": 0,
         "started_at": None, "finished_at": None, "error": None,
     },
+    "audio_analysis": {
+        "running": False, "phase": "",
+        "tracks_done": 0, "tracks_total": 0, "tracks_failed": 0,
+        "started_at": None, "finished_at": None, "error": None,
+    },
 }
 
 def _get_job_state(job_id: str) -> dict:
@@ -177,6 +182,8 @@ class AutomationSettingsUpdate(BaseModel):
     popularity_cache_refresh_interval_hours: Optional[int] = None
     billboard_refresh_enabled: Optional[bool] = None    # was missing — caused 422 on every save
     billboard_refresh_interval_hours: Optional[int] = None  # was missing — caused 422 on every save
+    audio_analysis_enabled: Optional[bool] = None
+    audio_analysis_interval_hours: Optional[int] = None
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -211,6 +218,9 @@ def get_settings(_: UserContext = Depends(get_current_user), db: Session = Depen
         "last_index": s.last_index,
         "last_discovery_refresh": s.last_discovery_refresh,
         "last_popularity_cache_refresh": s.last_popularity_cache_refresh,
+        "audio_analysis_enabled": bool(s.audio_analysis_enabled) if s.audio_analysis_enabled is not None else True,
+        "audio_analysis_interval_hours": s.audio_analysis_interval_hours or 24,
+        "last_audio_analysis": s.last_audio_analysis,
     }
 
 
@@ -269,6 +279,14 @@ def update_settings(payload: AutomationSettingsUpdate, _: UserContext = Depends(
         if not (24 <= payload.billboard_refresh_interval_hours <= 168):
             raise HTTPException(400, "Billboard interval must be 24–168 hours")
         s.billboard_refresh_interval_hours = payload.billboard_refresh_interval_hours
+
+    if payload.audio_analysis_enabled is not None:
+        s.audio_analysis_enabled = payload.audio_analysis_enabled
+
+    if payload.audio_analysis_interval_hours is not None:
+        if not (1 <= payload.audio_analysis_interval_hours <= 168):
+            raise HTTPException(400, "Audio analysis interval must be 1–168 hours")
+        s.audio_analysis_interval_hours = payload.audio_analysis_interval_hours
 
     db.commit()
 
@@ -1025,3 +1043,67 @@ def reset_all_job_states(_: UserContext = Depends(require_admin)):
     if reset:
         log.warning("All running job states reset by admin: %s", reset)
     return {"ok": True, "reset": reset, "message": f"Cleared {len(reset)} job state(s)"}
+
+
+# ── Audio analysis trigger / status ──────────────────────────────────────────
+
+async def _run_audio_analysis_async():
+    """Async implementation of the audio analysis job — called from trigger endpoint."""
+    import asyncio
+    import threading
+    from services.audio_analysis import analyze_new_tracks
+
+    if _get_job_state("audio_analysis").get("running"):
+        log.warning("Audio analysis already running — ignoring duplicate trigger")
+        return
+
+    def _run():
+        import asyncio as _aio
+        from database import SessionLocal as _SL
+
+        _set_job_state("audio_analysis", running=True, phase="Starting…",
+                       tracks_done=0, tracks_total=0, tracks_failed=0, error=None)
+        db = _SL()
+        try:
+            def _progress(done, total, failed, phase, current_track=None, status_line=None):
+                _set_job_state("audio_analysis", running=True, phase=phase,
+                               tracks_done=done, tracks_total=total, tracks_failed=failed,
+                               current_track=current_track, status_line=status_line)
+
+            result = _aio.run(analyze_new_tracks(db, set_state=_progress))
+            _stamp_setting("last_audio_analysis", __import__("datetime").datetime.utcnow())
+            _set_job_state("audio_analysis", running=False, phase="Complete",
+                           tracks_done=result["done"], tracks_total=result["total"],
+                           tracks_failed=result["failed"])
+        except Exception as exc:
+            log.error("Audio analysis failed: %s", exc, exc_info=True)
+            _set_job_state("audio_analysis", running=False, phase="Error", error=str(exc))
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, daemon=True, name="manual-audio-analysis").start()
+
+
+@router.post("/trigger/audio-analysis")
+async def trigger_audio_analysis(_: UserContext = Depends(require_admin)):
+    """Manually trigger audio waveform analysis for unprocessed tracks."""
+    if _get_job_state("audio_analysis").get("running"):
+        return {"ok": True, "message": "Audio analysis already running."}
+    asyncio.create_task(_run_audio_analysis_async())
+    return {"ok": True, "message": "Audio analysis started in background"}
+
+
+@router.get("/trigger/audio-analysis/status")
+def audio_analysis_status(_: UserContext = Depends(get_current_user)):
+    """Return current progress of the audio analysis job."""
+    return _get_job_state("audio_analysis")
+
+
+# ── System info ───────────────────────────────────────────────────────────────
+
+import os as _os
+
+@router.get("/system/timezone")
+def system_timezone(_: UserContext = Depends(get_current_user)):
+    """Return the server's configured timezone (TZ env var) for UI display."""
+    return {"timezone": _os.environ.get("TZ", "UTC")}

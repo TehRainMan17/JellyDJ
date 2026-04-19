@@ -1,17 +1,26 @@
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../lib/api'
-import { Clock, RefreshCw, Loader2, Save, Play, Telescope, Zap, Download, ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp, Trash2 } from 'lucide-react'
+import {
+  Clock, RefreshCw, Loader2, Save, Zap, Telescope, Download,
+  ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp,
+  Trash2, Activity,
+} from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
-// Python's datetime.utcnow().isoformat() produces "2026-02-24T14:30:00" with no
-// timezone suffix — new Date() treats that as local time in most browsers, which
-// gives wrong results or "Invalid Date" on Safari. We strip any existing offset
-// and always append Z so the string is unambiguously UTC.
 const utc = s => {
   if (!s) return s
-  // Remove any existing timezone offset (+HH:MM, -HH:MM, or Z)
   const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, '')
   return bare + 'Z'
+}
+
+// Format a UTC timestamp in the server's configured timezone.
+const fmtTime = (ts, tz) => {
+  if (!ts) return null
+  try {
+    return new Date(utc(ts)).toLocaleString(undefined, tz ? { timeZone: tz } : undefined)
+  } catch {
+    return new Date(utc(ts)).toLocaleString()
+  }
 }
 
 function Toggle({ enabled, onChange }) {
@@ -48,11 +57,10 @@ function Slider({ label, value, onChange, min=1, max=168, unit='h', markers }) {
   )
 }
 
-function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, enabled, onToggle, triggerLabel, onTrigger, triggering, children }) {
+function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, enabled, onToggle, triggerLabel, onTrigger, triggering, tz, children }) {
   return (
     <div className="rounded-2xl p-5 space-y-4 transition-all anim-fade-up"
          style={{ background:'var(--bg-elevated)', border:'1px solid var(--border)' }}>
-      {/* Header */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
@@ -69,17 +77,16 @@ function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, ena
 
       {children}
 
-      {/* Footer row */}
       <div className="flex items-center justify-between pt-1 gap-3">
         <div className="space-y-0.5">
           {lastRun && (
             <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>
-              Last run: {new Date(utc(lastRun)).toLocaleString()}
+              Last run: {fmtTime(lastRun, tz)}
             </div>
           )}
           {nextRun && !nextRun.paused && (
             <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>
-              Next: {new Date(utc(nextRun.next_run)).toLocaleString()}
+              Next: {fmtTime(nextRun.next_run, tz)}
             </div>
           )}
         </div>
@@ -94,15 +101,16 @@ function TaskCard({ icon: Icon, color, title, description, lastRun, nextRun, ena
   )
 }
 
+// ── Main panel ────────────────────────────────────────────────────────────────
+
 export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
-  // jobStatuses: { indexStatus, cacheStatus, enrichStatus, discoverStatus, downloadStatus }
-  // onTrigger: () => void — call this after any trigger POST so the parent re-starts polling
   const enrichStatus = jobStatuses.enrichStatus
 
   const [settings, setSettings]         = useState(null)
   const [jobStatus, setJobStatus]       = useState({})
   const [saving, setSaving]             = useState(false)
   const [saveMsg, setSaveMsg]           = useState('')
+  const [serverTz, setServerTz]         = useState(null)
 
   // Index
   const [indexInterval, setIndexInterval] = useState(6)
@@ -122,14 +130,19 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   // Billboard
   const [bbEnabled,   setBbEnabled]   = useState(true)
   const [bbInterval,  setBbInterval]  = useState(168)
-
-  // Trigger loading states (button spinner while POST is in-flight)
+  // Audio analysis
+  const [audioEnabled,   setAudioEnabled]   = useState(true)
+  const [audioInterval,  setAudioInterval]  = useState(24)
+  const [audioStatus,    setAudioStatus]    = useState(null)
+  const [audioStats,     setAudioStats]     = useState(null)
+  // Trigger loading states
   const [trigIndex,     setTrigIndex]     = useState(false)
   const [trigDisc,      setTrigDisc]      = useState(false)
   const [trigAuto,      setTrigAuto]      = useState(false)
   const [trigEnrich,    setTrigEnrich]    = useState(false)
   const [trigPopCache,  setTrigPopCache]  = useState(false)
   const [trigBillboard, setTrigBillboard] = useState(false)
+  const [trigAudio,     setTrigAudio]     = useState(false)
 
   useEffect(() => {
     apiFetch('/api/automation/settings').then(r=>r.json()).then(d => {
@@ -144,10 +157,15 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       setPopCacheInterval(d.popularity_cache_refresh_interval_hours ?? 24)
       setBbEnabled(d.billboard_refresh_enabled !== false)
       setBbInterval(d.billboard_refresh_interval_hours ?? 168)
+      setAudioEnabled(d.audio_analysis_enabled !== false)
+      setAudioInterval(d.audio_analysis_interval_hours ?? 24)
     }).catch(() => {})
     apiFetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
     apiFetch('/api/external-apis/cache/stats').then(r=>r.json()).then(setCacheStats).catch(() => {})
     apiFetch('/api/automation/auto-download/history?limit=1').then(r=>r.json()).then(d => { if (d?.length) setLastDownload(d[0]) }).catch(() => {})
+    apiFetch('/api/automation/trigger/audio-analysis/status').then(r=>r.json()).then(setAudioStatus).catch(() => {})
+    apiFetch('/api/audio-analysis/stats').then(r=>r.json()).then(setAudioStats).catch(() => {})
+    apiFetch('/api/automation/system/timezone').then(r=>r.json()).then(d => setServerTz(d.timezone)).catch(() => {})
   }, [])
 
   const fetchLastDownload = () =>
@@ -161,9 +179,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
     try {
       await apiFetch('/api/external-apis/cache', { method: 'DELETE' })
       await fetchCacheStats()
-    } finally {
-      setClearingCache(false)
-    }
+    } finally { setClearingCache(false) }
   }
 
   const save = async () => {
@@ -182,6 +198,8 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
           popularity_cache_refresh_interval_hours: popCacheInterval,
           billboard_refresh_enabled: bbEnabled,
           billboard_refresh_interval_hours: bbInterval,
+          audio_analysis_enabled: audioEnabled,
+          audio_analysis_interval_hours: audioInterval,
         }),
       })
       setSaveMsg(r.ok ? '✓ Saved' : '✗ Save failed')
@@ -189,7 +207,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
     finally {
       setSaving(false)
       setTimeout(() => setSaveMsg(''), 4000)
-      // Re-fetch scheduler state so next-run times reflect the new intervals
       apiFetch('/api/indexer/scheduler').then(r=>r.json()).then(setJobStatus).catch(() => {})
     }
   }
@@ -210,9 +227,27 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
     try {
       await apiFetch('/api/automation/trigger/enrichment', { method: 'POST' })
       onTrigger?.()
-    } finally {
-      setTrigEnrich(false)
-    }
+    } finally { setTrigEnrich(false) }
+  }
+
+  const triggerAudioAnalysis = async () => {
+    setTrigAudio(true)
+    try {
+      await apiFetch('/api/automation/trigger/audio-analysis', { method: 'POST' })
+      onTrigger?.()
+      // Poll status until complete
+      const poll = setInterval(async () => {
+        try {
+          const r = await apiFetch('/api/automation/trigger/audio-analysis/status')
+          const st = await r.json()
+          setAudioStatus(st)
+          if (!st.running) {
+            clearInterval(poll)
+            apiFetch('/api/audio-analysis/stats').then(r=>r.json()).then(setAudioStats).catch(() => {})
+          }
+        } catch { clearInterval(poll) }
+      }, 2000)
+    } finally { setTrigAudio(false) }
   }
 
   const s = settings
@@ -223,7 +258,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       {/* Index */}
       <TaskCard icon={RefreshCw} color="#60a5fa" title="Library Index"
                 description="Scans Jellyfin, imports play history, rebuilds scores"
-                lastRun={s?.last_index} nextRun={jobStatus.play_history_index}
+                lastRun={s?.last_index} nextRun={jobStatus.play_history_index} tz={serverTz}
                 triggerLabel="Index Now" triggering={trigIndex}
                 onTrigger={() => trigger('/api/indexer/full-scan', setTrigIndex)}>
         <Slider label="Run every" value={indexInterval} onChange={setIndexInterval}
@@ -233,7 +268,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       {/* Discovery */}
       <TaskCard icon={Telescope} color="var(--accent)" title="Discovery Refresh"
                 description="Generates new album recommendations per user"
-                lastRun={s?.last_discovery_refresh} nextRun={jobStatus.discovery_refresh}
+                lastRun={s?.last_discovery_refresh} nextRun={jobStatus.discovery_refresh} tz={serverTz}
                 enabled={discEnabled} onToggle={setDiscEnabled}
                 triggerLabel="Refresh Now" triggering={trigDisc}
                 onTrigger={() => trigger('/api/automation/trigger/discovery', setTrigDisc)}>
@@ -249,7 +284,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       <TaskCard icon={Download} color="#d29922" title="Auto-Download"
                 description="Automatically sends top-scored discoveries to Lidarr"
                 lastRun={s?.last_auto_download}
-                nextRun={autoEnabled ? jobStatus.auto_download : null}
+                nextRun={autoEnabled ? jobStatus.auto_download : null} tz={serverTz}
                 enabled={autoEnabled} onToggle={setAutoEnabled}
                 triggerLabel="Run Now" triggering={trigAuto}
                 onTrigger={() => { trigger('/api/automation/trigger/auto-download', setTrigAuto); setTimeout(fetchLastDownload, 5000) }}>
@@ -265,17 +300,15 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                       min={1} max={5} unit="" markers={['1 cautious','3','5 aggressive']} />
               <Slider label="Cooldown between runs" value={autoCooldown} onChange={setAutoCooldown}
                       min={1} max={30} unit=" days" markers={['1 day','7 days','30 days']} />
-              {/* Next scheduled run — computed from last run + cooldown */}
               {(() => {
                 const lastRan = s?.last_auto_download
                 const nextJob = jobStatus.auto_download
-                // Prefer the live scheduler next_run; fall back to computing from last_auto_download
                 let nextRunDisplay = null
                 if (nextJob && !nextJob.paused && nextJob.next_run) {
-                  nextRunDisplay = new Date(utc(nextJob.next_run)).toLocaleString()
+                  nextRunDisplay = fmtTime(nextJob.next_run, serverTz)
                 } else if (lastRan) {
                   const next = new Date(new Date(utc(lastRan)).getTime() + autoCooldown * 86400000)
-                  nextRunDisplay = next.toLocaleString()
+                  nextRunDisplay = fmtTime(next.toISOString(), serverTz)
                 }
                 return nextRunDisplay ? (
                   <div className="flex items-center gap-2 px-3 py-2 rounded-xl"
@@ -307,9 +340,7 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                 const msg    = lastDownload.message || ''
                 const artist = msg.replace(/^Auto-downloaded:\s*/, '').split(' — ')[0] || '—'
                 const album  = msg.includes(' — ') ? msg.split(' — ').slice(1).join(' — ') : '—'
-                const ts     = lastDownload.created_at
-                  ? new Date(lastDownload.created_at.replace(/([+-]\d{2}:\d{2}|Z)$/, '') + 'Z').toLocaleString()
-                  : ''
+                const ts     = lastDownload.created_at ? fmtTime(lastDownload.created_at, serverTz) : ''
                 return (
                   <div className="px-3 py-2.5 rounded-xl"
                        style={{ background:'rgba(212,153,34,0.06)', border:'1px solid rgba(212,153,34,0.15)' }}>
@@ -328,13 +359,10 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       {/* Enrichment */}
       <TaskCard icon={Star} color="#a78bfa" title="Track & Artist Enrichment"
                 description="Fetches per-song and per-artist Last.fm data — populates Song Popularity and Artist Popularity in Insights"
-                lastRun={s?.last_enrichment}
-                triggerLabel="Run Now"
-                triggering={trigEnrich}
+                lastRun={s?.last_enrichment} tz={serverTz}
+                triggerLabel="Run Now" triggering={trigEnrich}
                 onTrigger={triggerEnrichment}>
         <div className="space-y-3">
-
-          {/* Idle / static info — live progress is shown in the JobProgress bar above */}
           {!enrichStatus?.running && enrichStatus?.phase !== 'Error' && (
             <div className="text-[11px] px-3 py-2.5 rounded-xl space-y-1.5"
                  style={{ background:'rgba(167,139,250,0.06)', border:'1px solid rgba(167,139,250,0.18)', color:'var(--text-secondary)' }}>
@@ -343,31 +371,24 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
               <div>After enrichment finishes, run <strong style={{ color:'#a78bfa' }}>Library Index</strong> to apply the new popularity scores to recommendations.</div>
             </div>
           )}
-
-          {/* Error state */}
           {enrichStatus?.phase === 'Error' && (
             <div className="text-[11px] px-3 py-2.5 rounded-xl"
                  style={{ background:'rgba(248,113,113,0.08)', border:'1px solid rgba(248,113,113,0.25)', color:'#f87171' }}>
               ✗ {enrichStatus.error || 'Unknown error'}
             </div>
           )}
-
         </div>
       </TaskCard>
 
       {/* Popularity Cache */}
       <TaskCard icon={Database} color="#38bdf8" title="Popularity Cache Refresh"
                 description="Fetches artist-level listener counts, tags, similar artists and top albums from Last.fm"
-                lastRun={s?.last_popularity_cache_refresh}
-                nextRun={jobStatus.popularity_cache_refresh}
-                triggerLabel='Refresh Now'
-                triggering={trigPopCache}
+                lastRun={s?.last_popularity_cache_refresh} nextRun={jobStatus.popularity_cache_refresh} tz={serverTz}
+                triggerLabel='Refresh Now' triggering={trigPopCache}
                 onTrigger={() => { trigger('/api/automation/trigger/popularity-cache', setTrigPopCache); setTimeout(fetchCacheStats, 3000) }}>
         <div className="space-y-3">
           <Slider label="Run every" value={popCacheInterval} onChange={setPopCacheInterval}
                   min={1} max={168} unit="h" markers={['1h','24h','1w']} />
-
-          {/* Live / Expired stats + Clear button */}
           <div className="flex items-center justify-between px-3 py-2.5 rounded-xl"
                style={{ background:'rgba(56,189,248,0.06)', border:'1px solid rgba(56,189,248,0.18)' }}>
             <div className="flex gap-5">
@@ -392,7 +413,6 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
               Clear
             </button>
           </div>
-
           <div className="text-[11px] px-3 py-2" style={{ color:'var(--text-secondary)' }}>
             Feeds Discovery Refresh and the Artist Popularity column in Insights. Run this first if you
             just set up Last.fm credentials. Enrichment (above) populates song-level data; this populates artist-level data.
@@ -403,11 +423,10 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       {/* Billboard Hot 100 */}
       <TaskCard icon={TrendingUp} color="#f59e0b" title="Billboard Hot 100"
                 description="Fetches the current Hot 100 chart and matches entries against your library"
-                enabled={bbEnabled} onToggle={setBbEnabled}
+                enabled={bbEnabled} onToggle={setBbEnabled} tz={serverTz}
                 lastRun={s?.last_billboard_refresh}
                 nextRun={bbEnabled ? jobStatus.billboard_refresh : null}
-                triggerLabel="Refresh Now"
-                triggering={trigBillboard}
+                triggerLabel="Refresh Now" triggering={trigBillboard}
                 onTrigger={() => trigger('/api/indexer/billboard/refresh', setTrigBillboard)}>
         <div className="space-y-3">
           <Slider label="Check every" value={bbInterval} onChange={setBbInterval}
@@ -421,10 +440,103 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
         </div>
       </TaskCard>
 
+      {/* Audio Waveform Analysis */}
+      <TaskCard icon={Activity} color="#f87171" title="Audio Waveform Analysis"
+                description="Analyzes BPM, musical key, energy, beat strength, time signature, and acousticness for every track"
+                lastRun={s?.last_audio_analysis} nextRun={audioEnabled ? jobStatus.audio_analysis : null} tz={serverTz}
+                enabled={audioEnabled} onToggle={setAudioEnabled}
+                triggerLabel="Analyze Now" triggering={trigAudio}
+                onTrigger={triggerAudioAnalysis}>
+        <div className="space-y-3">
+
+          <Slider label="Check for new tracks every" value={audioInterval} onChange={setAudioInterval}
+                  min={1} max={168} unit="h" markers={['1h','24h','1w']} />
+
+          {/* Progress bar if running */}
+          {audioStatus?.running && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span style={{ color:'var(--text-secondary)' }}>{audioStatus.phase}</span>
+                <span style={{ color:'var(--text-muted)' }}>
+                  {(() => {
+                    const done   = audioStatus.tracks_done   ?? 0
+                    const total  = audioStatus.tracks_total  ?? 0
+                    const failed = audioStatus.tracks_failed ?? 0
+                    if (total === 0) return 'Loading…'
+                    return `${done} analyzed · ${failed} skipped · ${total} total`
+                  })()}
+                </span>
+              </div>
+              <div className="w-full rounded-full overflow-hidden" style={{ height:4, background:'rgba(248,113,113,0.15)' }}>
+                {(() => {
+                  const done   = audioStatus.tracks_done   ?? 0
+                  const total  = audioStatus.tracks_total  ?? 0
+                  const failed = audioStatus.tracks_failed ?? 0
+                  const processed = done + failed
+                  if (total === 0) {
+                    // indeterminate pulse while total is unknown
+                    return (
+                      <div className="h-full rounded-full" style={{
+                        width:'40%', background:'#f87171cc',
+                        animation:'progressPulse 1.6s ease-in-out infinite',
+                      }} />
+                    )
+                  }
+                  const pct = Math.round((processed / total) * 100)
+                  return (
+                    <div className="h-full rounded-full transition-all duration-500"
+                         style={{ background:'#f87171', width:`${pct}%` }} />
+                  )
+                })()}
+              </div>
+              {(audioStatus.status_line || audioStatus.current_track) && (
+                <div className="text-[10px] truncate pl-1 font-mono"
+                     style={{ color: (audioStatus.status_line || '').startsWith('✗') ? '#f87171'
+                                   : (audioStatus.status_line || '').startsWith('✓') ? '#4ade80'
+                                   : (audioStatus.status_line || '').startsWith('⚠') ? '#fbbf24'
+                                   : 'var(--text-muted)' }}>
+                  {audioStatus.status_line || audioStatus.current_track}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Coverage stats */}
+          {audioStats && (
+            <div className="flex items-center gap-5 px-3 py-2.5 rounded-xl"
+                 style={{ background:'rgba(248,113,113,0.06)', border:'1px solid rgba(248,113,113,0.18)' }}>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Analyzed</div>
+                <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-primary)' }}>{audioStats.analyzed}</div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Pending</div>
+                <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-muted)' }}>{audioStats.pending}</div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Total</div>
+                <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-secondary)' }}>{audioStats.total}</div>
+              </div>
+            </div>
+          )}
+
+          {/* Info text */}
+          {!audioStatus?.running && (
+            <div className="text-[11px] px-3 py-2.5 rounded-xl"
+                 style={{ background:'rgba(248,113,113,0.06)', border:'1px solid rgba(248,113,113,0.18)', color:'var(--text-secondary)' }}>
+              Audio is streamed directly from Jellyfin — no additional path configuration required.
+              Only unanalyzed tracks are processed; already-scanned tracks are skipped.
+              Large libraries can take several hours on first run.
+            </div>
+          )}
+        </div>
+      </TaskCard>
+
       {/* Save */}
       <div className="flex items-center justify-between pt-2">
         <div>
           {saveMsg && <span className={`text-sm anim-fade-in ${saveMsg.startsWith('✓') ? 'text-[var(--accent)]' : 'text-[var(--danger)]'}`}>{saveMsg}</span>}
+          {serverTz && <span className="text-[10px] ml-3" style={{ color:'var(--text-muted)' }}>Times shown in {serverTz}</span>}
         </div>
         <button onClick={save} disabled={saving} className="btn-primary">
           {saving ? <><Loader2 size={14} className="animate-spin" />Saving…</> : <><Save size={14} />Save Settings</>}

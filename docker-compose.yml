@@ -23,6 +23,7 @@ services:
       # Export a cookies.txt from your browser while logged into YouTube, then copy it:
       #   docker cp cookies.txt jellydj-backend:/config/youtube-cookies.txt
       # JellyDJ will auto-detect it there. No restart or env change required.
+      
     networks:
       - jellydj-net
     healthcheck:

@@ -269,6 +269,14 @@ const ALL_COLUMNS = [
   { key: 'skip_streak',       label: 'Skip streak',     default: true,  hint: 'Consecutive skips without a full listen. ≥3 triggers a cooldown.' },
   { key: 'on_cooldown',       label: 'Cooldown',        default: true,  hint: 'Whether this track is in a skip-streak cooldown and excluded from playlists until the timer expires.' },
   { key: 'holiday',           label: 'Holiday',         default: false, hint: 'Auto-detected holiday tag and whether it\'s currently in-season.' },
+  // Audio waveform analysis
+  { key: 'bpm',            label: 'BPM',          default: false, hint: 'Tempo in beats per minute (librosa waveform analysis).' },
+  { key: 'musical_key',    label: 'Key',          default: false, hint: 'Detected tonal center and mode, e.g. "C Major" or "F# Minor".' },
+  { key: 'energy',         label: 'Energy',       default: false, hint: 'RMS loudness normalized 0–1. 1 = very loud / energetic.' },
+  { key: 'loudness_db',    label: 'Loudness',     default: false, hint: 'Integrated loudness in dBFS. Closer to 0 = louder.' },
+  { key: 'beat_strength',  label: 'Beat',         default: false, hint: 'Rhythmic pulse clarity 0–1. 1 = very clear beat, low = diffuse or rubato.' },
+  { key: 'time_signature', label: 'Time sig.',    default: false, hint: 'Estimated beats per bar. 3 = waltz/triple, 4 = common time.' },
+  { key: 'acousticness',   label: 'Acoustic',     default: false, hint: 'Heuristic acousticness 0–1. 1 = purely acoustic, 0 = fully electronic.' },
 ]
 
 const DEFAULT_VISIBLE = new Set(
@@ -731,6 +739,41 @@ function TrackTable({ userId }) {
                     <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]">Holiday</span>
                   </th>
                 )}
+                {col('bpm') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Tempo in beats per minute">BPM</span>
+                  </th>
+                )}
+                {col('musical_key') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Detected tonal center and mode">Key</span>
+                  </th>
+                )}
+                {col('energy') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="RMS loudness normalized 0–1">Energy</span>
+                  </th>
+                )}
+                {col('loudness_db') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Integrated loudness in dBFS">Loudness</span>
+                  </th>
+                )}
+                {col('beat_strength') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Rhythmic pulse clarity 0–1">Beat</span>
+                  </th>
+                )}
+                {col('time_signature') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Beats per bar">Time sig.</span>
+                  </th>
+                )}
+                {col('acousticness') && (
+                  <th className="px-2 py-2.5 hidden xl:table-cell">
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-[var(--text-secondary)]" title="Acousticness 0–1 (1 = fully acoustic)">Acoustic</span>
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -926,6 +969,70 @@ function TrackTable({ userId }) {
                         <HolidayBadge tag={t.holiday_tag} exclude={t.holiday_exclude} />
                       </td>
                     )}
+
+                    {/* BPM */}
+                    {col('bpm') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs tabular-nums text-[var(--text-secondary)]">
+                        {t.bpm != null ? `${t.bpm}` : '—'}
+                      </td>
+                    )}
+
+                    {/* Musical key */}
+                    {col('musical_key') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs text-[var(--text-secondary)] whitespace-nowrap">
+                        {t.musical_key || '—'}
+                      </td>
+                    )}
+
+                    {/* Energy */}
+                    {col('energy') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell min-w-[70px]">
+                        {t.energy != null
+                          ? <div className="flex items-center gap-1.5">
+                              <span className="text-xs tabular-nums text-[var(--text-secondary)]">{t.energy.toFixed(2)}</span>
+                              <ScoreBar value={t.energy * 100} color="#f78166" />
+                            </div>
+                          : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                      </td>
+                    )}
+
+                    {/* Loudness */}
+                    {col('loudness_db') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs tabular-nums text-[var(--text-secondary)]">
+                        {t.loudness_db != null ? `${t.loudness_db.toFixed(1)} dB` : '—'}
+                      </td>
+                    )}
+
+                    {/* Beat strength */}
+                    {col('beat_strength') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell min-w-[70px]">
+                        {t.beat_strength != null
+                          ? <div className="flex items-center gap-1.5">
+                              <span className="text-xs tabular-nums text-[var(--text-secondary)]">{t.beat_strength.toFixed(2)}</span>
+                              <ScoreBar value={t.beat_strength * 100} color="#e3b341" />
+                            </div>
+                          : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                      </td>
+                    )}
+
+                    {/* Time signature */}
+                    {col('time_signature') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell text-xs tabular-nums text-[var(--text-secondary)]">
+                        {t.time_signature != null ? `${t.time_signature}/4` : '—'}
+                      </td>
+                    )}
+
+                    {/* Acousticness */}
+                    {col('acousticness') && (
+                      <td className="px-2 py-2.5 hidden xl:table-cell min-w-[70px]">
+                        {t.acousticness != null
+                          ? <div className="flex items-center gap-1.5">
+                              <span className="text-xs tabular-nums text-[var(--text-secondary)]">{t.acousticness.toFixed(2)}</span>
+                              <ScoreBar value={t.acousticness * 100} color="#7ee787" />
+                            </div>
+                          : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                      </td>
+                    )}
                   </tr>
 
                   {/* ── Expanded row ── */}
@@ -1058,6 +1165,60 @@ function TrackTable({ userId }) {
                               </>
                             )}
                           </div>
+
+                          {/* ── Audio analysis ── */}
+                          {t.audio_analyzed_at && (
+                            <div className="pt-3 border-t border-[var(--bg-overlay)]">
+                              <div className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider font-semibold flex items-center gap-1.5 mb-2">
+                                <Activity size={10} />
+                                Audio waveform analysis
+                                <span className="ml-auto text-[9px] font-normal normal-case opacity-60">
+                                  analyzed {fmtDateShort(t.audio_analyzed_at)}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                                <StatPill label="BPM" value={t.bpm != null ? `${t.bpm}` : '—'} hint="Tempo in beats per minute" />
+                                <StatPill label="Key" value={t.musical_key || '—'}
+                                  hint={t.key_confidence != null ? `Key confidence: ${(t.key_confidence * 100).toFixed(0)}%` : 'Musical key and mode'} />
+                                <div className="flex flex-col">
+                                  <span className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider" title="RMS loudness normalized 0–1">Energy</span>
+                                  {t.energy != null
+                                    ? <><span className="text-xs font-semibold mt-0.5">{t.energy.toFixed(3)}</span>
+                                        <ScoreBar value={t.energy * 100} color="#f78166" /></>
+                                    : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                                </div>
+                                <StatPill label="Loudness" value={t.loudness_db != null ? `${t.loudness_db.toFixed(1)} dBFS` : '—'}
+                                  hint="Integrated loudness. Closer to 0 = louder." />
+                                <div className="flex flex-col">
+                                  <span className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider" title="Onset envelope clarity 0–1">Beat strength</span>
+                                  {t.beat_strength != null
+                                    ? <><span className="text-xs font-semibold mt-0.5">{t.beat_strength.toFixed(3)}</span>
+                                        <ScoreBar value={t.beat_strength * 100} color="#e3b341" /></>
+                                    : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                                </div>
+                                <StatPill label="Time sig." value={t.time_signature != null ? `${t.time_signature}/4` : '—'}
+                                  hint="3 = waltz/triple time, 4 = common time" />
+                                <div className="flex flex-col">
+                                  <span className="text-[10px] text-[var(--text-secondary)] uppercase tracking-wider" title="1 = fully acoustic, 0 = fully electronic">Acousticness</span>
+                                  {t.acousticness != null
+                                    ? <><span className="text-xs font-semibold mt-0.5">{t.acousticness.toFixed(3)}</span>
+                                        <ScoreBar value={t.acousticness * 100} color="#7ee787" /></>
+                                    : <span className="text-xs text-[var(--text-secondary)]">—</span>}
+                                </div>
+                                <StatPill label="Key confidence"
+                                  value={t.key_confidence != null ? `${(t.key_confidence * 100).toFixed(0)}%` : '—'}
+                                  hint="Krumhansl-Schmuckler correlation score for the detected key (0–100%)" />
+                              </div>
+                            </div>
+                          )}
+                          {!t.audio_analyzed_at && (
+                            <div className="pt-3 border-t border-[var(--bg-overlay)]">
+                              <div className="text-[10px] text-[var(--text-secondary)] flex items-center gap-1.5">
+                                <Activity size={10} />
+                                Audio waveform analysis — not yet analyzed. Run the audio analysis job from Automation to populate these fields.
+                              </div>
+                            </div>
+                          )}
 
                           {/* ── Jellyfin deep-links ── */}
                           <JellyfinLinkStrip

@@ -463,20 +463,17 @@ def _run_rip_inner(job_id: str, url: str, job: dict, payload: RipRequest) -> Non
         # yt-dlp's FFmpegMetadata wrote the raw YouTube title/channel into the
         # tags; if the user confirmed different (MusicBrainz-matched) metadata,
         # rewrite those tags now so Jellyfin indexes the song correctly.
-        has_user_meta = any([
-            payload.user_title, payload.user_artist, payload.user_album,
-            payload.recording_mbid,
-        ])
-        if has_user_meta:
-            _write_id3_tags(
-                final_mp3,
-                title          = payload.user_title or title,
-                artist         = payload.user_artist or artist,
-                album          = payload.user_album or "",
-                year           = payload.user_year or "",
-                recording_mbid = payload.recording_mbid or "",
-                artist_mbid    = payload.artist_mbid or "",
-            )
+        # Always rewrite ID3 tags to override yt-dlp's raw YouTube metadata
+        # (which can include spurious values like playlist track numbers).
+        _write_id3_tags(
+            final_mp3,
+            title          = payload.user_title or title,
+            artist         = payload.user_artist or artist,
+            album          = payload.user_album or "",
+            year           = payload.user_year or "",
+            recording_mbid = payload.recording_mbid or "",
+            artist_mbid    = payload.artist_mbid or "",
+        )
 
     finally:
         # Always clean up the temp directory, even on error paths.
@@ -659,6 +656,8 @@ def _write_id3_tags(
         if audio.tags is None:
             audio.add_tags()
         tags = audio.tags
+
+        tags.delall("TRCK")  # strip track number written by yt-dlp (e.g. playlist index)
 
         tags.delall("TIT2")
         tags.add(TIT2(encoding=3, text=title))

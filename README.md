@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.3.0"><img src="https://img.shields.io/badge/release-v1.3.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.3.0" /></a>
+  <a href="https://github.com/TehRainMan17/JellyDJ/releases/tag/v1.4.0"><img src="https://img.shields.io/badge/release-v1.4.0-5be6f5?style=for-the-badge&labelColor=090b22" alt="v1.4.0" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/stargazers"><img src="https://img.shields.io/github/stars/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=5be6f5&labelColor=090b22&logoColor=5be6f5" alt="Stars" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/network/members"><img src="https://img.shields.io/github/forks/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=a28ffb&labelColor=090b22&logoColor=a28ffb" alt="Forks" /></a>
   <a href="https://github.com/TehRainMan17/JellyDJ/issues"><img src="https://img.shields.io/github/issues/TehRainMan17/JellyDJ?style=for-the-badge&logo=github&color=f87171&labelColor=090b22&logoColor=f87171" alt="Issues" /></a>
@@ -14,7 +14,7 @@
 
 <p align="center">
   <strong>A self-hosted music recommendation engine that turns your static Jellyfin library into a living, breathing music ecosystem.</strong><br/>
-  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration &nbsp;·&nbsp; Playlist import &nbsp;·&nbsp; Playlist backups &nbsp;·&nbsp; YouTube ripping
+  Taste profiles &nbsp;·&nbsp; Smart playlists &nbsp;·&nbsp; Custom playlist editor &nbsp;·&nbsp; Album discovery &nbsp;·&nbsp; Music Universe Map &nbsp;·&nbsp; Lidarr integration &nbsp;·&nbsp; Playlist import &nbsp;·&nbsp; Playlist backups &nbsp;·&nbsp; YouTube ripping &nbsp;·&nbsp; Audio analysis
 </p>
 
 <br/>
@@ -169,7 +169,8 @@ This is early days on this project and, as such, large portions are unfinished, 
 | 🌌 | **Music Universe Map** | Interactive zoom-driven graph of your taste — genres, artists, connections, skip signals, drift, and track orbits |
 | 🎸 | **Multi-Source Enrichment** | Spotify, Last.fm, MusicBrainz, Billboard — layered signals, no single point of failure |
 | 📥 | **Playlist Import** | Import any Spotify, Tidal, or YouTube Music playlist — JellyDJ matches tracks to your library and flags missing ones for Lidarr |
-| 🎵 | **YouTube Rip** | Rip any YouTube video to a 320 kbps MP3, auto-tagged and album-art matched, saved directly into your Jellyfin-watched folder |
+| 🎵 | **YouTube Rip** | Rip any song straight to a managed folder, with matched metadata and album artwork — one click from the browser extension or the JellyDJ UI |
+| 🎛️ | **Audio Analysis** | Tracks are analyzed for BPM, Key, Loudness, Beat Clarity, Time Signature, and Acousticness so you can create that perfect dancing or jogging playlist with powerful new filters |
 | 💾 | **Playlist Backups** | Rolling revision history for every JellyDJ playlist — browse, diff, and restore any prior version with one click |
 | 🧩 | **Browser Extension** | Clip a Spotify or YouTube Music playlist URL directly from your browser, or rip individual YouTube videos — all sent straight to JellyDJ |
 | ⏱️ | **Artist Timeouts** | Skip 5+ songs from the same artist in 2 days and they're benched for a week — escalating to 14d and 30d on repeat offences |
@@ -233,6 +234,17 @@ This is early days on this project and, as such, large portions are unfinished, 
 
 <p align="center">
   <img src=".github/images/screenshot-ChromeExtension.PNG" alt="JellyDJ Browser Extension" width="40%" />
+</p>
+
+### Rip to JellyDJ
+*Hit the Rip to JellyDJ button on any YouTube watch page — confirm or correct the metadata match, then let JellyDJ handle the rest*
+
+<p align="center">
+  <img src=".github/images/RipToJellyDJ_Button.PNG" alt="Rip to JellyDJ Button" width="60%" />
+</p>
+
+<p align="center">
+  <img src=".github/images/RipToJellyDJ_Matcher.PNG" alt="Rip to JellyDJ Metadata Matcher" width="60%" />
 </p>
 
 ---
@@ -414,6 +426,33 @@ From the **PL Backups** page you can:
 - **Delete** all stored backups for a playlist to free up space
 
 Each backup entry shows the track count and timestamp, making it easy to spot when a playlist changed and roll back if a regeneration produced unexpected results.
+
+---
+
+## 🎛️ Audio Analysis
+
+JellyDJ can analyze every track in your library for a set of acoustic properties, making it possible to build playlists tuned to a specific feeling or activity — not just taste scores.
+
+### What Gets Analyzed
+
+| Property | What It Measures |
+|---|---|
+| **BPM** | Tempo in beats per minute — filter by range to target workout, chill, or dance playlists |
+| **Key** | Musical key (C, D, E … B, in major or minor) — useful for DJ-style harmonic mixing |
+| **Loudness** | Integrated loudness in LUFS — distinguish energetic tracks from quiet background listening |
+| **Beat Clarity** | How strongly the beat pulse is defined — high clarity = reliable rhythm for workouts |
+| **Time Signature** | 3/4, 4/4, 6/8 etc. — filter out waltzes when you want straight-ahead driving music |
+| **Acousticness** | Confidence that the track is acoustic vs. electronic/produced (0–1 scale) |
+
+### Using Audio Analysis in Playlists
+
+Once analysis has run, these properties are available as filter blocks in the **Playlist Customization** editor. Chain them with the existing scoring blocks — for example:
+
+> *(BPM 120–160 AND Beat Clarity > 0.7)* **OR** *(Final Score > 85)*
+
+Which would give you: "high-energy tracks at jogging tempo, or anything you love regardless of tempo."
+
+Analysis runs as a background job and can also be triggered manually from the Settings page. Tracks added after initial analysis are picked up on the next scheduled run.
 
 ---
 

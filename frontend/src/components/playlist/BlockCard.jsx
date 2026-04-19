@@ -6,7 +6,7 @@ import { useState } from 'react'
 import {
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users,
   Tag, Layers, ChevronDown, ChevronUp, ArrowUp, ArrowDown, Trash2,
-  Zap, RefreshCw, Compass, BarChart2, SkipForward
+  Zap, RefreshCw, Compass, BarChart2, SkipForward, Activity, Music2, Wind
 } from 'lucide-react'
 
 export const BLOCK_TYPES = {
@@ -25,6 +25,14 @@ export const BLOCK_TYPES = {
   novelty:           { label: 'Novelty Score',       icon: Compass,      color: '#a78bfa',         desc: 'Unplayed tracks ranked by taste-profile fit' },
   recency_score:     { label: 'Recency Score',       icon: BarChart2,    color: '#fb923c',         desc: 'Smooth recency gradient: 100 = last month, 0 = over a year ago' },
   skip_streak:       { label: 'Skip Streak',         icon: Zap,          color: '#f43f5e',         desc: 'Filter by consecutive skip count — great for zero-tolerance filtering' },
+  // Audio analysis blocks
+  bpm_range:         { label: 'BPM Range',           icon: Activity,     color: '#f87171',         desc: 'Filter tracks by tempo (beats per minute)' },
+  musical_key:       { label: 'Musical Key',         icon: Music2,       color: '#a78bfa',         desc: 'Filter by musical key and mode — major, minor, or specific keys' },
+  energy:            { label: 'Energy',              icon: Zap,          color: '#fbbf24',         desc: 'Filter by RMS audio energy 0–1 (0 = quiet, 1 = loud and dense)' },
+  loudness_db:       { label: 'Loudness',            icon: BarChart2,    color: '#60a5fa',         desc: 'Filter by integrated loudness in dBFS (closer to 0 = louder)' },
+  beat_strength:     { label: 'Beat Strength',       icon: Activity,     color: '#f97316',         desc: 'Filter by rhythmic pulse clarity 0–1 (0 = loose/ambient, 1 = strong beat)' },
+  time_signature:    { label: 'Time Signature',      icon: Music2,       color: '#34d399',         desc: 'Filter by beats per bar — 3/4 (waltz) or 4/4 (common time)' },
+  acousticness:      { label: 'Acousticness',        icon: Wind,         color: '#7ee787',         desc: 'Filter by acoustic vs electronic character (0 = electronic, 1 = acoustic)' },
 }
 
 // ── RangeWithInputs ───────────────────────────────────────────────────────────
@@ -637,6 +645,206 @@ function SkipStreakFilters({ params, onChange }) {
   )
 }
 
+// ── Audio analysis filter components ─────────────────────────────────────────
+
+// Chromatic notes with enharmonic display names
+const CHROMATIC_NOTES = [
+  { root: 'C',  display: 'C' },
+  { root: 'C#', display: 'C# / D♭' },
+  { root: 'D',  display: 'D' },
+  { root: 'D#', display: 'D# / E♭' },
+  { root: 'E',  display: 'E' },
+  { root: 'F',  display: 'F' },
+  { root: 'F#', display: 'F# / G♭' },
+  { root: 'G',  display: 'G' },
+  { root: 'G#', display: 'G# / A♭' },
+  { root: 'A',  display: 'A' },
+  { root: 'A#', display: 'A# / B♭' },
+  { root: 'B',  display: 'B' },
+]
+
+function BpmRangeFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Tempo range"
+        minVal={params.bpm_min ?? 120}
+        maxVal={params.bpm_max ?? 160}
+        absMin={40} absMax={220} step={1}
+        onMinChange={v => onChange({ ...params, bpm_min: v })}
+        onMaxChange={v => onChange({ ...params, bpm_max: v })}
+        unit=" BPM"
+      />
+
+      {/* Harmonic BPM toggle */}
+      <div className="flex items-start gap-3 px-3 py-2.5 rounded-xl cursor-pointer select-none"
+           style={{ background: params.harmonic ? 'rgba(248,113,113,0.08)' : 'rgba(255,255,255,0.03)', border: `1px solid ${params.harmonic ? 'rgba(248,113,113,0.25)' : 'var(--border)'}` }}
+           onClick={() => onChange({ ...params, harmonic: !params.harmonic })}>
+        <div className="w-4 h-4 rounded flex items-center justify-center flex-shrink-0 mt-0.5"
+             style={{ background: params.harmonic ? '#f87171' : 'transparent', border: `2px solid ${params.harmonic ? '#f87171' : 'var(--border)'}` }}>
+          {params.harmonic && <svg width="8" height="6" viewBox="0 0 8 6"><path d="M1 3l2 2 4-4" stroke="white" strokeWidth="1.5" fill="none" strokeLinecap="round"/></svg>}
+        </div>
+        <div>
+          <div className="text-xs font-medium" style={{ color: params.harmonic ? '#f87171' : 'var(--text-primary)' }}>Harmonic BPM</div>
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+            Also include songs at half and double tempo — e.g. 120 BPM also matches 60 and 240 BPM since the beat feel is identical.
+          </div>
+        </div>
+      </div>
+
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function MusicalKeyFilters({ params, onChange }) {
+  const mode     = params.mode  ?? 'all'
+  const selected = params.notes ?? []
+
+  const toggle = (root) =>
+    onChange({ ...params, notes: selected.includes(root) ? selected.filter(n => n !== root) : [...selected, root] })
+
+  const modes = [
+    { v: 'all',   label: 'All modes' },
+    { v: 'major', label: 'Major only' },
+    { v: 'minor', label: 'Minor only' },
+  ]
+
+  return (
+    <div className="space-y-5">
+      {/* Mode */}
+      <div>
+        <div className="section-label mb-1.5">Mode</div>
+        <div className="flex gap-1.5">
+          {modes.map(({ v, label }) => (
+            <button key={v} onClick={() => onChange({ ...params, mode: v })}
+                    className="px-2.5 py-1 rounded-lg text-xs font-medium transition-all"
+                    style={{
+                      background: mode === v ? 'rgba(167,139,250,0.15)' : 'rgba(255,255,255,0.04)',
+                      border: `1px solid ${mode === v ? 'rgba(167,139,250,0.4)' : 'var(--border)'}`,
+                      color: mode === v ? '#a78bfa' : 'var(--text-secondary)',
+                    }}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Note picker */}
+      <div>
+        <div className="section-label mb-1.5">
+          Root note <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(leave empty = all)</span>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5">
+          {CHROMATIC_NOTES.map(({ root, display }) => (
+            <button key={root} onClick={() => toggle(root)}
+                    className="px-2 py-1.5 rounded-lg text-xs font-medium transition-all text-center"
+                    style={{
+                      background: selected.includes(root) ? 'rgba(167,139,250,0.12)' : 'rgba(255,255,255,0.03)',
+                      border: `1px solid ${selected.includes(root) ? 'rgba(167,139,250,0.4)' : 'var(--border)'}`,
+                      color: selected.includes(root) ? '#a78bfa' : 'var(--text-secondary)',
+                    }}>
+              {display}
+            </button>
+          ))}
+        </div>
+        {selected.length > 0 && (
+          <button onClick={() => onChange({ ...params, notes: [] })}
+                  className="mt-2 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+            Clear selection (show all keys)
+          </button>
+        )}
+      </div>
+
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function EnergyFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Energy range"
+        minVal={params.energy_min ?? 0.4} maxVal={params.energy_max ?? 1.0}
+        absMin={0} absMax={1} step={0.01}
+        onMinChange={v => onChange({ ...params, energy_min: v })}
+        onMaxChange={v => onChange({ ...params, energy_max: v })}
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function LoudnessFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Loudness range (dBFS)"
+        minVal={params.loudness_min ?? -30} maxVal={params.loudness_max ?? 0}
+        absMin={-60} absMax={0} step={1}
+        onMinChange={v => onChange({ ...params, loudness_min: v })}
+        onMaxChange={v => onChange({ ...params, loudness_max: v })}
+        unit=" dB"
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function BeatStrengthFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Beat strength range"
+        minVal={params.beat_min ?? 0.4} maxVal={params.beat_max ?? 1.0}
+        absMin={0} absMax={1} step={0.01}
+        onMinChange={v => onChange({ ...params, beat_min: v })}
+        onMaxChange={v => onChange({ ...params, beat_max: v })}
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function TimeSignatureFilters({ params, onChange }) {
+  const sigs = params.time_sigs ?? [4]
+  const toggle = v => onChange({ ...params, time_sigs: sigs.includes(v) ? sigs.filter(x => x !== v) : [...sigs, v] })
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="section-label mb-3">Beats per bar</div>
+        <div className="flex gap-3">
+          {[3, 4].map(v => (
+            <button key={v} onClick={() => toggle(v)}
+              className="flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all"
+              style={{ background: sigs.includes(v) ? 'rgba(52,211,153,0.1)' : 'rgba(255,255,255,0.03)', border: `1px solid ${sigs.includes(v) ? 'rgba(52,211,153,0.4)' : 'var(--border)'}`, color: sigs.includes(v) ? '#34d399' : 'var(--text-secondary)' }}>
+              {v}/4
+              <div className="text-[10px] font-normal mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                {v === 3 ? 'Waltz / triple' : 'Common time'}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
+function AcousticnessFilters({ params, onChange }) {
+  return (
+    <div className="space-y-5">
+      <RangeWithInputs
+        label="Acousticness range"
+        minVal={params.acousticness_min ?? 0.0} maxVal={params.acousticness_max ?? 1.0}
+        absMin={0} absMax={1} step={0.01}
+        onMinChange={v => onChange({ ...params, acousticness_min: v })}
+        onMaxChange={v => onChange({ ...params, acousticness_max: v })}
+      />
+      <PlayedFilter value={params.played_filter ?? 'all'} onChange={v => onChange({ ...params, played_filter: v })} />
+    </div>
+  )
+}
+
 const FILTER_COMPONENTS = {
   final_score:       FinalScoreFilters,
   affinity:          AffinityFilters,
@@ -653,6 +861,14 @@ const FILTER_COMPONENTS = {
   novelty:           NoveltyFilters,
   recency_score:     RecencyScoreFilters,
   skip_streak:       SkipStreakFilters,
+  // Audio analysis blocks
+  bpm_range:         BpmRangeFilters,
+  musical_key:       MusicalKeyFilters,
+  energy:            EnergyFilters,
+  loudness_db:       LoudnessFilters,
+  beat_strength:     BeatStrengthFilters,
+  time_signature:    TimeSignatureFilters,
+  acousticness:      AcousticnessFilters,
 }
 
 // ── BlockCard ─────────────────────────────────────────────────────────────────

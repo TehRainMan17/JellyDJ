@@ -54,6 +54,7 @@ BILLBOARD_JOB_ID           = "billboard_refresh"
 ENRICHMENT_JOB_ID          = "enrichment"
 POPULARITY_CACHE_JOB_ID    = "popularity_cache_refresh"
 PLAYLIST_BACKUP_JOB_ID     = "playlist_backup"
+AUDIO_ANALYSIS_JOB_ID      = "audio_analysis"
 
 
 def _get_settings(db):
@@ -204,6 +205,52 @@ def _job_playlist_backup():
     from playlist_backup_scheduler import _run_auto_backup
     from database import SessionLocal
     _run_auto_backup(SessionLocal)
+
+
+def _job_audio_analysis():
+    """
+    Periodic job: analyze audio waveforms for unprocessed library tracks.
+    Extracts BPM, musical key, energy, loudness, beat strength, time signature,
+    and acousticness via librosa.  Requires media library path mappings to be
+    configured in Settings → Audio Analysis.
+    """
+    try:
+        from routers.automation import _get_job_state
+        if _get_job_state("audio_analysis").get("running"):
+            log.warning("Audio analysis already running — skipping scheduled trigger")
+            return
+    except Exception as e:
+        log.warning(f"Audio analysis guard check failed ({e}) — proceeding anyway")
+
+    import threading
+
+    def _run():
+        import asyncio
+        from database import SessionLocal
+        from services.audio_analysis import analyze_new_tracks
+        from routers.automation import _set_job_state, _stamp_setting
+
+        _set_job_state("audio_analysis", running=True, phase="Starting…",
+                       tracks_done=0, tracks_total=0, tracks_failed=0, error=None)
+        db = SessionLocal()
+        try:
+            def _progress(done, total, failed, phase):
+                _set_job_state("audio_analysis", running=True, phase=phase,
+                               tracks_done=done, tracks_total=total, tracks_failed=failed)
+
+            result = asyncio.run(analyze_new_tracks(db, set_state=_progress))
+            _stamp_setting("last_audio_analysis", __import__("datetime").datetime.utcnow())
+            _set_job_state("audio_analysis", running=False, phase="Complete",
+                           tracks_done=result["done"], tracks_total=result["total"],
+                           tracks_failed=result["failed"])
+            log.info("Audio analysis job complete: %s", result)
+        except Exception as e:
+            log.error(f"Audio analysis job failed: {e}", exc_info=True)
+            _set_job_state("audio_analysis", running=False, phase="Error", error=str(e))
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, daemon=True, name="scheduled-audio-analysis").start()
 
 
 # Maximum time (hours) a job is allowed to stay running=True before the watchdog
@@ -587,6 +634,16 @@ def start_scheduler(db_session_factory):
         name="Playlist auto-backup",
     )
 
+    # Audio waveform analysis — BPM, key, energy, beat strength, time signature, acousticness
+    scheduler.add_job(
+        _job_audio_analysis,
+        trigger=IntervalTrigger(hours=24),
+        id=AUDIO_ANALYSIS_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=3600,
+        name="Audio waveform analysis",
+    )
+
     # Stale-job watchdog — runs every hour and resets any job that has been
     # stuck at running=True longer than _STALE_JOB_THRESHOLD_HOURS.
     scheduler.add_job(
@@ -822,6 +879,35 @@ def reschedule_automation_jobs(db):
     except Exception:
         pass
 
+    # Audio analysis — enabled/disabled, last-run-based scheduling
+    audio_enabled  = getattr(s, "audio_analysis_enabled", True)
+    audio_interval = getattr(s, "audio_analysis_interval_hours", 24) or 24
+    if audio_enabled:
+        from datetime import timedelta as _td
+        _aa_last = getattr(s, "last_audio_analysis", None)
+        _now_aa  = datetime.now(timezone.utc)
+        if _aa_last is None:
+            _aa_next = _now_aa + _td(hours=1)  # first run: 1h after startup
+        else:
+            if _aa_last.tzinfo is None:
+                _aa_last = _aa_last.replace(tzinfo=timezone.utc)
+            _aa_next = _aa_last + _td(hours=audio_interval)
+            if _aa_next < _now_aa:
+                _aa_next = _now_aa + _td(minutes=5)
+        try:
+            scheduler.reschedule_job(
+                AUDIO_ANALYSIS_JOB_ID,
+                trigger=IntervalTrigger(hours=audio_interval, start_date=_aa_next),
+            )
+            scheduler.resume_job(AUDIO_ANALYSIS_JOB_ID)
+        except Exception:
+            pass
+    else:
+        try:
+            scheduler.pause_job(AUDIO_ANALYSIS_JOB_ID)
+        except Exception:
+            pass
+
     log.info(
         f"Automation rescheduled: index={s.index_interval_hours}h | "
         f"discovery={'on' if s.discovery_refresh_enabled else 'off'} "
@@ -832,7 +918,9 @@ def reschedule_automation_jobs(db):
         f"billboard={'on' if billboard_enabled else 'off'} "
         f"(every {billboard_interval}h) | "
         f"enrichment=on (every {enrich_interval}h) | "
-        f"popularity_cache=on (every {pop_cache_interval}h)"
+        f"popularity_cache=on (every {pop_cache_interval}h) | "
+        f"audio_analysis={'on' if audio_enabled else 'off'} "
+        f"(every {audio_interval}h)"
     )
 
 

@@ -23,7 +23,7 @@ import {
   X, Plus, Save, Eye, Loader2, CheckCircle2, Search,
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users, Tag,
   ChevronUp, ChevronDown, Trash2, Shuffle, AlertCircle,
-  Zap, Wind, BarChart2, SkipForward, Repeat, Heart
+  Zap, Wind, BarChart2, SkipForward, Repeat, Heart, Activity, Music2
 } from 'lucide-react'
 import { useAuth } from '../../contexts/AuthContext'
 import { api } from '../../lib/api'
@@ -228,6 +228,80 @@ export const FILTER_TYPES = {
       { '3+':  'On active cooldown' },
     ],
   },
+
+  // ── Audio waveform analysis blocks ────────────────────────────────────────────
+  // All require the audio analysis job to have run. Filters on LibraryTrack columns.
+
+  bpm_range: {
+    label: 'BPM Range', icon: Activity, color: '#f87171',
+    oneliner: 'Filter tracks by tempo in beats per minute',
+    desc: [
+      'Uses waveform analysis (librosa) to match tracks within a tempo range. Requires the Audio Analysis job to have run on your library.',
+      'Harmonic BPM also matches half and double tempo — a 120 BPM filter catches 60 and 240 BPM too, since the rhythmic feel is the same.',
+      { '60–90':   'Slow / ballad' },
+      { '90–110':  'Moderate / mid-tempo' },
+      { '110–130': 'Upbeat / pop' },
+      { '130–160': 'Fast / dance' },
+      { '160–200': 'Very fast / drum & bass' },
+    ],
+  },
+  musical_key: {
+    label: 'Musical Key', icon: Music2, color: '#a78bfa',
+    oneliner: 'Filter by tonal center and mode — major, minor, or specific root notes',
+    desc: [
+      'Detects the musical key via chromagram analysis and the Krumhansl-Schmuckler algorithm. Requires the Audio Analysis job to have run.',
+      'Filter by mode (major/minor) and optional root notes. Minor keys for melancholic sets; major for upbeat. Leave notes empty to match all keys in that mode.',
+    ],
+  },
+  energy: {
+    label: 'Energy', icon: Zap, color: '#fbbf24',
+    oneliner: 'Filter by audio energy level (0 = quiet, 1 = loud and dense)',
+    desc: [
+      'RMS loudness normalized 0–1. High-energy tracks are loud and intense; low-energy tracks are quiet and sparse. Requires Audio Analysis.',
+      { '0.7–1.0': 'High energy — loud, intense' },
+      { '0.4–0.7': 'Mid energy — moderate intensity' },
+      { '0.0–0.4': 'Low energy — quiet, delicate' },
+    ],
+  },
+  loudness_db: {
+    label: 'Loudness', icon: BarChart2, color: '#60a5fa',
+    oneliner: 'Filter by integrated loudness in dBFS (closer to 0 = louder)',
+    desc: [
+      'Integrated loudness in decibels relative to full scale. Always negative — 0 dBFS is the loudest possible. Heavily mastered tracks cluster near -10 to -5; dynamic acoustic recordings reach -30 or below.',
+      { '-10 to 0':   'Very loud / heavily mastered' },
+      { '-20 to -10': 'Moderately loud' },
+      { '-30 to -20': 'Quiet / dynamic' },
+      { 'below -30':  'Very quiet or sparse' },
+    ],
+  },
+  beat_strength: {
+    label: 'Beat Strength', icon: Activity, color: '#f97316',
+    oneliner: 'Filter by rhythmic pulse clarity (0 = loose/ambient, 1 = strong locked-in beat)',
+    desc: [
+      'Measures how clear and consistent the rhythmic beat is. High values = strong, metronomic pulse. Low values = loose, rubato, or ambient texture. Requires Audio Analysis.',
+      { '0.7–1.0': 'Strong clear beat — great for workouts' },
+      { '0.4–0.7': 'Moderate rhythmic presence' },
+      { '0.0–0.4': 'Loose / ambient / rubato' },
+    ],
+  },
+  time_signature: {
+    label: 'Time Signature', icon: Music2, color: '#34d399',
+    oneliner: 'Filter by beats per bar — 3/4 (waltz) or 4/4 (common time)',
+    desc: [
+      'Estimated from onset autocorrelation. Most pop and rock is 4/4. Waltz, some jazz, and folk is 3/4. Requires Audio Analysis.',
+      'Useful for sets with a consistent rhythmic feel — all waltzes, or strictly common-time dance tracks.',
+    ],
+  },
+  acousticness: {
+    label: 'Acousticness', icon: Wind, color: '#7ee787',
+    oneliner: 'Filter by acoustic vs electronic character (0 = fully electronic, 1 = fully acoustic)',
+    desc: [
+      'A heuristic 0–1 estimate based on zero-crossing rate and spectral contrast. Acoustic instruments (guitar, piano, voice) score high; synths and drum machines score low. Requires Audio Analysis.',
+      { '0.7–1.0': 'Strongly acoustic' },
+      { '0.4–0.7': 'Mixed / semi-acoustic' },
+      { '0.0–0.4': 'Electronic / produced' },
+    ],
+  },
 }
 
 const DEFAULT_PARAMS = {
@@ -253,6 +327,14 @@ const DEFAULT_PARAMS = {
   novelty:           { novelty_min: 50, novelty_max: 100 },
   recency_score:     { recency_min: 0, recency_max: 100, played_filter: 'played' },
   skip_streak:       { streak_min: 0, streak_max: 0, played_filter: 'all' },
+  // Audio waveform analysis blocks
+  bpm_range:         { bpm_min: 120, bpm_max: 160, harmonic: false, played_filter: 'all' },
+  musical_key:       { mode: 'all', notes: [], played_filter: 'all' },
+  energy:            { energy_min: 0.4, energy_max: 1.0, played_filter: 'all' },
+  loudness_db:       { loudness_min: -30, loudness_max: 0, played_filter: 'all' },
+  beat_strength:     { beat_min: 0.4, beat_max: 1.0, played_filter: 'all' },
+  time_signature:    { time_sigs: [4], played_filter: 'all' },
+  acousticness:      { acousticness_min: 0.0, acousticness_max: 1.0, played_filter: 'all' },
 }
 
 let _uid = 5000
@@ -895,6 +977,164 @@ const Editors = {
       </div>
     )
   },
+
+  // ── Audio waveform analysis editors ──────────────────────────────────────────
+
+  bpm_range: ({ p, set }) => (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Tempo range (BPM)"
+        lo={p.bpm_min ?? 120} hi={p.bpm_max ?? 160} min={20} max={300} step={1}
+        onLo={v => set({ ...p, bpm_min: v })} onHi={v => set({ ...p, bpm_max: v })}
+        unit=" BPM"
+      />
+      <div
+        className="flex items-start gap-3 px-3 py-2.5 rounded-xl cursor-pointer select-none"
+        style={{ background: p.harmonic ? 'rgba(248,113,113,0.08)' : 'rgba(255,255,255,0.03)', border: `1px solid ${p.harmonic ? 'rgba(248,113,113,0.3)' : 'var(--border)'}` }}
+        onClick={() => set({ ...p, harmonic: !p.harmonic })}>
+        <div className="w-4 h-4 rounded flex items-center justify-center flex-shrink-0 mt-0.5"
+          style={{ background: p.harmonic ? '#f87171' : 'transparent', border: `2px solid ${p.harmonic ? '#f87171' : 'var(--border)'}` }}>
+          {p.harmonic && <svg width="8" height="6" viewBox="0 0 8 6"><path d="M1 3l2 2 4-4" stroke="white" strokeWidth="1.5" fill="none" strokeLinecap="round"/></svg>}
+        </div>
+        <div>
+          <div className="text-xs font-medium" style={{ color: p.harmonic ? '#f87171' : 'var(--text-primary)' }}>Harmonic BPM</div>
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+            Also match half and double tempo — e.g. 120 BPM also catches 60 and 240 BPM since the rhythmic feel is the same.
+          </div>
+        </div>
+      </div>
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+    </div>
+  ),
+
+  musical_key: ({ p, set }) => {
+    const CHROMATIC_NOTES = [
+      { root: 'C', display: 'C' }, { root: 'C#', display: 'C# / D♭' },
+      { root: 'D', display: 'D' }, { root: 'D#', display: 'D# / E♭' },
+      { root: 'E', display: 'E' }, { root: 'F',  display: 'F' },
+      { root: 'F#', display: 'F# / G♭' }, { root: 'G', display: 'G' },
+      { root: 'G#', display: 'G# / A♭' }, { root: 'A', display: 'A' },
+      { root: 'A#', display: 'A# / B♭' }, { root: 'B', display: 'B' },
+    ]
+    const selected = p.notes ?? []
+    const toggle = root => set({ ...p, notes: selected.includes(root) ? selected.filter(n => n !== root) : [...selected, root] })
+    return (
+      <div className="space-y-4">
+        <div>
+          <div className="section-label mb-1.5">Mode</div>
+          <Chips value={p.mode ?? 'all'} onChange={v => set({ ...p, mode: v })}
+            options={[{ v: 'all', label: 'All modes' }, { v: 'major', label: 'Major only' }, { v: 'minor', label: 'Minor only' }]} />
+        </div>
+        <div>
+          <div className="section-label mb-1.5">Root note <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(empty = all)</span></div>
+          <div className="grid grid-cols-3 gap-1.5">
+            {CHROMATIC_NOTES.map(({ root, display }) => {
+              const active = selected.includes(root)
+              return (
+                <button key={root} onClick={() => toggle(root)}
+                  className="px-2 py-1.5 rounded-lg text-xs font-medium transition-all text-center"
+                  style={{ background: active ? 'rgba(167,139,250,0.12)' : 'rgba(255,255,255,0.03)', border: `1px solid ${active ? 'rgba(167,139,250,0.4)' : 'var(--border)'}`, color: active ? '#a78bfa' : 'var(--text-secondary)' }}>
+                  {display}
+                </button>
+              )
+            })}
+          </div>
+          {selected.length > 0 && (
+            <button onClick={() => set({ ...p, notes: [] })} className="mt-2 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+              Clear (show all keys)
+            </button>
+          )}
+        </div>
+        <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      </div>
+    )
+  },
+
+  energy: ({ p, set }) => (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Energy range"
+        lo={p.energy_min ?? 0.4} hi={p.energy_max ?? 1.0} min={0} max={1} step={0.01} decimals={2}
+        onLo={v => set({ ...p, energy_min: v })} onHi={v => set({ ...p, energy_max: v })}
+      />
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        RMS loudness normalized 0–1. Requires Audio Analysis to have run on your library.
+      </p>
+    </div>
+  ),
+
+  loudness_db: ({ p, set }) => (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Loudness range (dBFS)"
+        lo={p.loudness_min ?? -30} hi={p.loudness_max ?? 0} min={-60} max={0} step={1} decimals={0}
+        onLo={v => set({ ...p, loudness_min: v })} onHi={v => set({ ...p, loudness_max: v })}
+        unit=" dB"
+      />
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        Integrated loudness in dBFS — always negative, closer to 0 = louder. Requires Audio Analysis.
+      </p>
+    </div>
+  ),
+
+  beat_strength: ({ p, set }) => (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Beat strength range"
+        lo={p.beat_min ?? 0.4} hi={p.beat_max ?? 1.0} min={0} max={1} step={0.01} decimals={2}
+        onLo={v => set({ ...p, beat_min: v })} onHi={v => set({ ...p, beat_max: v })}
+      />
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        Rhythmic pulse clarity 0–1. High = strong metronomic beat. Low = loose or ambient. Requires Audio Analysis.
+      </p>
+    </div>
+  ),
+
+  time_signature: ({ p, set }) => {
+    const sigs = p.time_sigs ?? [4]
+    const toggle = v => set({ ...p, time_sigs: sigs.includes(v) ? sigs.filter(x => x !== v) : [...sigs, v] })
+    return (
+      <div className="space-y-4">
+        <div>
+          <div className="section-label mb-1.5">Beats per bar</div>
+          <div className="flex gap-2">
+            {[3, 4].map(v => (
+              <button key={v} onClick={() => toggle(v)}
+                className="flex-1 py-2 rounded-xl text-sm font-semibold transition-all"
+                style={{ background: sigs.includes(v) ? 'rgba(52,211,153,0.12)' : 'rgba(255,255,255,0.03)', border: `1px solid ${sigs.includes(v) ? 'rgba(52,211,153,0.4)' : 'var(--border)'}`, color: sigs.includes(v) ? '#34d399' : 'var(--text-secondary)' }}>
+                {v}/4
+                <div className="text-[10px] font-normal mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                  {v === 3 ? 'Waltz / triple' : 'Common time'}
+                </div>
+              </button>
+            ))}
+          </div>
+          {sigs.length === 0 && <p className="text-[11px] mt-2" style={{ color: '#f87171' }}>Select at least one time signature.</p>}
+        </div>
+        <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+        <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+          Estimated via onset autocorrelation. Most pop/rock is 4/4; waltz and some jazz is 3/4. Requires Audio Analysis.
+        </p>
+      </div>
+    )
+  },
+
+  acousticness: ({ p, set }) => (
+    <div className="space-y-4">
+      <RangeInputs
+        label="Acousticness range"
+        lo={p.acousticness_min ?? 0.0} hi={p.acousticness_max ?? 1.0} min={0} max={1} step={0.01} decimals={2}
+        onLo={v => set({ ...p, acousticness_min: v })} onHi={v => set({ ...p, acousticness_max: v })}
+      />
+      <PlayedFilterRow value={p.played_filter ?? 'all'} onChange={v => set({ ...p, played_filter: v })} />
+      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        Heuristic 0–1 estimate based on zero-crossing rate and spectral contrast. 1 = fully acoustic, 0 = fully electronic. Requires Audio Analysis.
+      </p>
+    </div>
+  ),
 
 }
 

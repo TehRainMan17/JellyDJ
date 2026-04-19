@@ -176,6 +176,7 @@ def get_tracks(
     # TrackScore doesn't store jellyfin_album_id / jellyfin_artist_id; LibraryTrack does.
     album_id_map: dict[str, str] = {}
     artist_id_map: dict[str, str] = {}
+    audio_map: dict[str, dict] = {}
     if item_ids:
         try:
             from models import LibraryTrack
@@ -184,6 +185,15 @@ def get_tracks(
                     LibraryTrack.jellyfin_item_id,
                     LibraryTrack.jellyfin_album_id,
                     LibraryTrack.jellyfin_artist_id,
+                    LibraryTrack.bpm,
+                    LibraryTrack.musical_key,
+                    LibraryTrack.key_confidence,
+                    LibraryTrack.energy,
+                    LibraryTrack.loudness_db,
+                    LibraryTrack.beat_strength,
+                    LibraryTrack.time_signature,
+                    LibraryTrack.acousticness,
+                    LibraryTrack.audio_analyzed_at,
                 )
                 .filter(LibraryTrack.jellyfin_item_id.in_(item_ids))
                 .all()
@@ -197,6 +207,20 @@ def get_tracks(
                 r.jellyfin_item_id: r.jellyfin_artist_id
                 for r in lt_rows
                 if r.jellyfin_artist_id
+            }
+            audio_map = {
+                r.jellyfin_item_id: {
+                    "bpm":            r.bpm,
+                    "musical_key":    r.musical_key,
+                    "key_confidence": r.key_confidence,
+                    "energy":         r.energy,
+                    "loudness_db":    r.loudness_db,
+                    "beat_strength":  r.beat_strength,
+                    "time_signature": r.time_signature,
+                    "acousticness":   r.acousticness,
+                    "audio_analyzed_at": r.audio_analyzed_at.isoformat() if r.audio_analyzed_at else None,
+                }
+                for r in lt_rows
             }
         except Exception:
             pass
@@ -335,6 +359,12 @@ def get_tracks(
                 # Holiday
                 "holiday_tag":       getattr(r, "holiday_tag", None),
                 "holiday_exclude":   bool(getattr(r, "holiday_exclude", False)),
+                # Audio waveform analysis
+                **audio_map.get(r.jellyfin_item_id, {
+                    "bpm": None, "musical_key": None, "key_confidence": None,
+                    "energy": None, "loudness_db": None, "beat_strength": None,
+                    "time_signature": None, "acousticness": None, "audio_analyzed_at": None,
+                }),
             }
             for r in rows
         ],

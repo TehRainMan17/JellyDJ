@@ -19,6 +19,19 @@ _Nothing pending._
 
 ---
 
+## [1.4.0] — 2026-04-18
+
+### Added
+- `!!!` **Rip to JellyDJ** — rip any YouTube music video straight to a managed folder with matched metadata and album artwork. The browser extension's pre-rip modal lets you confirm or correct the MusicBrainz match (title, artist, album, year) before the download starts. Falls back to YouTube thumbnail, center-cropped, when no match is found. Geo-restricted and age-gated videos supported via `cookies.txt`.
+- `!!` **Album art matching for ripped tracks** — rips now attempt to match a MusicBrainz release and fetch high-resolution artwork from Cover Art Archive before falling back to the YouTube thumbnail.
+- `!!` **DRM / region bypass** — yt-dlp cookie support (`YOUTUBE_COOKIES_FILE`) automatically used when present, enabling ripping of VEVO, Disney, and region-locked content without manual configuration per-rip.
+- `!!!` **Audio Analysis** — tracks are analyzed for BPM, Key, Loudness, Beat Clarity, Time Signature, and Acousticness. Analysis results are stored per track and exposed as new filter blocks in the playlist editor, enabling activity-tuned playlists (running, dancing, background listening, harmonic mixing).
+
+### Changed
+- YouTube Rip feature row in README updated to lead with the user-facing value ("rip any song straight to a managed folder, with matched metadata and album artwork").
+
+---
+
 ## [1.3.0] — 2026-03-26
 
 ### Added

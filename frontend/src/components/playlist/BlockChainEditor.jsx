@@ -15,7 +15,7 @@ import { createPortal } from 'react-dom'
 import {
   Sparkles, Radio, TrendingUp, Clock, Globe, Star, Users,
   Tag, ChevronDown, ChevronUp, Trash2, Plus, X, Search,
-  Zap, RefreshCw, Compass, BarChart2, SkipForward
+  Zap, RefreshCw, Compass, BarChart2, SkipForward, Activity, Music2, Wind
 } from 'lucide-react'
 
 // ── Filter catalogue ──────────────────────────────────────────────────────────
@@ -38,6 +38,14 @@ export const FILTER_TYPES = {
   novelty:           { label: 'Novelty Score',       icon: Compass,      color: '#a78bfa',        desc: 'Unplayed tracks ranked by how well they match your artist + genre taste profile' },
   recency_score:     { label: 'Recency Score',       icon: BarChart2,    color: '#fb923c',        desc: 'Smooth recency gradient — 100 = played last month, 0 = over a year ago' },
   skip_streak:       { label: 'Skip Streak',         icon: Zap,          color: '#f43f5e',        desc: 'Filter by consecutive skip count — great for zero-tolerance skip filtering' },
+  // Audio analysis blocks — require waveform analysis to have run on your library
+  bpm_range:         { label: 'BPM Range',           icon: Activity,     color: '#f87171',        desc: 'Filter tracks by tempo (beats per minute). Enable Harmonic BPM to include half/double-tempo variants.' },
+  musical_key:       { label: 'Musical Key',         icon: Music2,       color: '#a78bfa',        desc: 'Filter tracks by musical key or mode — major, minor, or specific keys. Great for mood-matched workout playlists.' },
+  energy:            { label: 'Energy',              icon: Zap,          color: '#fbbf24',        desc: 'Filter by RMS audio energy 0–1. High = loud and intense; low = quiet and sparse.' },
+  loudness_db:       { label: 'Loudness',            icon: BarChart2,    color: '#60a5fa',        desc: 'Filter by integrated loudness in dBFS. Closer to 0 = louder. Useful for matching mastering levels.' },
+  beat_strength:     { label: 'Beat Strength',       icon: Activity,     color: '#f97316',        desc: 'Filter by rhythmic pulse clarity 0–1. High = strong metronomic beat; low = loose or ambient.' },
+  time_signature:    { label: 'Time Signature',      icon: Music2,       color: '#34d399',        desc: 'Filter by beats per bar — 3/4 (waltz/triple) or 4/4 (common time).' },
+  acousticness:      { label: 'Acousticness',        icon: Wind,         color: '#7ee787',        desc: 'Filter by acoustic vs electronic character. 1 = fully acoustic; 0 = fully electronic.' },
 }
 
 const DEFAULT_PARAMS = {
@@ -58,6 +66,13 @@ const DEFAULT_PARAMS = {
   novelty:           { novelty_min: 0, novelty_max: 100 },
   recency_score:     { recency_min: 0, recency_max: 100, played_filter: 'played' },
   skip_streak:       { streak_min: 0, streak_max: 2, played_filter: 'all' },
+  bpm_range:         { bpm_min: 120, bpm_max: 160, harmonic: false, played_filter: 'all' },
+  musical_key:       { mode: 'all', notes: [], played_filter: 'all' },
+  energy:            { energy_min: 0.4, energy_max: 1.0, played_filter: 'all' },
+  loudness_db:       { loudness_min: -30, loudness_max: 0, played_filter: 'all' },
+  beat_strength:     { beat_min: 0.4, beat_max: 1.0, played_filter: 'all' },
+  time_signature:    { time_sigs: [4], played_filter: 'all' },
+  acousticness:      { acousticness_min: 0.0, acousticness_max: 1.0, played_filter: 'all' },
 }
 
 let _uid = 1000

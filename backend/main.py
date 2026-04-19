@@ -38,6 +38,7 @@ from routers.admin_defaults import router as admin_defaults_router
 from routers.playlist_backups import router as playlist_backups_router
 from routers.playlist_import import router as playlist_import_router
 from routers.youtube_rip import router as youtube_rip_router
+from routers.audio_analysis import router as audio_analysis_router
 
 
 def _run_migrations():
@@ -172,6 +173,21 @@ def _run_migrations():
         ("import_album_suggestions",  "missing_tracks",      "TEXT",     "NULL"),
         # v12: per-artist catalog popularity — track's listeners relative to artist's #1 hit
         ("track_scores", "artist_catalog_popularity", "REAL", "NULL"),
+        # audio analysis: waveform-derived properties on library_tracks
+        ("library_tracks", "bpm",                    "INTEGER",  "NULL"),
+        ("library_tracks", "musical_key",             "TEXT",     "NULL"),
+        ("library_tracks", "key_confidence",          "REAL",     "NULL"),
+        ("library_tracks", "energy",                  "REAL",     "NULL"),
+        ("library_tracks", "loudness_db",             "REAL",     "NULL"),
+        ("library_tracks", "beat_strength",           "REAL",     "NULL"),
+        ("library_tracks", "time_signature",          "INTEGER",  "NULL"),
+        ("library_tracks", "acousticness",            "REAL",     "NULL"),
+        ("library_tracks", "audio_analyzed_at",       "DATETIME", "NULL"),
+        ("library_tracks", "audio_analysis_version",  "INTEGER",  "NULL"),
+        # audio analysis schedule on automation_settings
+        ("automation_settings", "audio_analysis_enabled",        "BOOLEAN", "1"),
+        ("automation_settings", "audio_analysis_interval_hours", "INTEGER", "24"),
+        ("automation_settings", "last_audio_analysis",           "DATETIME", "NULL"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -666,6 +682,7 @@ app.include_router(admin_defaults_router)      # /api/admin/default-playlists �
 app.include_router(playlist_backups_router)    # /api/playlist-backups   — playlist backup + restore
 app.include_router(playlist_import_router)     # /api/import             — external playlist import
 app.include_router(youtube_rip_router)         # /api/import/youtube-rip — YouTube audio → MP3 → Jellyfin
+app.include_router(audio_analysis_router)      # /api/audio-analysis    — media paths, stats, key list
 
 
 @app.get("/api/health")

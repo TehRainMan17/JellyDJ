@@ -943,6 +943,239 @@ def execute_genre_adjacent_block(
     return _apply_exclusions(_rows_to_set(rows), excluded_item_ids)
 
 
+# ── Audio analysis blocks ─────────────────────────────────────────────────────
+
+def execute_bpm_range_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """
+    Filter tracks by BPM range.  Optionally includes tracks at half and double
+    tempo (harmonic BPM) so a 120–140 filter also catches 60–70 and 240–280.
+    """
+    from models import LibraryTrack, TrackScore
+    from sqlalchemy import or_
+
+    bpm_min = int(params.get("bpm_min", 60))
+    bpm_max = int(params.get("bpm_max", 180))
+    harmonic = bool(params.get("harmonic", False))
+    played_filter = params.get("played_filter", "all")
+
+    q = db.query(LibraryTrack.jellyfin_item_id).filter(LibraryTrack.bpm.isnot(None))
+
+    if harmonic:
+        half_min = max(20, bpm_min // 2)
+        half_max = max(20, bpm_max // 2)
+        dbl_min  = min(300, bpm_min * 2)
+        dbl_max  = min(300, bpm_max * 2)
+        q = q.filter(or_(
+            LibraryTrack.bpm.between(bpm_min, bpm_max),
+            LibraryTrack.bpm.between(half_min, half_max),
+            LibraryTrack.bpm.between(dbl_min,  dbl_max),
+        ))
+    else:
+        q = q.filter(LibraryTrack.bpm.between(bpm_min, bpm_max))
+
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {
+            row[0] for row in
+            db.query(TrackScore.jellyfin_item_id)
+              .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0)
+              .all()
+            if row[0]
+        }
+        if played_filter == "played":
+            item_ids &= played_ids
+        else:
+            item_ids -= played_ids
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_musical_key_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """
+    Filter tracks by musical key.  Supports mode (major/minor/all) and optional
+    specific root note selection (C, C#, D, …).  Empty notes list = all notes.
+    """
+    from models import LibraryTrack, TrackScore
+    from sqlalchemy import or_
+
+    mode         = params.get("mode", "all")   # "all" | "major" | "minor"
+    notes        = params.get("notes", [])     # [] = all roots; ["C", "G"] = specific
+    played_filter = params.get("played_filter", "all")
+
+    q = db.query(LibraryTrack.jellyfin_item_id).filter(LibraryTrack.musical_key.isnot(None))
+
+    if mode == "major":
+        q = q.filter(LibraryTrack.musical_key.like("% Major"))
+    elif mode == "minor":
+        q = q.filter(LibraryTrack.musical_key.like("% Minor"))
+
+    if notes:
+        q = q.filter(or_(*[
+            LibraryTrack.musical_key.like(f"{n} %")
+            for n in notes
+        ]))
+
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {
+            row[0] for row in
+            db.query(TrackScore.jellyfin_item_id)
+              .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0)
+              .all()
+            if row[0]
+        }
+        if played_filter == "played":
+            item_ids &= played_ids
+        else:
+            item_ids -= played_ids
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_energy_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Filter tracks by RMS energy (0–1). Requires audio analysis."""
+    from models import LibraryTrack, TrackScore
+
+    energy_min    = float(params.get("energy_min", 0.0))
+    energy_max    = float(params.get("energy_max", 1.0))
+    played_filter = params.get("played_filter", "all")
+
+    q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.energy.isnot(None))
+           .filter(LibraryTrack.energy.between(energy_min, energy_max)))
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {row[0] for row in db.query(TrackScore.jellyfin_item_id)
+                      .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0).all() if row[0]}
+        item_ids = (item_ids & played_ids) if played_filter == "played" else (item_ids - played_ids)
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_loudness_db_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Filter tracks by integrated loudness in dBFS. Requires audio analysis."""
+    from models import LibraryTrack, TrackScore
+
+    loudness_min  = float(params.get("loudness_min", -60))
+    loudness_max  = float(params.get("loudness_max", 0))
+    played_filter = params.get("played_filter", "all")
+
+    q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.loudness_db.isnot(None))
+           .filter(LibraryTrack.loudness_db.between(loudness_min, loudness_max)))
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {row[0] for row in db.query(TrackScore.jellyfin_item_id)
+                      .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0).all() if row[0]}
+        item_ids = (item_ids & played_ids) if played_filter == "played" else (item_ids - played_ids)
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_beat_strength_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Filter tracks by rhythmic pulse clarity (0–1). Requires audio analysis."""
+    from models import LibraryTrack, TrackScore
+
+    beat_min      = float(params.get("beat_min", 0.0))
+    beat_max      = float(params.get("beat_max", 1.0))
+    played_filter = params.get("played_filter", "all")
+
+    q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.beat_strength.isnot(None))
+           .filter(LibraryTrack.beat_strength.between(beat_min, beat_max)))
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {row[0] for row in db.query(TrackScore.jellyfin_item_id)
+                      .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0).all() if row[0]}
+        item_ids = (item_ids & played_ids) if played_filter == "played" else (item_ids - played_ids)
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_time_signature_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Filter tracks by beats per bar (3 or 4). Requires audio analysis."""
+    from models import LibraryTrack, TrackScore
+
+    time_sigs     = [int(x) for x in params.get("time_sigs", [4]) if x]
+    played_filter = params.get("played_filter", "all")
+
+    if not time_sigs:
+        return set()
+
+    q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.time_signature.isnot(None))
+           .filter(LibraryTrack.time_signature.in_(time_sigs)))
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {row[0] for row in db.query(TrackScore.jellyfin_item_id)
+                      .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0).all() if row[0]}
+        item_ids = (item_ids & played_ids) if played_filter == "played" else (item_ids - played_ids)
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
+def execute_acousticness_block(
+    user_id: str,
+    params: dict,
+    db: Session,
+    excluded_item_ids: frozenset,
+) -> set[str]:
+    """Filter tracks by acousticness heuristic (0–1). Requires audio analysis."""
+    from models import LibraryTrack, TrackScore
+
+    acousticness_min = float(params.get("acousticness_min", 0.0))
+    acousticness_max = float(params.get("acousticness_max", 1.0))
+    played_filter    = params.get("played_filter", "all")
+
+    q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.acousticness.isnot(None))
+           .filter(LibraryTrack.acousticness.between(acousticness_min, acousticness_max)))
+    item_ids = {row[0] for row in q.all() if row[0]}
+
+    if played_filter != "all":
+        played_ids = {row[0] for row in db.query(TrackScore.jellyfin_item_id)
+                      .filter(TrackScore.user_id == user_id, TrackScore.play_count > 0).all() if row[0]}
+        item_ids = (item_ids & played_ids) if played_filter == "played" else (item_ids - played_ids)
+
+    return _apply_exclusions(item_ids, excluded_item_ids)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 BLOCK_REGISTRY: dict = {
@@ -971,4 +1204,12 @@ BLOCK_REGISTRY: dict = {
     "novelty":           execute_novelty_block,
     "recency_score":     execute_recency_score_block,
     "skip_streak":       execute_skip_streak_block,
+    # Audio analysis blocks — require audio waveform analysis to have run
+    "bpm_range":         execute_bpm_range_block,
+    "musical_key":       execute_musical_key_block,
+    "energy":            execute_energy_block,
+    "loudness_db":       execute_loudness_db_block,
+    "beat_strength":     execute_beat_strength_block,
+    "time_signature":    execute_time_signature_block,
+    "acousticness":      execute_acousticness_block,
 }

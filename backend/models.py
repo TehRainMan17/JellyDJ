@@ -261,6 +261,17 @@ class LibraryTrack(Base):
     jellyfin_album_id = Column(String, nullable=True, index=True)
     # v6: Jellyfin artist item ID
     jellyfin_artist_id = Column(String, nullable=True, index=True)
+    # audio analysis: waveform-derived properties (BPM, key, energy, etc.)
+    bpm                    = Column(Integer, nullable=True)
+    musical_key            = Column(String,  nullable=True)   # e.g. "C Major", "F# Minor"
+    key_confidence         = Column(Float,   nullable=True)   # 0-1
+    energy                 = Column(Float,   nullable=True)   # RMS energy normalized 0-1
+    loudness_db            = Column(Float,   nullable=True)   # integrated loudness in dB
+    beat_strength          = Column(Float,   nullable=True)   # onset strength confidence 0-1
+    time_signature         = Column(Integer, nullable=True)   # beats per bar (3, 4, 6, …)
+    acousticness           = Column(Float,   nullable=True)   # 0-1 (1 = fully acoustic)
+    audio_analyzed_at      = Column(DateTime, nullable=True)
+    audio_analysis_version = Column(Integer, nullable=True, default=1)
 
     # Aliases used by playlist_import service
     @property
@@ -408,6 +419,30 @@ class AutomationSettings(Base):
     # v7: popularity cache refresh schedule
     popularity_cache_refresh_interval_hours = Column(Integer, nullable=False, default=24)
     last_popularity_cache_refresh = Column(DateTime, nullable=True)
+    # audio analysis schedule
+    audio_analysis_enabled        = Column(Boolean, default=True)
+    audio_analysis_interval_hours = Column(Integer, nullable=False, default=24)
+    last_audio_analysis           = Column(DateTime, nullable=True)
+
+
+class MediaLibraryPath(Base):
+    """
+    Path mapping between what Jellyfin sees on its filesystem and what the
+    JellyDJ backend can access locally.  Multiple rows allow libraries spread
+    across several mount points.
+
+    When the audio analysis service resolves a track file it:
+      1. Requests the track's Path from Jellyfin Items API.
+      2. Iterates enabled rows here and replaces jellyfin_prefix with local_prefix.
+      3. Uses the first match where the translated path exists on disk.
+    """
+    __tablename__ = "media_library_paths"
+    id              = Column(Integer, primary_key=True)
+    label           = Column(String,  nullable=False, default="")
+    jellyfin_prefix = Column(String,  nullable=False)
+    local_prefix    = Column(String,  nullable=False)
+    enabled         = Column(Boolean, default=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
 
 
 # ── v2: new tables ────────────────────────────────────────────────────────────
