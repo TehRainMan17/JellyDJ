@@ -3,7 +3,7 @@ import { apiFetch } from '../lib/api'
 import {
   Clock, RefreshCw, Loader2, Save, Zap, Telescope, Download,
   ShieldAlert, ToggleLeft, ToggleRight, Star, Database, TrendingUp,
-  Trash2, Activity,
+  Trash2, Activity, RotateCcw,
 } from 'lucide-react'
 
 // Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
@@ -143,6 +143,8 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
   const [trigPopCache,  setTrigPopCache]  = useState(false)
   const [trigBillboard, setTrigBillboard] = useState(false)
   const [trigAudio,     setTrigAudio]     = useState(false)
+  const [reindexing,   setReindexing]    = useState(false)
+  const [reindexMsg,   setReindexMsg]    = useState('')
 
   useEffect(() => {
     apiFetch('/api/automation/settings').then(r=>r.json()).then(d => {
@@ -228,6 +230,30 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
       await apiFetch('/api/automation/trigger/enrichment', { method: 'POST' })
       onTrigger?.()
     } finally { setTrigEnrich(false) }
+  }
+
+  const handleReindexAll = async () => {
+    if (!window.confirm(
+      'This will clear audio analysis data for all tracks and queue them for re-analysis.\n\n' +
+      'Click "Analyze Now" afterwards to start the job.\n\nContinue?'
+    )) return
+    setReindexing(true)
+    setReindexMsg('')
+    try {
+      const r = await apiFetch('/api/audio-analysis/reindex-all', { method: 'POST' })
+      const d = await r.json()
+      if (r.ok) {
+        setReindexMsg(`✓ Reset ${d.reset} tracks — click Analyze Now to begin`)
+        apiFetch('/api/audio-analysis/stats').then(r=>r.json()).then(setAudioStats).catch(() => {})
+      } else {
+        setReindexMsg('✗ Reset failed')
+      }
+    } catch {
+      setReindexMsg('✗ Network error')
+    } finally {
+      setReindexing(false)
+      setTimeout(() => setReindexMsg(''), 8000)
+    }
   }
 
   const triggerAudioAnalysis = async () => {
@@ -517,6 +543,30 @@ export default function AutomationPanel({ jobStatuses = {}, onTrigger }) {
                 <div className="text-[10px] uppercase tracking-wider" style={{ color:'var(--text-secondary)' }}>Total</div>
                 <div className="text-xl font-bold mt-0.5" style={{ fontFamily:'Syne', color:'var(--text-secondary)' }}>{audioStats.total}</div>
               </div>
+            </div>
+          )}
+
+          {/* Reindex all */}
+          {!audioStatus?.running && (
+            <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl"
+                 style={{ background:'rgba(248,113,113,0.06)', border:'1px solid rgba(248,113,113,0.18)' }}>
+              <div className="space-y-0.5">
+                <div className="text-xs font-semibold" style={{ color:'var(--text-primary)' }}>Reindex All Songs</div>
+                <div className="text-[11px]" style={{ color:'var(--text-muted)' }}>
+                  Clears existing data and re-queues all tracks for analysis.
+                </div>
+                {reindexMsg && (
+                  <div className={`text-[11px] font-mono mt-1 ${reindexMsg.startsWith('✓') ? 'text-[var(--accent)]' : 'text-[var(--danger)]'}`}>
+                    {reindexMsg}
+                  </div>
+                )}
+              </div>
+              <button onClick={handleReindexAll} disabled={reindexing}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all disabled:opacity-40 flex-shrink-0"
+                      style={{ background:'rgba(248,113,113,0.12)', border:'1px solid rgba(248,113,113,0.35)', color:'#f87171' }}>
+                {reindexing ? <Loader2 size={11} className="animate-spin" /> : <RotateCcw size={11} />}
+                Reindex All
+              </button>
             </div>
           )}
 

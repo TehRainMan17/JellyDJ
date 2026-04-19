@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, UserContext
+from auth import get_current_user, require_admin, UserContext
 from database import get_db
 from models import LibraryTrack
 
@@ -69,3 +69,20 @@ def analysis_stats(_: UserContext = Depends(get_current_user), db: Session = Dep
         "bpm_histogram": histogram,
         "key_distribution": key_distribution,
     }
+
+
+@router.post("/reindex-all")
+def reindex_all_tracks(_: UserContext = Depends(require_admin), db: Session = Depends(get_db)):
+    """
+    Reset audio analysis data on every track so the next analysis run reprocesses
+    the entire library with the current algorithm version.  Does not start the job —
+    trigger it separately via POST /api/automation/trigger/audio-analysis.
+    """
+    count = db.query(LibraryTrack).filter(LibraryTrack.audio_analyzed_at.isnot(None)).count()
+    db.query(LibraryTrack).update(
+        {"audio_analyzed_at": None, "audio_analysis_version": None},
+        synchronize_session=False,
+    )
+    db.commit()
+    log.info("Reindex-all: reset audio analysis data for %d tracks", count)
+    return {"ok": True, "reset": count}

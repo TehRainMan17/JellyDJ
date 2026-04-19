@@ -32,7 +32,7 @@ from sqlalchemy import or_
 
 log = logging.getLogger(__name__)
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 _SAMPLE_RATE = 22050       # Hz — sufficient for all audio features
 _BATCH_COMMIT = 10         # commit to DB every N tracks to limit lock time
 
@@ -205,25 +205,114 @@ def _analyze_audio(audio_bytes: bytes, step_cb=None) -> dict:
     if len(y) < sr:  # less than 1 second → skip
         raise ValueError("Audio too short")
 
-    _step("Detecting BPM…")
-    tempo_frames = librosa.feature.tempo(y=y, sr=sr)
-    bpm = int(round(float(np.median(tempo_frames))))
-    bpm = max(20, min(300, bpm))
+    hop = 512  # shared hop length for all frame-based features
 
+    # ── Onset envelopes ───────────────────────────────────────────────────────
+    # Full-spectrum onset env is used for beat clarity (needs hi-hats etc.).
+    # Low-frequency onset env (<= 500 Hz) is used for BPM: kick drums and bass
+    # live here; hi-hats / arpeggios / snare cracks that fire at double the beat
+    # rate are excluded, preventing the autocorrelation from locking onto the
+    # 8th-note period instead of the actual beat period.
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    onset_env_low = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, fmax=500)
+
+    # If the low-freq channel is too quiet (e.g. harpsichord, solo flute),
+    # fall back to the full onset env so we still get a tempo estimate.
+    onset_for_bpm = (
+        onset_env_low
+        if float(onset_env_low.max()) > 0.10 * float(onset_env.max())
+        else onset_env
+    )
+
+    # ── BPM via low-frequency onset autocorrelation ───────────────────────────
+    _step("Detecting BPM…")
+    ac = np.correlate(onset_for_bpm, onset_for_bpm, mode="full")
+    ac = ac[len(ac) // 2:]
+    ac_norm = ac / max(float(ac[0]), 1e-6)
+
+    lag_lo = max(1, int(np.ceil(60.0 / 200.0 * sr / hop)))   # 200 BPM → shortest lag
+    lag_hi = min(len(ac_norm) - 1, int(np.floor(60.0 / 40.0 * sr / hop)))  # 40 BPM → longest lag
+
+    if lag_lo < lag_hi:
+        lags = np.arange(lag_lo, lag_hi + 1, dtype=float)
+        bpm_at_lag = 60.0 * sr / (hop * lags)
+
+        # Soft prior: still mildly penalise very high BPMs as a safety net
+        prior = np.ones(len(lags))
+        prior[bpm_at_lag > 145] = 0.80
+        prior[bpm_at_lag > 180] = 0.50
+        prior[bpm_at_lag < 55]  = 0.80
+
+        best_idx = int(np.argmax(ac_norm[lag_lo:lag_hi + 1] * prior))
+        bpm = int(round(float(bpm_at_lag[best_idx])))
+        bpm = max(40, min(200, bpm))
+    else:
+        bpm = 120
+
+    # ── Key ───────────────────────────────────────────────────────────────────
     _step("Detecting key…")
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
     musical_key, key_confidence = _detect_key(chroma)
 
+    # ── Energy ────────────────────────────────────────────────────────────────
+    # Old approach used amplitude_to_db(rms, ref=np.max) which is relative to
+    # each track's own peak — this collapses all tracks to a narrow band (~0.78–0.84).
+    # New approach: absolute dBFS loudness + spectral centroid + crest ratio,
+    # giving a perceptual measure similar to Spotify's energy feature.
     _step("Measuring loudness…")
     rms = librosa.feature.rms(y=y)[0]
-    loudness_db = float(librosa.amplitude_to_db(rms, ref=np.max).mean())
-    energy = float(np.clip((loudness_db + 60) / 60, 0.0, 1.0))
+    rms_mean = float(rms.mean())
+    rms_peak = float(rms.max()) or 1e-10
 
-    _step("Measuring beat strength…")
-    hop = 512
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    peak = float(onset_env.max()) or 1e-6
-    beat_strength = float(np.clip(onset_env.mean() / peak, 0, 1))
+    loudness_db = float(20.0 * np.log10(max(rms_mean, 1e-10)))
+
+    spec_centroid = float(librosa.feature.spectral_centroid(y=y, sr=sr)[0].mean())
+    centroid_norm = float(np.clip(spec_centroid / 6000.0, 0.0, 1.0))
+
+    # Low crest_ratio (mean ≪ peak) = very dynamic (acoustic/classical).
+    # High crest_ratio (mean ≈ peak) = heavily compressed/loud (electronic/pop).
+    crest_ratio = float(np.clip(rms_mean / rms_peak, 0.0, 1.0))
+
+    # Map absolute loudness: typical commercial audio is −30 to −3 dBFS mean RMS
+    loudness_norm = float(np.clip((loudness_db + 40.0) / 37.0, 0.0, 1.0))
+
+    energy = float(np.clip(
+        0.55 * loudness_norm + 0.30 * centroid_norm + 0.15 * crest_ratio,
+        0.0, 1.0,
+    ))
+
+    # ── Beat clarity ──────────────────────────────────────────────────────────
+    # Measures how much stronger the onset energy is ON detected beats vs OFF
+    # beats. EDM / hip-hop with a hard kick scores high; ambient / classical
+    # scores low. Log-scaling the on/off ratio spreads it across the full 0–1
+    # range rather than being bimodal like the AC approach.
+    _step("Measuring beat clarity…")
+    _, beat_frames = librosa.beat.beat_track(
+        onset_envelope=onset_env, sr=sr, hop_length=hop
+    )
+    onset_norm = onset_env / max(float(onset_env.max()), 1e-6)
+
+    if len(beat_frames) >= 4:
+        beat_mask = np.zeros(len(onset_norm), dtype=bool)
+        for bf in beat_frames:
+            for offset in range(-2, 3):  # ±2-frame tolerance around each beat
+                idx = int(bf) + offset
+                if 0 <= idx < len(onset_norm):
+                    beat_mask[idx] = True
+
+        n_on  = int(beat_mask.sum())
+        n_off = int((~beat_mask).sum())
+        if n_on > 0 and n_off > 0:
+            on_energy  = float(onset_norm[beat_mask].mean())
+            off_energy = float(onset_norm[~beat_mask].mean())
+            # ratio 1 = no distinction (ambient), 8+ = very clear beats (EDM)
+            ratio = on_energy / max(off_energy, 1e-6)
+            # log2 scale: 1→0.0, 2→0.33, 4→0.67, 8→1.0
+            beat_strength = float(np.clip(np.log2(max(ratio, 1.0)) / 3.0, 0.0, 1.0))
+        else:
+            beat_strength = 0.1
+    else:
+        beat_strength = 0.05  # beat tracker found too few events
 
     _step("Estimating time signature…")
     time_sig = _estimate_time_signature(onset_env, sr, hop)
