@@ -100,6 +100,7 @@ _EMBY_AUTH = (
 )
 
 REFRESH_TOKEN_EXPIRE_HOURS = 8
+LONG_SESSION_EXPIRE_DAYS = 30
 
 # ── Setup mode ────────────────────────────────────────────────────────────────
 
@@ -219,6 +220,7 @@ def _issue_tokens(
     username: str,
     is_admin: bool,
     jellyfin_token: str,
+    long_session: bool = False,
 ) -> tuple[str, str]:
     """
     Issue a new access JWT and refresh token.
@@ -230,13 +232,17 @@ def _issue_tokens(
     )
     refresh_plaintext = create_refresh_token()
     token_hash = hash_token(refresh_plaintext)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=REFRESH_TOKEN_EXPIRE_HOURS)
+    if long_session:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=LONG_SESSION_EXPIRE_DAYS)
+    else:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=REFRESH_TOKEN_EXPIRE_HOURS)
 
     rt = RefreshToken(
         token_hash=token_hash,
         user_id=jellyfin_user_id,
         jellyfin_token=encrypt(jellyfin_token),
         expires_at=expires_at,
+        long_session=long_session,
     )
     db.add(rt)
     db.commit()
@@ -249,6 +255,7 @@ def _issue_tokens(
 class LoginRequest(BaseModel):
     username: str
     password: str
+    remember_me: bool = False
 
 
 class LoginResponse(BaseModel):
@@ -459,7 +466,8 @@ async def login(request: Request, body: LoginRequest, db: Session = Depends(get_
         log.warning("Auto-provision on login failed for %s: %s", jellyfin_user_id, _prov_err)
 
     access_token, refresh_token = _issue_tokens(
-        db, jellyfin_user_id, jellyfin_username, is_admin, jellyfin_token
+        db, jellyfin_user_id, jellyfin_username, is_admin, jellyfin_token,
+        long_session=body.remember_me,
     )
 
     return LoginResponse(
@@ -536,7 +544,8 @@ async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
     db.commit()
 
     new_access, new_refresh = _issue_tokens(
-        db, rt.user_id, username, is_admin, jellyfin_token
+        db, rt.user_id, username, is_admin, jellyfin_token,
+        long_session=bool(getattr(rt, "long_session", False)),
     )
 
     return RefreshResponse(access_token=new_access, refresh_token=new_refresh)

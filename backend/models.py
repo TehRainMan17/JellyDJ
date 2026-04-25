@@ -600,6 +600,7 @@ class RefreshToken(Base):
     expires_at     = Column(DateTime, nullable=False)
     created_at     = Column(DateTime, default=datetime.utcnow)
     last_used_at   = Column(DateTime, nullable=True)
+    long_session   = Column(Boolean, nullable=False, default=False)
 
 
 # ── v4: manual album exclusions ───────────────────────────────────────────────

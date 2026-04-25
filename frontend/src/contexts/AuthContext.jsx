@@ -48,7 +48,7 @@ export function AuthProvider({ children }) {
 
   // ── Refresh ───────────────────────────────────────────────────────────────
   const refresh = useCallback(async () => {
-    const storedRefresh = sessionStorage.getItem(REFRESH_KEY)
+    const storedRefresh = sessionStorage.getItem(REFRESH_KEY) || localStorage.getItem(REFRESH_KEY)
     if (!storedRefresh) throw new Error('No refresh token')
 
     const resp = await fetch('/api/auth/refresh', {
@@ -63,6 +63,10 @@ export function AuthProvider({ children }) {
     applyAccessToken(data.access_token)
     if (data.refresh_token) {
       sessionStorage.setItem(REFRESH_KEY, data.refresh_token)
+      // Keep localStorage in sync so "remember me" sessions survive browser restarts
+      if (localStorage.getItem(REFRESH_KEY)) {
+        localStorage.setItem(REFRESH_KEY, data.refresh_token)
+      }
     }
     return data.access_token
   }, [applyAccessToken])
@@ -85,11 +89,11 @@ export function AuthProvider({ children }) {
     applyAccessToken(data.access_token)
     // Do NOT store a refresh token
   }, [applyAccessToken])
-  const login = useCallback(async (username, password) => {
+  const login = useCallback(async (username, password, rememberMe = false) => {
     const resp = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, remember_me: rememberMe }),
     })
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}))
@@ -100,6 +104,9 @@ export function AuthProvider({ children }) {
     const data = await resp.json()
     applyAccessToken(data.access_token)
     sessionStorage.setItem(REFRESH_KEY, data.refresh_token)
+    if (rememberMe) {
+      localStorage.setItem(REFRESH_KEY, data.refresh_token)
+    }
     const payload = decodeJwtPayload(data.access_token)
     return payload ? {
       user_id:  payload.sub ?? payload.user_id,
@@ -120,17 +127,22 @@ export function AuthProvider({ children }) {
     setAccessToken(null)
     setUser(null)
     sessionStorage.removeItem(REFRESH_KEY)
+    localStorage.removeItem(REFRESH_KEY)
   }, [accessToken])
 
   // ── On mount: attempt silent refresh to restore session ──────────────────
   useEffect(() => {
     async function init() {
-      const stored = sessionStorage.getItem(REFRESH_KEY)
+      // Prefer sessionStorage; fall back to localStorage (used by the Android WebView companion app)
+      const stored = sessionStorage.getItem(REFRESH_KEY) || localStorage.getItem(REFRESH_KEY)
       if (stored) {
+        // Ensure both stores are populated so subsequent reads succeed regardless of source
+        sessionStorage.setItem(REFRESH_KEY, stored)
         try {
           await refresh()
         } catch {
           sessionStorage.removeItem(REFRESH_KEY)
+          localStorage.removeItem(REFRESH_KEY)
           setAccessToken(null)
           setUser(null)
         }

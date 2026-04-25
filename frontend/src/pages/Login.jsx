@@ -11,6 +11,7 @@ export default function Login() {
 
   const [username, setUsername]     = useState('')
   const [password, setPassword]     = useState('')
+  const [rememberMe, setRememberMe] = useState(false)
   const [error, setError]           = useState('')
   const [loading, setLoading]       = useState(false)
 
@@ -40,7 +41,7 @@ export default function Login() {
       if (setupMode) {
         await setupLogin(username, password)
       } else {
-        await login(username, password)
+        await login(username, password, rememberMe)
       }
       navigate(from, { replace: true })
     } catch (err) {
@@ -174,6 +175,22 @@ export default function Login() {
               className="input"
             />
           </div>
+
+          {/* Remember me — only for Jellyfin login, not setup */}
+          {!setupMode && (
+            <label
+              className="flex items-center gap-2 cursor-pointer select-none"
+              style={{ fontSize: 13, color: 'var(--text-secondary)' }}
+            >
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={e => setRememberMe(e.target.checked)}
+                style={{ accentColor: 'var(--accent)', width: 14, height: 14 }}
+              />
+              Remember me for 30 days
+            </label>
+          )}
 
           {/* Error */}
           {error && (

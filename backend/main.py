@@ -32,6 +32,7 @@ from routers import (
 )
 from routers.graph import router as graph_router
 from routers.auth import router as auth_router
+from routers.mobile import router as mobile_router
 from routers.playlist_templates import router as playlist_templates_router
 from routers.user_playlists import router as user_playlists_router
 from routers.admin_defaults import router as admin_defaults_router
@@ -188,6 +189,8 @@ def _run_migrations():
         ("automation_settings", "audio_analysis_enabled",        "BOOLEAN", "1"),
         ("automation_settings", "audio_analysis_interval_hours", "INTEGER", "24"),
         ("automation_settings", "last_audio_analysis",           "DATETIME", "NULL"),
+        # remember-me: long-lived refresh tokens (30 days vs 8 hours)
+        ("refresh_tokens", "long_session", "BOOLEAN", "0"),
     ]
     with engine.connect() as conn:
         for table, col, typ, default in new_columns:
@@ -676,6 +679,7 @@ app.include_router(graph_router)          # /api/graph          — artist/genre
 app.include_router(automation.router)     # /api/automation     — scheduler settings + triggers
 app.include_router(exclusions.router)     # /api/exclusions     — manual album exclusions
 app.include_router(auth_router)           # /api/auth           — Jellyfin login + JWT tokens
+app.include_router(mobile_router)         # /api/mobile         — Android/iOS companion endpoints
 app.include_router(playlist_templates_router)  # /api/playlist-templates — template + block CRUD
 app.include_router(user_playlists_router)      # /api/user-playlists     — user playlist CRUD + push
 app.include_router(admin_defaults_router)      # /api/admin/default-playlists — admin default playlist config
