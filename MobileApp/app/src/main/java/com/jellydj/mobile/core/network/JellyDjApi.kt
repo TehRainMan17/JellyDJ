@@ -31,7 +31,7 @@ data class RefreshRequest(
 
 data class RefreshResponse(
     val access_token: String,
-    val refresh_token: String
+    val refresh_token: String? = null
 )
 
 data class MeResponse(
@@ -59,6 +59,80 @@ data class MobilePlaylistDto(
 
 data class MobileSearchResponseDto(
     val tracks: List<MobileTrackDto>
+)
+
+data class MobileLibraryTrackDto(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val duration_ms: Long,
+    val stream_url: String,
+    val image_url: String?,
+    val artist_affinity: Float,
+    val global_popularity: Float?,
+    val play_count: Int,
+    val bpm: Double? = null,
+    val energy: Float? = null
+)
+
+data class MobileLibraryArtistDto(
+    val id: String,
+    val name: String,
+    val image_url: String?,
+    val affinity_score: Float,
+    val global_popularity: Float?,
+    val track_count: Int
+)
+
+data class MobileLibraryAlbumDto(
+    val id: String,
+    val name: String,
+    val artist: String,
+    val image_url: String?,
+    val affinity_score: Float,
+    val global_popularity: Float?,
+    val track_count: Int
+)
+
+data class MobileLibraryGenreDto(
+    val id: String,
+    val name: String,
+    val affinity_score: Float,
+    val track_count: Int
+)
+
+data class MobileRelatedArtistDto(
+    val name: String,
+    val match_score: Double
+)
+
+data class MobileGenreWeightDto(
+    val genre: String,
+    val weight: Double
+)
+
+data class MobileArtistDetailDto(
+    val name: String,
+    val image_url: String?,
+    val affinity_score: Float,
+    val global_popularity: Float?,
+    val trend_direction: String?,
+    val biography: String?,
+    val canonical_genres: List<MobileGenreWeightDto>,
+    val related_artists: List<MobileRelatedArtistDto>
+)
+
+data class MobileLibraryYearDto(
+    val year: Int,
+    val track_count: Int
+)
+
+data class MobileSmartCollectionDto(
+    val key: String,
+    val label: String,
+    val description: String,
+    val icon_hint: String
 )
 
 interface JellyDjApi {
@@ -91,4 +165,68 @@ interface JellyDjApi {
 
     @GET("api/mobile/top-tracks")
     suspend fun topTracks(@Query("limit") limit: Int = 20): List<MobileTrackDto>
+
+    @GET("api/mobile/library/artists")
+    suspend fun libraryArtists(
+        @Query("q") query: String? = null,
+        @Query("limit") limit: Int = 200
+    ): List<MobileLibraryArtistDto>
+
+    @GET("api/mobile/library/albums")
+    suspend fun libraryAlbums(
+        @Query("q") query: String? = null,
+        @Query("artist") artist: String? = null,
+        @Query("sort") sort: String = "affinity",
+        @Query("limit") limit: Int = 200
+    ): List<MobileLibraryAlbumDto>
+
+    @GET("api/mobile/library/genres")
+    suspend fun libraryGenres(
+        @Query("q") query: String? = null,
+        @Query("limit") limit: Int = 200
+    ): List<MobileLibraryGenreDto>
+
+    @GET("api/mobile/library/tracks")
+    suspend fun libraryTracks(
+        @Query("q") query: String? = null,
+        @Query("artist") artist: String? = null,
+        @Query("album") album: String? = null,
+        @Query("genre") genre: String? = null,
+        @Query("sort") sort: String = "personal",
+        @Query("limit") limit: Int = 250
+    ): List<MobileLibraryTrackDto>
+
+    @GET("api/mobile/library/artists/{artistName}/tracks")
+    suspend fun libraryArtistTracks(
+        @Path("artistName") artistName: String,
+        @Query("sort") sort: String = "personal",
+        @Query("q") query: String? = null,
+        @Query("limit") limit: Int = 250
+    ): List<MobileLibraryTrackDto>
+
+    @GET("api/mobile/library/artists/{artistName}/detail")
+    suspend fun artistDetail(
+        @Path("artistName") artistName: String
+    ): MobileArtistDetailDto
+
+    @GET("api/mobile/library/years")
+    suspend fun libraryYears(
+        @Query("limit") limit: Int = 200
+    ): List<MobileLibraryYearDto>
+
+    @GET("api/mobile/library/years/{year}/tracks")
+    suspend fun yearTracks(
+        @Path("year") year: Int,
+        @Query("sort") sort: String = "personal",
+        @Query("limit") limit: Int = 500
+    ): List<MobileLibraryTrackDto>
+
+    @GET("api/mobile/library/smart")
+    suspend fun smartCollections(): List<MobileSmartCollectionDto>
+
+    @GET("api/mobile/library/smart/{collectionKey}/tracks")
+    suspend fun smartCollectionTracks(
+        @Path("collectionKey") collectionKey: String,
+        @Query("limit") limit: Int = 100
+    ): List<MobileLibraryTrackDto>
 }

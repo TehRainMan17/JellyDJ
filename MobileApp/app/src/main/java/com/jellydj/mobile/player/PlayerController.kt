@@ -56,37 +56,41 @@ class JellyDjPlayerController(context: Context) : PlayerController {
     override suspend fun playQueue(tracks: List<Track>, startIndex: Int) {
         if (tracks.isEmpty()) return
 
-        withContext(Dispatchers.IO) {
-            val mediaItems = tracks.filter { it.streamUrl.isNotBlank() }.map { track ->
-                    MediaItem.Builder()
-                        .setMediaId(track.id)
-                        .setUri(track.streamUrl)
-                        .setMediaMetadata(
-                            androidx.media3.common.MediaMetadata.Builder()
-                                .setTitle(track.title)
-                                .setArtist(track.artist)
-                                .setAlbumTitle(track.album)
-                                .setIsPlayable(true)
-                                .setArtworkUri(track.imageUrl?.let { Uri.parse(it) })
-                                .build()
-                        )
-                        .build()
-                }
-            if (mediaItems.isEmpty()) {
-                Log.e(TAG, "Playback skipped because all tracks had blank stream URLs.")
-                return@withContext
+        val mediaItems = tracks
+            .filter { it.streamUrl.isNotBlank() }
+            .map { track ->
+                MediaItem.Builder()
+                    .setMediaId(track.id)
+                    .setUri(track.streamUrl)
+                    .setMediaMetadata(
+                        androidx.media3.common.MediaMetadata.Builder()
+                            .setTitle(track.title)
+                            .setArtist(track.artist)
+                            .setAlbumTitle(track.album)
+                            .setIsPlayable(true)
+                            .setArtworkUri(track.imageUrl?.let { Uri.parse(it) })
+                            .build()
+                    )
+                    .build()
             }
+        if (mediaItems.isEmpty()) {
+            Log.e(TAG, "Playback skipped because all tracks had blank stream URLs.")
+            return
+        }
 
-            val boundedIndex = startIndex.coerceIn(0, mediaItems.lastIndex)
+        val boundedIndex = startIndex.coerceIn(0, mediaItems.lastIndex)
+        val controller = withContext(Dispatchers.IO) {
             val firstAttempt = getOrCreateControllerFuture()
-            val controller = try {
+            try {
                 firstAttempt.get()
             } catch (firstError: ExecutionException) {
                 Log.w(TAG, "MediaController connection failed, retrying with a fresh session.", firstError)
                 resetControllerFutureIfCurrent(firstAttempt)
                 getOrCreateControllerFuture().get()
             }
+        }
 
+        withContext(Dispatchers.Main.immediate) {
             try {
                 controller.setMediaItems(mediaItems, boundedIndex, 0L)
                 controller.prepare()

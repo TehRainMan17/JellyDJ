@@ -19,15 +19,24 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.QueueMusic
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Surface
@@ -68,12 +77,16 @@ import com.jellydj.mobile.AppContainer
 import com.jellydj.mobile.R
 import com.jellydj.mobile.auth.LoginInput
 import com.jellydj.mobile.home.HomeScreen
+import com.jellydj.mobile.library.AlbumLibraryDetailScreen
+import com.jellydj.mobile.library.ArtistLibraryDetailScreen
+import com.jellydj.mobile.library.LibraryScreen
+import com.jellydj.mobile.library.SmartCollectionDetailScreen
+import com.jellydj.mobile.library.YearLibraryDetailScreen
 import com.jellydj.mobile.player.MiniPlayer
 import com.jellydj.mobile.player.NowPlayingScreen
 import com.jellydj.mobile.player.PlayerViewModel
 import com.jellydj.mobile.playlists.PlaylistDetailScreen
 import com.jellydj.mobile.playlists.PlaylistsScreen
-import com.jellydj.mobile.search.SearchScreen
 import com.jellydj.mobile.settings.SettingsScreen
 import com.jellydj.mobile.webview.ServerWebViewScreen
 import kotlinx.coroutines.launch
@@ -86,19 +99,36 @@ import javax.net.ssl.SSLException
 @Composable
 fun JellyDjMobileApp(container: AppContainer, playerViewModel: PlayerViewModel) {
     var authState by remember { mutableStateOf(AuthState.CHECKING) }
+    var loginInitialStage by remember { mutableStateOf(LoginStage.SERVER) }
 
     LaunchedEffect(Unit) {
         if (container.sessionStore.read() == null) {
+            loginInitialStage = if (container.sessionStore.readServerBaseUrl() != null) LoginStage.CREDENTIALS else LoginStage.SERVER
             authState = AuthState.LOGGED_OUT
             return@LaunchedEffect
         }
-        val ok = container.authRepository.currentUser().isSuccess
-            || (container.authRepository.refreshSession() && container.authRepository.currentUser().isSuccess)
-        if (ok) {
+
+        // Always attempt a refresh on startup so the stored access token is
+        // fresh and the refresh token's validity is confirmed before the
+        // WebView tries to use it.  If refresh succeeds we are fully authenticated.
+        val refreshOk = container.authRepository.refreshSession()
+        if (refreshOk) {
             authState = AuthState.LOGGED_IN
-        } else {
+            return@LaunchedEffect
+        }
+
+        // Refresh failed.  Distinguish "server unreachable" from "token invalid":
+        // if /me succeeds the server IS reachable but the refresh token is gone
+        // (e.g. database wiped) — force re-login now rather than letting the
+        // WebView fail silently later.  If /me also fails the server is offline;
+        // keep the existing JWT so the user can at least browse cached data.
+        val meOk = container.authRepository.currentUser().isSuccess
+        if (meOk) {
             container.authRepository.logout()
+            loginInitialStage = if (container.sessionStore.readServerBaseUrl() != null) LoginStage.CREDENTIALS else LoginStage.SERVER
             authState = AuthState.LOGGED_OUT
+        } else {
+            authState = AuthState.LOGGED_IN
         }
     }
 
@@ -116,6 +146,7 @@ fun JellyDjMobileApp(container: AppContainer, playerViewModel: PlayerViewModel) 
         AuthState.LOGGED_OUT -> {
             LoginScreen(
                 initialServerUrl = container.sessionStore.readServerBaseUrl().orEmpty(),
+                initialStage = loginInitialStage,
                 onVerifyServer = { url -> container.authRepository.verifyInstance(url) },
                 onLogin = { input ->
                     val ok = container.authRepository.login(input).isSuccess
@@ -130,6 +161,18 @@ fun JellyDjMobileApp(container: AppContainer, playerViewModel: PlayerViewModel) 
                 playerViewModel = playerViewModel,
                 onSessionInvalid = {
                     container.authRepository.logout()
+                    loginInitialStage = if (container.sessionStore.readServerBaseUrl() != null) LoginStage.CREDENTIALS else LoginStage.SERVER
+                    authState = AuthState.LOGGED_OUT
+                },
+                onSignOut = {
+                    container.authRepository.logout()
+                    loginInitialStage = LoginStage.CREDENTIALS
+                    authState = AuthState.LOGGED_OUT
+                },
+                onChangeServer = {
+                    container.authRepository.logout()
+                    container.sessionStore.clearServerUrl()
+                    loginInitialStage = LoginStage.SERVER
                     authState = AuthState.LOGGED_OUT
                 }
             )
@@ -142,7 +185,9 @@ fun JellyDjMobileApp(container: AppContainer, playerViewModel: PlayerViewModel) 
 private fun MainScreen(
     container: AppContainer,
     playerViewModel: PlayerViewModel,
-    onSessionInvalid: () -> Unit
+    onSessionInvalid: () -> Unit,
+    onSignOut: () -> Unit,
+    onChangeServer: () -> Unit
 ) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -160,14 +205,20 @@ private fun MainScreen(
 
     val bottomNavItems = listOf(
         BottomNavItem("home", "Home", Icons.Default.Home),
-        BottomNavItem("search", "Search", Icons.Default.Search),
+        BottomNavItem("library", "Library", Icons.Default.LibraryMusic),
         BottomNavItem("playlists", "Playlists", Icons.Default.QueueMusic),
     )
 
     val drawerFeatures = listOf(
+        DrawerFeature("Dashboard", Icons.Default.Dashboard, "dashboard"),
         DrawerFeature("Insights", Icons.Default.BarChart, "insights"),
+        DrawerFeature("Discovery Queue", Icons.Default.Explore, "discovery"),
+        DrawerFeature("Playlist Manager", Icons.Default.LibraryMusic, "playlists"),
         DrawerFeature("Playlist Import", Icons.Default.Download, "import"),
         DrawerFeature("Playlist Backup", Icons.Default.Backup, "admin/playlist-backups", adminOnly = true),
+        DrawerFeature("Album Exclusions", Icons.Default.Block, "exclusions", adminOnly = true),
+        DrawerFeature("Connections", Icons.Default.Link, "connections", adminOnly = true),
+        DrawerFeature("Server Settings", Icons.Default.Tune, "settings", adminOnly = true),
         DrawerFeature("Admin Controls", Icons.Default.AdminPanelSettings, "admin/users", adminOnly = true),
     )
 
@@ -176,8 +227,11 @@ private fun MainScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
+        gesturesEnabled = false,
         drawerContent = {
-            ModalDrawerSheet {
+            ModalDrawerSheet(
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
                 Spacer(Modifier.height(16.dp))
                 Row(
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
@@ -239,6 +293,33 @@ private fun MainScreen(
                         )
                     }
                 }
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                Text(
+                    "Account",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Dns, contentDescription = null) },
+                    label = { Text("Change Server") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        onChangeServer()
+                    },
+                    modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Logout, contentDescription = null) },
+                    label = { Text("Sign Out") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        onSignOut()
+                    },
+                    modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding)
+                )
             }
         }
     ) {
@@ -291,11 +372,101 @@ private fun MainScreen(
                             val encodedName = Uri.encode(playlistName)
                             val encodedCover = Uri.encode(coverImageUrl ?: "")
                             navController.navigate("playlist_detail/$playlistId/$encodedName/$encodedCover")
+                        },
+                        onAlbumClick = { artistName, albumName ->
+                            val encArtist = Uri.encode(artistName)
+                            val encAlbum = Uri.encode(albumName)
+                            navController.navigate("album_library/$encArtist/$encAlbum")
                         }
                     )
                 }
-                composable("search") {
-                    SearchScreen(container = container, playerViewModel = playerViewModel)
+                composable("library") {
+                    LibraryScreen(
+                        container = container,
+                        playerViewModel = playerViewModel,
+                        onArtistClick = { artistName ->
+                            val encoded = Uri.encode(artistName)
+                            navController.navigate("artist_library/$encoded")
+                        },
+                        onAlbumClick = { artistName, albumName ->
+                            val encArtist = Uri.encode(artistName)
+                            val encAlbum = Uri.encode(albumName)
+                            navController.navigate("album_library/$encArtist/$encAlbum")
+                        },
+                        onYearClick = { year ->
+                            navController.navigate("year_library/$year")
+                        },
+                        onSmartCollectionClick = { key ->
+                            val encoded = Uri.encode(key)
+                            navController.navigate("smart_library/$encoded")
+                        }
+                    )
+                }
+                composable(
+                    "artist_library/{artistName}",
+                    enterTransition = { slideInHorizontally(tween(300)) { it } + fadeIn(tween(300)) },
+                    exitTransition = { fadeOut(tween(200)) },
+                    popEnterTransition = { fadeIn(tween(220)) },
+                    popExitTransition = { slideOutHorizontally(tween(300)) { it } + fadeOut(tween(300)) }
+                ) { backStackEntry ->
+                    val artistName = Uri.decode(backStackEntry.arguments?.getString("artistName") ?: return@composable)
+                    ArtistLibraryDetailScreen(
+                        container = container,
+                        playerViewModel = playerViewModel,
+                        artistName = artistName,
+                        onBack = { navController.navigateUp() },
+                        onRelatedArtistClick = { related ->
+                            val encoded = Uri.encode(related)
+                            navController.navigate("artist_library/$encoded")
+                        }
+                    )
+                }
+                composable(
+                    "year_library/{year}",
+                    enterTransition = { slideInHorizontally(tween(300)) { it } + fadeIn(tween(300)) },
+                    exitTransition = { fadeOut(tween(200)) },
+                    popEnterTransition = { fadeIn(tween(220)) },
+                    popExitTransition = { slideOutHorizontally(tween(300)) { it } + fadeOut(tween(300)) }
+                ) { backStackEntry ->
+                    val year = backStackEntry.arguments?.getString("year")?.toIntOrNull() ?: return@composable
+                    YearLibraryDetailScreen(
+                        container = container,
+                        playerViewModel = playerViewModel,
+                        year = year,
+                        onBack = { navController.navigateUp() }
+                    )
+                }
+                composable(
+                    "smart_library/{collectionKey}",
+                    enterTransition = { slideInHorizontally(tween(300)) { it } + fadeIn(tween(300)) },
+                    exitTransition = { fadeOut(tween(200)) },
+                    popEnterTransition = { fadeIn(tween(220)) },
+                    popExitTransition = { slideOutHorizontally(tween(300)) { it } + fadeOut(tween(300)) }
+                ) { backStackEntry ->
+                    val key = Uri.decode(backStackEntry.arguments?.getString("collectionKey") ?: return@composable)
+                    SmartCollectionDetailScreen(
+                        container = container,
+                        playerViewModel = playerViewModel,
+                        collectionKey = key,
+                        onBack = { navController.navigateUp() }
+                    )
+                }
+                composable(
+                    "album_library/{artistName}/{albumName}",
+                    enterTransition = { slideInHorizontally(tween(300)) { it } + fadeIn(tween(300)) },
+                    exitTransition = { fadeOut(tween(200)) },
+                    popEnterTransition = { fadeIn(tween(220)) },
+                    popExitTransition = { slideOutHorizontally(tween(300)) { it } + fadeOut(tween(300)) }
+                ) { backStackEntry ->
+                    val artistName = Uri.decode(backStackEntry.arguments?.getString("artistName") ?: return@composable)
+                    val albumName = Uri.decode(backStackEntry.arguments?.getString("albumName") ?: return@composable)
+                    AlbumLibraryDetailScreen(
+                        container = container,
+                        playerViewModel = playerViewModel,
+                        artistName = artistName,
+                        albumName = albumName,
+                        onBack = { navController.navigateUp() }
+                    )
                 }
                 composable("playlists") {
                     PlaylistsScreen(
@@ -369,6 +540,7 @@ private enum class LoginStage { SERVER, CREDENTIALS }
 @Composable
 private fun LoginScreen(
     initialServerUrl: String,
+    initialStage: LoginStage = LoginStage.SERVER,
     onVerifyServer: suspend (String) -> Result<Unit>,
     onLogin: suspend (LoginInput) -> Boolean
 ) {
@@ -379,7 +551,7 @@ private fun LoginScreen(
     var rememberMe by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    var stage by remember { mutableStateOf(LoginStage.SERVER) }
+    var stage by remember { mutableStateOf(initialStage) }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(20.dp),

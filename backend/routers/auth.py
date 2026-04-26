@@ -39,6 +39,7 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import httpx
 import io
@@ -99,8 +100,8 @@ _EMBY_AUTH = (
     'DeviceId="jellydj-server", Version="1.0.0"'
 )
 
-REFRESH_TOKEN_EXPIRE_HOURS = 8
-LONG_SESSION_EXPIRE_DAYS = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+LONG_SESSION_EXPIRE_DAYS = 365
 
 # ── Setup mode ────────────────────────────────────────────────────────────────
 
@@ -235,7 +236,7 @@ def _issue_tokens(
     if long_session:
         expires_at = datetime.now(timezone.utc) + timedelta(days=LONG_SESSION_EXPIRE_DAYS)
     else:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=REFRESH_TOKEN_EXPIRE_HOURS)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
     rt = RefreshToken(
         token_hash=token_hash,
@@ -248,6 +249,28 @@ def _issue_tokens(
     db.commit()
 
     return access_token, refresh_plaintext
+
+
+def _jellyfin_base_url_or_none(db: Session) -> Optional[str]:
+    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
+    return row.base_url.rstrip("/") if (row and row.base_url) else None
+
+
+async def _validate_jellyfin_token(base_url: str, token: str) -> bool:
+    """Return True if the Jellyfin token is still valid, False if rejected.
+
+    Network errors return True (don't revoke the session when Jellyfin is
+    temporarily unreachable — the user shouldn't be logged out for that).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{base_url}/Users/Me",
+                headers={"X-Emby-Token": token},
+            )
+        return resp.status_code == 200
+    except Exception:
+        return True
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -290,7 +313,7 @@ class RefreshRequest(BaseModel):
 
 class RefreshResponse(BaseModel):
     access_token: str
-    refresh_token: str
+    refresh_token: Optional[str] = None
 
 
 class LogoutRequest(BaseModel):
@@ -481,17 +504,21 @@ async def login(request: Request, body: LoginRequest, db: Session = Depends(get_
 @router.post("/refresh", response_model=RefreshResponse)
 async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
     """
-    Rotate a refresh token and issue a new access JWT.
+    Issue a new access JWT for a valid refresh token.
 
-    Flow:
-      1. Look up RefreshToken row by hash
-      2. Verify not expired
-      3. Decrypt stored Jellyfin token and re-validate via GET /Users/{id}
-      4. Delete old RefreshToken row, issue new pair
-      5. Return new access JWT + new refresh token
+    Refresh tokens are NOT rotated — the same token remains valid until
+    explicitly revoked (logout), the Jellyfin session is invalidated
+    (password change), or the sliding inactivity window expires
+    (30 days for regular sessions, 365 days for long/remember-me sessions).
 
-    Returns HTTP 401 if the token is unknown, expired, or Jellyfin rejects
-    the stored session (e.g. user changed their Jellyfin password).
+    Each refresh re-validates the stored Jellyfin token against Jellyfin.
+    If Jellyfin rejects it (password changed, account disabled, etc.), the
+    refresh token is revoked and 401 is returned.  Network errors do NOT
+    revoke the session — Jellyfin being temporarily unreachable should not
+    log the user out.
+
+    Returns HTTP 401 if the token is unknown, expired, or Jellyfin
+    permanently rejects the stored session.
     """
     invalid_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -505,7 +532,6 @@ async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
         raise invalid_exc
 
     now = datetime.now(timezone.utc)
-    # Handle both tz-aware and tz-naive datetimes stored in SQLite
     expires = rt.expires_at
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
@@ -514,41 +540,49 @@ async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
         db.commit()
         raise invalid_exc
 
-    # Decrypt the stored Jellyfin token (needed to re-issue it with the new
-    # refresh token row).  We do NOT re-ping Jellyfin on every refresh — that
-    # would fire a live HTTP call to Jellyfin every 13 minutes per open tab,
-    # competing with active playback.  The refresh token itself is the proof
-    # of identity: it is a cryptographically random 64-byte opaque value stored
-    # only as a SHA-256 hash, with its own server-side expiry.  Rotating it is
-    # sufficient; a round-trip to Jellyfin adds latency and load without
-    # meaningfully improving security (a stolen refresh token could be used
-    # before any re-validation could detect it anyway).
     try:
         jellyfin_token = decrypt(rt.jellyfin_token)
     except Exception:
         log.error("Failed to decrypt stored Jellyfin token for user %s", rt.user_id)
         raise invalid_exc
 
-    # Pull username/is_admin from the ManagedUser row — already kept up-to-date
-    # by the indexer's username-sync step and by each fresh login.
+    # Re-validate the Jellyfin session to detect password changes.
+    # NOTE: We intentionally do NOT revoke the JellyDJ refresh token when
+    # Jellyfin rejects the stored session token.  Jellyfin sessions can expire
+    # due to inactivity, session-limit policies, or brief server unavailability.
+    # Revoking aggressively here deleted valid refresh tokens and caused
+    # the mobile companion app's WebView to always show the login screen.
+    # The JellyDJ session lifetime (30 days) is independent of the Jellyfin
+    # session; Jellyfin is only the credential store at login time.
+    jf_base = _jellyfin_base_url_or_none(db)
+    if jf_base:
+        valid = await _validate_jellyfin_token(jf_base, jellyfin_token)
+        if not valid:
+            log.warning(
+                "Jellyfin session expired for user %s during refresh "
+                "(Jellyfin token rejected) — JellyDJ session continues",
+                rt.user_id,
+            )
+
     managed = db.query(ManagedUser).filter_by(jellyfin_user_id=rt.user_id).first()
     username: str = managed.username if managed else ""
     is_admin: bool = bool(managed.is_admin) if managed else False
 
-    # Update last_used_at before deleting
+    # Slide the expiry window so actively-used sessions never expire.
+    window = timedelta(
+        days=LONG_SESSION_EXPIRE_DAYS if rt.long_session else REFRESH_TOKEN_EXPIRE_DAYS
+    )
+    rt.expires_at = now + window
     rt.last_used_at = now
     db.commit()
 
-    # Rotate: delete old token row, issue fresh pair
-    db.delete(rt)
-    db.commit()
-
-    new_access, new_refresh = _issue_tokens(
-        db, rt.user_id, username, is_admin, jellyfin_token,
-        long_session=bool(getattr(rt, "long_session", False)),
+    access_token = create_access_token(
+        {"user_id": rt.user_id, "username": username, "is_admin": is_admin}
     )
 
-    return RefreshResponse(access_token=new_access, refresh_token=new_refresh)
+    # refresh_token is intentionally omitted — the client keeps its existing
+    # token. Returning null here signals "your token is still valid, keep it."
+    return RefreshResponse(access_token=access_token)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

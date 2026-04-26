@@ -8,10 +8,12 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaLibraryService.LibraryParams
@@ -20,6 +22,7 @@ import androidx.media3.session.MediaSession
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.ListenableFuture
 import com.jellydj.mobile.JellyDjApplication
+import com.jellydj.mobile.R
 import com.jellydj.mobile.core.model.Track
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -134,7 +137,15 @@ class JellyDjPlaybackService : MediaLibraryService() {
             }
         }
 
-        mediaLibrarySession = MediaLibrarySession.Builder(this, player, callback).build()
+        mediaLibrarySession = MediaLibrarySession.Builder(this, player, callback)
+            .setBitmapLoader(DataSourceBitmapLoader(this))
+            .build()
+
+        val notificationProvider = DefaultMediaNotificationProvider.Builder(this)
+            .setChannelName(R.string.playback_channel_name)
+            .build()
+        notificationProvider.setSmallIcon(R.drawable.ic_notification)
+        setMediaNotificationProvider(notificationProvider)
     }
 
     private suspend fun loadChildren(parentId: String): List<MediaItem> {

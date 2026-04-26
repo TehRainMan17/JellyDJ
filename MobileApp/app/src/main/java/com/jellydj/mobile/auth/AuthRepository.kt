@@ -33,16 +33,17 @@ class JellyDjAuthRepository(
 ) : AuthRepository {
     override suspend fun verifyInstance(baseUrl: String): Result<Unit> {
         val previous = sessionStore.readServerBaseUrl()
-        val normalized = normalizeBaseUrl(baseUrl)
-        sessionStore.saveServerBaseUrl(normalized)
-
         return runCatching {
+            val normalized = normalizeBaseUrl(baseUrl)
+            sessionStore.saveServerBaseUrl(normalized)
             val health = api.health()
             if (health.status.lowercase() != "ok") {
                 throw IllegalStateException("Server did not return healthy status.")
             }
         }.onFailure {
+            // Restore previous URL on any failure (including invalid URL format)
             if (previous != null) sessionStore.saveServerBaseUrl(previous)
+            else sessionStore.clearServerUrl()
         }
     }
 
@@ -97,7 +98,8 @@ class JellyDjAuthRepository(
             sessionStore.save(
                 current.copy(
                     accessToken = refreshed.access_token,
-                    refreshToken = refreshed.refresh_token
+                    // Server returns null to indicate "keep your existing token"
+                    refreshToken = refreshed.refresh_token ?: current.refreshToken
                 )
             )
             true

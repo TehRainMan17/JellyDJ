@@ -20,10 +20,12 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.TrendingUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -38,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -57,11 +60,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.jellydj.mobile.AppContainer
+import com.jellydj.mobile.core.model.LibraryAlbum
 import com.jellydj.mobile.core.model.Playlist
 import com.jellydj.mobile.core.model.Track
 import com.jellydj.mobile.player.AlbumArt
@@ -80,12 +85,15 @@ fun HomeScreen(
     playerViewModel: PlayerViewModel,
     onSessionInvalid: () -> Unit,
     onMenuOpen: () -> Unit,
-    onPlaylistClick: (id: String, name: String, coverImageUrl: String?) -> Unit
+    onPlaylistClick: (id: String, name: String, coverImageUrl: String?) -> Unit,
+    onAlbumClick: (artistName: String, albumName: String) -> Unit = { _, _ -> }
 ) {
     val scope = rememberCoroutineScope()
     val recentTracks = remember { mutableStateListOf<Track>() }
-    val topTracks = remember { mutableStateListOf<Track>() }
+    val globalTracks = remember { mutableStateListOf<Track>() }
     val playlists = remember { mutableStateListOf<Playlist>() }
+    val recentAlbums = remember { mutableStateListOf<LibraryAlbum>() }
+    val suggestedAlbums = remember { mutableStateListOf<LibraryAlbum>() }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     val session = container.sessionStore.read()
@@ -93,18 +101,24 @@ fun HomeScreen(
 
     LaunchedEffect(Unit) {
         coroutineScope {
-            val recentDeferred = async { runCatching { container.libraryRepository.recentlyPlayed() } }
-            val topDeferred = async { runCatching { container.libraryRepository.topTracks() } }
-            val playlistsDeferred = async { runCatching { container.libraryRepository.playlists() } }
+            val recentDef = async { runCatching { container.libraryRepository.recentlyPlayed() } }
+            val globalDef = async { runCatching { container.libraryRepository.topGlobalTracks(5) } }
+            val playlistsDef = async { runCatching { container.libraryRepository.playlists() } }
+            val recentAlbumsDef = async { runCatching { container.libraryRepository.recentAlbums(12) } }
+            val suggestedDef = async { runCatching { container.libraryRepository.suggestedAlbums(8) } }
 
-            recentDeferred.await()
+            recentDef.await()
                 .onSuccess { recentTracks.addAll(it) }
                 .onFailure { t ->
                     if ((t as? HttpException)?.code() == 401) { onSessionInvalid(); return@coroutineScope }
                     error = "Could not load library"
                 }
-            topDeferred.await().onSuccess { topTracks.addAll(it) }
-            playlistsDeferred.await().onSuccess { playlists.addAll(it) }
+            globalDef.await().onSuccess { globalTracks.addAll(it) }
+            playlistsDef.await().onSuccess { playlists.addAll(it) }
+            recentAlbumsDef.await().onSuccess { items ->
+                recentAlbums.addAll(items.filter { it.affinityScore > 0f || it.trackCount > 0 })
+            }
+            suggestedDef.await().onSuccess { suggestedAlbums.addAll(it) }
         }
         loading = false
     }
@@ -118,18 +132,16 @@ fun HomeScreen(
                         Icon(Icons.Default.Menu, contentDescription = "Menu")
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color.Transparent
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(bottom = 16.dp)
+            contentPadding = PaddingValues(bottom = 24.dp)
         ) {
-            // Greeting header
+            // Greeting
             item {
                 Box(
                     modifier = Modifier
@@ -180,9 +192,7 @@ fun HomeScreen(
                         },
                         enabled = recentTracks.isNotEmpty(),
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary
-                        )
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                     ) {
                         Icon(Icons.Default.Shuffle, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
@@ -197,12 +207,12 @@ fun HomeScreen(
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Play All")
+                        Text("Play Recent")
                     }
                 }
             }
 
-            // Loading / error state
+            // Loading / error
             if (loading) {
                 item {
                     Row(
@@ -225,32 +235,82 @@ fun HomeScreen(
                 }
             }
 
-            // Top Picks section
-            if (topTracks.isNotEmpty()) {
+            // Recently Played Albums
+            if (recentAlbums.isNotEmpty()) {
+                item { SectionHeader("Recently Played") }
                 item {
-                    SectionHeader(title = "Top Picks")
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(recentAlbums) { album ->
+                            AlbumCard(album = album, onClick = { onAlbumClick(album.artist, album.name) })
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+            }
+
+            // Trending Now (top 5 global)
+            if (globalTracks.isNotEmpty()) {
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 20.dp, end = 8.dp, top = 16.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.TrendingUp,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "Trending Now",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
                 item {
                     LazyRow(
                         contentPadding = PaddingValues(horizontal = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        itemsIndexed(topTracks) { index, track ->
+                        itemsIndexed(globalTracks) { index, track ->
                             TopPickCard(
                                 track = track,
-                                onClick = { playerViewModel.playQueue(topTracks.toList(), index) }
+                                rank = index + 1,
+                                onClick = { scope.launch { playerViewModel.playQueue(globalTracks.toList(), index) } }
                             )
                         }
                     }
+                    Spacer(Modifier.height(4.dp))
                 }
-                item { Spacer(Modifier.height(8.dp)) }
             }
 
-            // Your Playlists section
-            if (playlists.isNotEmpty()) {
+            // Suggested For You
+            if (suggestedAlbums.isNotEmpty()) {
+                item { SectionHeader("Suggested For You") }
                 item {
-                    SectionHeader(title = "Your Playlists")
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(suggestedAlbums) { album ->
+                            AlbumCard(album = album, onClick = { onAlbumClick(album.artist, album.name) })
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
                 }
+            }
+
+            // Your Playlists
+            if (playlists.isNotEmpty()) {
+                item { SectionHeader("Your Playlists") }
                 item {
                     LazyRow(
                         contentPadding = PaddingValues(horizontal = 16.dp),
@@ -263,19 +323,32 @@ fun HomeScreen(
                             )
                         }
                     }
+                    Spacer(Modifier.height(4.dp))
                 }
-                item { Spacer(Modifier.height(8.dp)) }
             }
 
-            // Recently Played section
+            // Recently Played Tracks
             if (recentTracks.isNotEmpty()) {
                 item {
-                    SectionHeader(title = "Recently Played")
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 20.dp, end = 8.dp, top = 16.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Recently Played",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = {}) { /* no-op; user taps play to start */ }
+                    }
                 }
-                itemsIndexed(recentTracks) { index, track ->
+                itemsIndexed(recentTracks.take(12)) { index, track ->
                     TrackListItem(
                         track = track,
-                        onPlay = { playerViewModel.playQueue(recentTracks.toList(), index) }
+                        onPlay = { scope.launch { playerViewModel.playQueue(recentTracks.toList(), index) } }
                     )
                 }
             }
@@ -294,19 +367,68 @@ private fun SectionHeader(title: String) {
 }
 
 @Composable
-private fun TopPickCard(track: Track, onClick: () -> Unit) {
+private fun AlbumCard(album: LibraryAlbum, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .width(120.dp)
+            .clickable(onClick = onClick),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Box(
+            modifier = Modifier
+                .size(120.dp)
+                .shadow(elevation = 3.dp, shape = RoundedCornerShape(10.dp))
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center
+        ) {
+            if (!album.imageUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(album.imageUrl)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Icon(
+                    Icons.Default.Album,
+                    contentDescription = null,
+                    modifier = Modifier.size(40.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = album.name,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = album.artist,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun TopPickCard(track: Track, rank: Int, onClick: () -> Unit) {
     Card(
         onClick = onClick,
-        modifier = Modifier.size(160.dp),
+        modifier = Modifier.size(150.dp),
         shape = RoundedCornerShape(12.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            AlbumArt(
-                artworkUri = track.imageUrl,
-                modifier = Modifier.fillMaxSize()
-            )
-            // Gradient overlay for text readability
+            AlbumArt(artworkUri = track.imageUrl, modifier = Modifier.fillMaxSize())
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -314,10 +436,26 @@ private fun TopPickCard(track: Track, onClick: () -> Unit) {
                     .align(Alignment.BottomCenter)
                     .background(
                         Brush.verticalGradient(
-                            colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f))
+                            colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.80f))
                         )
                     )
             )
+            // Rank badge
+            Surface(
+                modifier = Modifier
+                    .padding(8.dp)
+                    .align(Alignment.TopStart),
+                shape = RoundedCornerShape(6.dp),
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+            ) {
+                Text(
+                    text = "#$rank",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
@@ -390,6 +528,7 @@ private fun PlaylistCard(playlist: Playlist, onClick: () -> Unit) {
             fontWeight = FontWeight.Medium,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 4.dp)
         )
         Text(

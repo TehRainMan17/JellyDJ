@@ -17,6 +17,7 @@ interface SessionStore {
     fun updateAccessToken(accessToken: String)
     fun saveServerBaseUrl(url: String)
     fun readServerBaseUrl(): String?
+    fun clearServerUrl()
 }
 
 class SharedPrefsSessionStore(context: Context) : SessionStore {
@@ -69,6 +70,10 @@ class SharedPrefsSessionStore(context: Context) : SessionStore {
 
     override fun readServerBaseUrl(): String? {
         return prefs.getString(KEY_SERVER_BASE_URL, null)
+    }
+
+    override fun clearServerUrl() {
+        prefs.edit().remove(KEY_SERVER_BASE_URL).apply()
     }
 
     companion object {

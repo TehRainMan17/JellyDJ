@@ -2,19 +2,20 @@ package com.jellydj.mobile.webview
 
 import android.annotation.SuppressLint
 import android.net.Uri
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -53,35 +54,75 @@ fun ServerWebViewScreen(
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             AndroidView(
                 factory = { ctx ->
-                    val escaped = refreshToken.replace("\\", "\\\\").replace("'", "\\'")
-                    val origin = Uri.parse(url).run { "$scheme://$authority" }
-                    var primed = false
+                    val parsed = Uri.parse(url)
+                    val origin = "${parsed.scheme}://${parsed.authority}"
+                    val escaped = refreshToken
+                        .replace("\\", "\\\\")
+                        .replace("'", "\\'")
 
                     WebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.useWideViewPort = false
+                        settings.loadWithOverviewMode = false
+                        settings.builtInZoomControls = false
+                        settings.displayZoomControls = false
+                        settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+
+                        var bootstrapDone = false
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView, pageUrl: String) {
-                                val isBootstrap = pageUrl == origin || pageUrl == "$origin/"
-                                if (!primed) {
-                                    primed = true
-                                    if (!isBootstrap) loading = false
-                                } else {
-                                    loading = false
+                                if (!bootstrapDone) {
+                                    bootstrapDone = true
+                                    view.loadUrl(url)
+                                    return
                                 }
+
+                                loading = false
+
+                                // CSP-safe fix for WebView height collapse:
+                                // inject a .h-screen override through CSSOM rules,
+                                // not inline styles.
+                                view.evaluateJavascript(
+                                    "(function(){" +
+                                        "var h=Math.max(window.innerHeight||0,document.documentElement.clientHeight||0,screen.height||0);" +
+                                        "if(h>0&&!window.__jellydjCssRuleFix){" +
+                                            "window.__jellydjCssRuleFix=true;" +
+                                            "var ruleHeight='.h-screen{height:'+h+'px!important;min-height:'+h+'px!important;}';" +
+                                            "var ruleHideNestedMenu='header button.lg\\\\:hidden{display:none!important;}';" +
+                                            "for(var i=0;i<document.styleSheets.length;i++){" +
+                                                "var ss=document.styleSheets[i];" +
+                                                "try{" +
+                                                    "var idx=ss.cssRules?ss.cssRules.length:0;" +
+                                                    "ss.insertRule(ruleHeight, idx);" +
+                                                    "idx=ss.cssRules?ss.cssRules.length:0;" +
+                                                    "ss.insertRule(ruleHideNestedMenu, idx);" +
+                                                    "break;" +
+                                                "}catch(e){}" +
+                                            "}" +
+                                        "}" +
+                                    "})()",
+                                    null
+                                )
                             }
                         }
-                        // loadDataWithBaseURL runs the script under the server's origin so
-                        // localStorage.setItem writes to the same origin the React app reads.
+
                         loadDataWithBaseURL(
-                            origin,
-                            "<script>localStorage.setItem('jellydj_refresh_token','$escaped');location.replace('$url');</script>",
-                            "text/html", "UTF-8", null
+                            "$origin/",
+                            "<!DOCTYPE html><html><head><script>" +
+                                "localStorage.setItem('jellydj_refresh_token','$escaped');" +
+                                "sessionStorage.setItem('jellydj_refresh_token','$escaped');" +
+                                "</script></head><body></body></html>",
+                            "text/html",
+                            "UTF-8",
+                            null
                         )
                     }
                 },
                 modifier = Modifier.fillMaxSize()
             )
+
             if (loading) {
                 Box(
                     modifier = Modifier
