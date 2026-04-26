@@ -3,8 +3,67 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- Headphones icon representing JellyDJ audio playback -->
+
+    <!-- Jellyfish dome/bell body -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M12,3C7.03,3 3,7.03 3,12v5c0,1.1 0.9,2 2,2h1c1.1,0 2,-0.9 2,-2v-3c0,-1.1 -0.9,-2 -2,-2H5v-1c0,-3.87 3.13,-7 7,-7s7,3.13 7,7v1h-1c-1.1,0 -2,0.9 -2,2v3c0,1.1 0.9,2 2,2h1c1.1,0 2,-0.9 2,-2v-5C21,7.03 16.97,3 12,3z"/>
+        android:pathData="M4,14 A8,5.5 0 0,0 20,14 Z"/>
+
+    <!-- Headphone band arching over the dome -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.8"
+        android:pathData="M4.5,9.5 A7.5,7 0 0,0 19.5,9.5"/>
+
+    <!-- Left ear cup -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2.5,9 L2.5,13 Q2.5,14.5 4.5,14 L4.5,9 Z"/>
+
+    <!-- Right ear cup -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M19.5,9 L19.5,14 Q21.5,14.5 21.5,13 L21.5,9 Z"/>
+
+    <!-- Tentacle 1 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M7,14 Q5.5,17 7,20"/>
+
+    <!-- Tentacle 2 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M9.5,14 Q8,17 9.5,20"/>
+
+    <!-- Tentacle 3 (center) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M12,14 Q13.5,17 12,20"/>
+
+    <!-- Tentacle 4 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M14.5,14 Q16,17 14.5,20"/>
+
+    <!-- Tentacle 5 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M17,14 Q18.5,17 17,20"/>
+
 </vector>

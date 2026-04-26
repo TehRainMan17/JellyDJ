@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Shuffle
@@ -31,8 +32,11 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -542,8 +546,15 @@ private fun PlaylistCard(playlist: Playlist, onClick: () -> Unit) {
 
 @Composable
 internal fun TrackListItem(track: Track, onPlay: () -> Unit) {
+    var showInfo by remember { mutableStateOf(false) }
     ListItem(
-        headlineContent = { Text(track.title, maxLines = 1) },
+        headlineContent = {
+            Text(
+                track.title,
+                maxLines = 1,
+                modifier = Modifier.clickable(onClick = onPlay)
+            )
+        },
         supportingContent = { Text("${track.artist} • ${track.album}", maxLines = 1) },
         leadingContent = {
             AlbumArt(
@@ -551,11 +562,24 @@ internal fun TrackListItem(track: Track, onPlay: () -> Unit) {
                 modifier = Modifier
                     .size(48.dp)
                     .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onPlay)
             )
         },
         trailingContent = {
-            IconButton(onClick = onPlay) {
-                Icon(Icons.Default.PlayArrow, contentDescription = "Play")
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onPlay) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Play")
+                }
+                Box {
+                    IconButton(onClick = { showInfo = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Track info")
+                    }
+                    TrackInfoDropdown(
+                        track = track,
+                        expanded = showInfo,
+                        onDismiss = { showInfo = false }
+                    )
+                }
             }
         }
     )
@@ -570,4 +594,57 @@ private fun greeting(): String {
         hour < 21 -> "Good evening,"
         else      -> "Good night,"
     }
+}
+
+@Composable
+private fun TrackInfoDropdown(track: Track, expanded: Boolean, onDismiss: () -> Unit) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        // Track name header
+        DropdownMenuItem(
+            text = {
+                Text(
+                    track.title,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            onClick = onDismiss,
+            enabled = false
+        )
+        HorizontalDivider()
+        TrackInfoRow("Duration", formatDuration(track.durationMs))
+        if (track.playCount > 0 || track.artistAffinity != null) {
+            TrackInfoRow("Plays", track.playCount.toString())
+        }
+        track.artistAffinity?.let { TrackInfoRow("Affinity", it.toInt().toString()) }
+        track.globalPopularity?.let { TrackInfoRow("Global Pop.", it.toInt().toString()) }
+        track.bpm?.let { TrackInfoRow("BPM", it.toString()) }
+        track.energy?.let { TrackInfoRow("Energy", "${(it * 100).toInt()}%") }
+    }
+}
+
+@Composable
+private fun TrackInfoRow(label: String, value: String) {
+    DropdownMenuItem(
+        text = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(24.dp))
+                Text(value, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        onClick = {}
+    )
+}
+
+private fun formatDuration(ms: Long): String {
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "$minutes:${seconds.toString().padStart(2, '0')}"
 }

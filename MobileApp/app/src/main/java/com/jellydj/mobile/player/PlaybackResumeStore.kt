@@ -18,6 +18,7 @@ class PlaybackResumeStore(context: Context) {
                 .put("title", item.mediaMetadata.title?.toString() ?: "")
                 .put("artist", item.mediaMetadata.artist?.toString() ?: "")
                 .put("album", item.mediaMetadata.albumTitle?.toString() ?: "")
+                .put("artwork", item.mediaMetadata.artworkUri?.toString() ?: "")
             array.put(obj)
         }
 
@@ -40,6 +41,7 @@ class PlaybackResumeStore(context: Context) {
             val uri = obj.optString("uri", "")
             if (uri.isBlank()) continue
 
+            val artworkUriStr = obj.optString("artwork", "")
             items += MediaItem.Builder()
                 .setMediaId(obj.optString("id", "item-$i"))
                 .setUri(uri)
@@ -49,6 +51,7 @@ class PlaybackResumeStore(context: Context) {
                         .setArtist(obj.optString("artist", ""))
                         .setAlbumTitle(obj.optString("album", ""))
                         .setIsPlayable(true)
+                        .setArtworkUri(if (artworkUriStr.isNotBlank()) android.net.Uri.parse(artworkUriStr) else null)
                         .build()
                 )
                 .build()

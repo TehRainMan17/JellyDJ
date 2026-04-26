@@ -175,7 +175,9 @@ class JellyDjPlaybackService : MediaLibraryService() {
 
     private fun restoreQueueIfAvailable() {
         val state = resumeStore.load() ?: return
-        player.setMediaItems(state.items, state.index, state.positionMs)
+        // Restore position as 0 — seeking to the exact saved position can land at end-of-stream
+        // if the event fired during a track transition, leaving the player in STATE_ENDED.
+        player.setMediaItems(state.items, state.index, 0L)
         player.prepare()
     }
 

@@ -4,6 +4,8 @@
 !.env.example
 repomix-output.xml
 .claude
+CLAUDE.md
+
 
 # ── Python ───────────────────────────────────────────────────
 __pycache__/
