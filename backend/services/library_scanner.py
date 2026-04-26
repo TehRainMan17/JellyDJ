@@ -58,7 +58,7 @@ async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
             params = {
                 "IncludeItemTypes": "Audio",
                 "Recursive": "true",
-                "Fields": "DateCreated,Genres,Album,AlbumArtist,Artists,AlbumArtists,ArtistItems,"
+                "Fields": "DateCreated,Genres,Album,AlbumArtist,Artists,AlbumArtists,"
                           "IndexNumber,ParentIndexNumber,RunTimeTicks,ProductionYear,AlbumId",
                 "StartIndex": start_index,
                 "Limit": BATCH_SIZE,
@@ -154,9 +154,11 @@ def _extract_artist_id(item: dict) -> Optional[str]:
     a name-based search.
 
     Jellyfin returns AlbumArtists as a list of {Id, Name} objects on Audio
-    items when the Artists/AlbumArtists field is requested.  We mirror the
-    same compilation-aware logic used by _extract_artist: prefer the first
-    non-Various AlbumArtists entry, then fall back to ArtistItems.
+    items when the AlbumArtists field is requested.  We prefer the first
+    non-Various AlbumArtists entry.  Note: ArtistItems is intentionally NOT
+    requested in the Fields list because it forces Jellyfin to load full
+    BaseItemDto objects for every artist per track, which is extremely expensive
+    on large libraries and has been observed to crash Jellyfin.
     """
     album_artists: list[dict] = item.get("AlbumArtists") or []
     real_album = [
@@ -166,16 +168,7 @@ def _extract_artist_id(item: dict) -> Optional[str]:
     if real_album:
         return real_album[0].get("Id") or None
 
-    # Compilation fallback — try ArtistItems (track-level artist objects)
-    artist_items: list[dict] = item.get("ArtistItems") or []
-    real_track = [
-        a for a in artist_items
-        if isinstance(a, dict) and (a.get("Name") or "").strip().lower() not in _VARIOUS_ARTISTS
-    ]
-    if real_track:
-        return real_track[0].get("Id") or None
-
-    # Last resort: take whatever is there
+    # Last resort: take whatever is there (e.g. Various Artists compilation)
     if album_artists and isinstance(album_artists[0], dict):
         return album_artists[0].get("Id") or None
 

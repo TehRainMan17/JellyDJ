@@ -9,7 +9,6 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSourceBitmapLoader
-import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -45,17 +44,22 @@ class JellyDjPlaybackService : MediaLibraryService() {
         val container = (application as JellyDjApplication).appContainer
         resumeStore = PlaybackResumeStore(this)
 
+        // Use OkHttp-backed data source so the JellyDJ JWT is added as a header.
+        // Stream URLs no longer embed Jellyfin tokens in query params.
+        val upstreamFactory = container.audioDataSourceFactory
         val cache = container.simpleCache
         player = if (cache != null) {
-            val dataSourceFactory = CacheDataSource.Factory()
+            val cacheDataSourceFactory = CacheDataSource.Factory()
                 .setCache(cache)
-                .setUpstreamDataSourceFactory(DefaultDataSource.Factory(this))
+                .setUpstreamDataSourceFactory(upstreamFactory)
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
             ExoPlayer.Builder(this)
-                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .setMediaSourceFactory(DefaultMediaSourceFactory(cacheDataSourceFactory))
                 .build()
         } else {
-            ExoPlayer.Builder(this).build()
+            ExoPlayer.Builder(this)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(upstreamFactory))
+                .build()
         }
 
         val sessionId = player.audioSessionId
@@ -88,6 +92,19 @@ class JellyDjPlaybackService : MediaLibraryService() {
         observeQueueForResume()
 
         val callback = object : MediaLibrarySession.Callback {
+
+            override fun onConnect(
+                session: MediaSession,
+                controller: MediaSession.ControllerInfo
+            ): MediaSession.ConnectionResult {
+                return if (isTrustedController(controller)) {
+                    super.onConnect(session, controller)
+                } else {
+                    Log.w(TAG, "Rejected MediaBrowser connection from ${controller.packageName} (uid=${controller.uid})")
+                    MediaSession.ConnectionResult.reject()
+                }
+            }
+
             override fun onGetLibraryRoot(
                 session: MediaLibrarySession,
                 browser: MediaSession.ControllerInfo,
@@ -99,6 +116,7 @@ class JellyDjPlaybackService : MediaLibraryService() {
                         MediaMetadata.Builder()
                             .setTitle("JellyDJ")
                             .setIsBrowsable(true)
+                            .setIsPlayable(false)
                             .build()
                     )
                     .build()
@@ -146,6 +164,15 @@ class JellyDjPlaybackService : MediaLibraryService() {
             .build()
         notificationProvider.setSmallIcon(R.drawable.ic_notification)
         setMediaNotificationProvider(notificationProvider)
+    }
+
+    private fun isTrustedController(controller: MediaSession.ControllerInfo): Boolean {
+        // Our own app binds as a controller for playback control
+        if (controller.packageName == packageName) return true
+        // Android system process (notification shade, lock screen media controls)
+        if (controller.uid == android.os.Process.SYSTEM_UID) return true
+        // Known trusted media clients
+        return controller.packageName in TRUSTED_PACKAGES
     }
 
     private suspend fun loadChildren(parentId: String): List<MediaItem> {
@@ -239,6 +266,7 @@ class JellyDjPlaybackService : MediaLibraryService() {
                 MediaMetadata.Builder()
                     .setTitle(title)
                     .setIsBrowsable(true)
+                    .setIsPlayable(false)
                     .build()
             )
             .build()
@@ -263,5 +291,12 @@ class JellyDjPlaybackService : MediaLibraryService() {
         private const val RECENTS_ID = "recent"
         private const val PLAYLISTS_ID = "playlists"
         private const val PLAYLIST_PREFIX = "playlist:"
+
+        private val TRUSTED_PACKAGES = setOf(
+            "com.google.android.projection.gearhead", // Android Auto
+            "com.google.android.carassistant",
+            "com.android.systemui",
+            "android",
+        )
     }
 }

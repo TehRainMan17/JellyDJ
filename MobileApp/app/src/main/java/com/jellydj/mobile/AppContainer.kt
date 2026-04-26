@@ -6,6 +6,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import com.jellydj.mobile.auth.AuthRepository
 import com.jellydj.mobile.auth.JellyDjAuthRepository
 import com.jellydj.mobile.core.network.JellyDjApi
@@ -26,6 +27,7 @@ import com.jellydj.mobile.social.SocialRepository
 import com.jellydj.mobile.vibe.FakeVibeRepository
 import com.jellydj.mobile.vibe.VibeRepository
 import kotlinx.coroutines.flow.MutableStateFlow
+import okhttp3.OkHttpClient
 import java.io.File
 
 @OptIn(UnstableApi::class)
@@ -33,7 +35,15 @@ class AppContainer(
     context: Context,
     val sessionStore: SessionStore
 ) {
-    private val api: JellyDjApi = JellyDjApiClientFactory.create(sessionStore)
+    // Shared OkHttpClient used for both Retrofit API calls and ExoPlayer stream requests.
+    // Both paths need the auth interceptor so the JWT is added to every request.
+    val okHttpClient: OkHttpClient = JellyDjApiClientFactory.createClient(sessionStore)
+
+    private val api: JellyDjApi = JellyDjApiClientFactory.create(okHttpClient)
+
+    // OkHttp-backed data source for ExoPlayer. Stream URLs no longer contain Jellyfin
+    // tokens; the JWT is added by the auth interceptor in okHttpClient instead.
+    val audioDataSourceFactory: OkHttpDataSource.Factory = OkHttpDataSource.Factory(okHttpClient)
 
     val settingsStore = SettingsStore(context)
     val albumCatalogStore = AlbumCatalogStore(context)

@@ -168,7 +168,7 @@ class JellyDjAuthRepository(
             return malformed.groupValues[1].lowercase() to malformed.groupValues[2]
         }
 
-        return "http" to input
+        return "https" to input
     }
 
 }

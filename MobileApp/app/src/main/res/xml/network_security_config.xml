@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Cleartext HTTP is permitted so that self-hosted JellyDJ instances on a local
+    network (without a TLS certificate) keep working. Users must explicitly type
+    "http://" in the server URL field to opt into cleartext — the app defaults to
+    HTTPS. Sensitive tokens are no longer embedded in URLs; they travel as HTTP
+    headers, which is acceptable on a trusted LAN.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

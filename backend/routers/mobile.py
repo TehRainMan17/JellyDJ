@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import Float, cast, desc, func
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
+from starlette.responses import Response, StreamingResponse
 
 from auth import UserContext, get_current_user
 from crypto import decrypt
@@ -70,6 +72,7 @@ class MobileLibraryAlbum(BaseModel):
     name: str
     artist: str
     image_url: Optional[str] = None
+    fallback_image_url: Optional[str] = None
     affinity_score: float
     global_popularity: Optional[float] = None
     track_count: int
@@ -176,7 +179,19 @@ def _try_active_jellyfin_user_token(user_id: str, db: Session) -> Optional[str]:
         raise
 
 
-def _track_from_jellyfin(item: dict, base_url: str, user_id: str, jellyfin_token: str) -> MobileTrack:
+def _jellydj_base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+def _stream_url_for_item(jellydj_base: str, item_id: str) -> str:
+    return f"{jellydj_base}/api/mobile/stream/{item_id}"
+
+
+def _image_url_for_item(jellydj_base: str, item_id: str) -> str:
+    return f"{jellydj_base}/api/mobile/image/{item_id}"
+
+
+def _track_from_jellyfin(item: dict, jellydj_base: str) -> MobileTrack:
     item_id = str(item.get("Id") or "")
     title = item.get("Name") or "Unknown Track"
     artists = item.get("Artists") or []
@@ -185,43 +200,15 @@ def _track_from_jellyfin(item: dict, base_url: str, user_id: str, jellyfin_token
     runtime_ticks = int(item.get("RunTimeTicks") or 0)
     duration_ms = int(runtime_ticks / 10_000)
 
-    stream_url = (
-        f"{base_url}/Audio/{item_id}/universal"
-        f"?UserId={user_id}&DeviceId=JellyDJMobileAndroid&api_key={jellyfin_token}"
-        "&Container=opus,webm,mp3,aac,m4a,m4b,flac,wav,ogg,webma"
-        "&TranscodingContainer=mp3"
-        "&TranscodingProtocol=http"
-        "&AudioCodec=mp3"
-        "&MaxStreamingBitrate=320000"
-    )
-
-    image_url = f"{base_url}/Items/{item_id}/Images/Primary?api_key={jellyfin_token}&maxWidth=512&quality=80"
-
     return MobileTrack(
         id=item_id,
         title=title,
         artist=artist,
         album=album,
         duration_ms=duration_ms,
-        stream_url=stream_url,
-        image_url=image_url,
+        stream_url=_stream_url_for_item(jellydj_base, item_id),
+        image_url=_image_url_for_item(jellydj_base, item_id),
     )
-
-
-def _stream_url_for_item(base_url: str, user_id: str, jellyfin_token: str, item_id: str) -> str:
-    return (
-        f"{base_url}/Audio/{item_id}/universal"
-        f"?UserId={user_id}&DeviceId=JellyDJMobileAndroid&api_key={jellyfin_token}"
-        "&Container=opus,webm,mp3,aac,m4a,m4b,flac,wav,ogg,webma"
-        "&TranscodingContainer=mp3"
-        "&TranscodingProtocol=http"
-        "&AudioCodec=mp3"
-        "&MaxStreamingBitrate=320000"
-    )
-
-
-def _image_url_for_item(base_url: str, jellyfin_token: str, item_id: str) -> str:
-    return f"{base_url}/Items/{item_id}/Images/Primary?api_key={jellyfin_token}&maxWidth=512&quality=80"
 
 
 def _ensure_jellyfin_ok(resp: httpx.Response, action: str) -> None:
@@ -234,23 +221,15 @@ def _ensure_jellyfin_ok(resp: httpx.Response, action: str) -> None:
     raise HTTPException(status_code=502, detail=f"Could not {action} from Jellyfin")
 
 
-def _build_library_track(r, base_url: Optional[str], user_id: str, jellyfin_token: Optional[str]) -> MobileLibraryTrack:
+def _build_library_track(r, jellydj_base: Optional[str]) -> MobileLibraryTrack:
     return MobileLibraryTrack(
         id=r.jellyfin_item_id,
         title=r.track_name or "Unknown Track",
         artist=r.artist_name or "Unknown Artist",
         album=r.album_name or "Unknown Album",
         duration_ms=int((r.duration_ticks or 0) / 10_000),
-        stream_url=(
-            _stream_url_for_item(base_url, user_id, jellyfin_token, r.jellyfin_item_id)
-            if (base_url and jellyfin_token)
-            else ""
-        ),
-        image_url=(
-            _image_url_for_item(base_url, jellyfin_token, r.jellyfin_item_id)
-            if (base_url and jellyfin_token)
-            else None
-        ),
+        stream_url=_stream_url_for_item(jellydj_base, r.jellyfin_item_id) if jellydj_base else "",
+        image_url=_image_url_for_item(jellydj_base, r.jellyfin_item_id) if jellydj_base else None,
         artist_affinity=float(r.artist_affinity or 0.0),
         global_popularity=float(r.global_popularity) if r.global_popularity is not None else None,
         play_count=int(r.play_count or 0),
@@ -259,17 +238,86 @@ def _build_library_track(r, base_url: Optional[str], user_id: str, jellyfin_toke
     )
 
 
-@router.get("/library/recent", response_model=list[MobileTrack])
-async def recent_tracks(
-    limit: int = Query(default=100, ge=1, le=500),
+@router.get("/stream/{item_id}")
+async def stream_track(
+    item_id: str,
+    request: Request,
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     base_url = _jellyfin_connection(db)
     jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
 
+    upstream_headers: dict[str, str] = {"X-Emby-Token": jellyfin_token}
+    if range_val := request.headers.get("range"):
+        upstream_headers["Range"] = range_val
+
+    jellyfin_url = (
+        f"{base_url}/Audio/{item_id}/universal"
+        f"?UserId={user.user_id}&DeviceId=JellyDJMobileAndroid"
+        "&Container=opus,webm,mp3,aac,m4a,m4b,flac,wav,ogg,webma"
+        "&TranscodingContainer=mp3&TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=320000"
+    )
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0))
+    req = client.build_request("GET", jellyfin_url, headers=upstream_headers)
+    resp = await client.send(req, stream=True)
+
+    forward: dict[str, str] = {}
+    for h in ("content-type", "content-length", "content-range"):
+        if v := resp.headers.get(h):
+            forward[h] = v
+    forward.setdefault("accept-ranges", "bytes")
+
+    async def _cleanup() -> None:
+        await resp.aclose()
+        await client.aclose()
+
+    return StreamingResponse(
+        resp.aiter_bytes(chunk_size=65536),
+        status_code=resp.status_code,
+        headers=forward,
+        background=BackgroundTask(_cleanup),
+    )
+
+
+@router.get("/image/{item_id}")
+async def proxy_image(
+    item_id: str,
+    user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    base_url = _jellyfin_connection(db)
+    jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+
+    url = f"{base_url}/Items/{item_id}/Images/Primary?maxWidth=512&quality=80"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(url, headers={"X-Emby-Token": jellyfin_token})
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+        headers={"cache-control": "max-age=86400"},
+    )
+
+
+@router.get("/library/recent", response_model=list[MobileTrack])
+async def recent_tracks(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    base_url = _jellyfin_connection(db)
+    jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
+
     params = {
         "IncludeItemTypes": "Audio",
+        "IsPlayed": "true",
         "Recursive": "true",
         "SortBy": "DatePlayed",
         "SortOrder": "Descending",
@@ -287,11 +335,12 @@ async def recent_tracks(
     _ensure_jellyfin_ok(resp, "load Jellyfin library")
 
     items = resp.json().get("Items", [])
-    return [_track_from_jellyfin(item, base_url, user.user_id, jellyfin_token) for item in items]
+    return [_track_from_jellyfin(item, jellydj_base) for item in items]
 
 
 @router.get("/search", response_model=MobileSearchResponse)
 async def search_tracks(
+    request: Request,
     q: str = Query(min_length=1, max_length=120),
     limit: int = Query(default=50, ge=1, le=200),
     user: UserContext = Depends(get_current_user),
@@ -299,6 +348,7 @@ async def search_tracks(
 ):
     base_url = _jellyfin_connection(db)
     jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     params = {
         "IncludeItemTypes": "Audio",
@@ -318,17 +368,19 @@ async def search_tracks(
     _ensure_jellyfin_ok(resp, "search Jellyfin library")
 
     items = resp.json().get("Items", [])
-    tracks = [_track_from_jellyfin(item, base_url, user.user_id, jellyfin_token) for item in items]
+    tracks = [_track_from_jellyfin(item, jellydj_base) for item in items]
     return MobileSearchResponse(tracks=tracks)
 
 
 @router.get("/playlists", response_model=list[MobilePlaylist])
 async def playlists(
+    request: Request,
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     base_url = _jellyfin_connection(db)
     jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     params = {
         "IncludeItemTypes": "Playlist",
@@ -350,10 +402,7 @@ async def playlists(
     for item in resp.json().get("Items", []):
         item_id = str(item.get("Id") or "")
         has_image = bool(item.get("ImageTags", {}).get("Primary"))
-        cover_url = (
-            f"{base_url}/Items/{item_id}/Images/Primary?api_key={jellyfin_token}&maxWidth=512&quality=80"
-            if has_image else None
-        )
+        cover_url = _image_url_for_item(jellydj_base, item_id) if has_image else None
         out.append(
             MobilePlaylist(
                 id=item_id,
@@ -367,12 +416,14 @@ async def playlists(
 
 @router.get("/top-tracks", response_model=list[MobileTrack])
 async def top_tracks(
+    request: Request,
     limit: int = Query(default=20, ge=1, le=50),
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     base_url = _jellyfin_connection(db)
     jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     scores = (
         db.query(TrackScore)
@@ -400,18 +451,20 @@ async def top_tracks(
     for score in scores:
         item = items_by_id.get(score.jellyfin_item_id)
         if item:
-            result.append(_track_from_jellyfin(item, base_url, user.user_id, jellyfin_token))
+            result.append(_track_from_jellyfin(item, jellydj_base))
     return result
 
 
 @router.get("/playlists/{playlist_id}/tracks", response_model=list[MobileTrack])
 async def playlist_tracks(
     playlist_id: str,
+    request: Request,
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     base_url = _jellyfin_connection(db)
     jellyfin_token = _active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.get(
@@ -423,18 +476,18 @@ async def playlist_tracks(
     _ensure_jellyfin_ok(resp, "load playlist tracks")
 
     items = resp.json().get("Items", [])
-    return [_track_from_jellyfin(item, base_url, user.user_id, jellyfin_token) for item in items]
+    return [_track_from_jellyfin(item, jellydj_base) for item in items]
 
 
 @router.get("/library/artists", response_model=list[MobileLibraryArtist])
 def library_artists(
+    request: Request,
     q: Optional[str] = Query(default=None, min_length=1, max_length=120),
     limit: int = Query(default=200, ge=1, le=1000),
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    base_url = _try_jellyfin_connection(db)
-    jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     lib_q = db.query(
         LibraryTrack.artist_name.label("artist_name"),
@@ -485,11 +538,11 @@ def library_artists(
             id=lr.artist_name,
             name=lr.artist_name,
             image_url=(
-                _image_url_for_item(base_url, jellyfin_token, lr.jellyfin_artist_id)
-                if (base_url and jellyfin_token and lr.jellyfin_artist_id)
+                _image_url_for_item(jellydj_base, lr.jellyfin_artist_id)
+                if lr.jellyfin_artist_id
                 else (
-                    _image_url_for_item(base_url, jellyfin_token, lr.fallback_item_id)
-                    if (base_url and jellyfin_token and lr.fallback_item_id)
+                    _image_url_for_item(jellydj_base, lr.fallback_item_id)
+                    if lr.fallback_item_id
                     else None
                 )
             ),
@@ -512,6 +565,7 @@ def library_artists(
 
 @router.get("/library/albums", response_model=list[MobileLibraryAlbum])
 def library_albums(
+    request: Request,
     q: Optional[str] = Query(default=None, min_length=1, max_length=120),
     artist: Optional[str] = Query(default=None),
     sort: str = Query(default="affinity"),
@@ -519,8 +573,7 @@ def library_albums(
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    base_url = _try_jellyfin_connection(db)
-    jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     # Use the pre-built catalog when available — it dedups tracks that share the
     # same logical album but have different jellyfin_album_ids (Jellyfin metadata
@@ -534,7 +587,7 @@ def library_albums(
 
     if not catalog_rows:
         # Catalog not built yet — fall back to the raw LibraryTrack query (no dedup).
-        return _library_albums_fallback(q, artist, sort, limit, user, db, base_url, jellyfin_token)
+        return _library_albums_fallback(q, artist, sort, limit, user, db, jellydj_base)
 
     # Gather all track IDs across all catalog entries so we can fetch scores in one query.
     all_track_ids: list[str] = []
@@ -598,9 +651,8 @@ def library_albums(
             name=ce.display_album,
             artist=ce.display_artist,
             image_url=(
-                _image_url_for_item(base_url, jellyfin_token, primary_album_id)
-                if (base_url and jellyfin_token and primary_album_id)
-                else None
+                _image_url_for_item(jellydj_base, primary_album_id)
+                if primary_album_id else None
             ),
             affinity_score=affinity,
             global_popularity=popularity,
@@ -623,7 +675,7 @@ def library_albums(
     return albums[:limit]
 
 
-def _library_albums_fallback(q, artist, sort, limit, user, db, base_url, jellyfin_token):
+def _library_albums_fallback(q, artist, sort, limit, user, db, jellydj_base: Optional[str]):
     """Original LibraryTrack-based query used when catalog hasn't been built yet."""
     lib_q = db.query(
         LibraryTrack.album_name.label("album_name"),
@@ -674,9 +726,8 @@ def _library_albums_fallback(q, artist, sort, limit, user, db, base_url, jellyfi
             name=lr.album_name,
             artist="Various Artists" if (lr.distinct_artists or 1) > 1 else (lr.primary_artist or ""),
             image_url=(
-                _image_url_for_item(base_url, jellyfin_token, lr.jellyfin_album_id)
-                if (base_url and jellyfin_token and lr.jellyfin_album_id)
-                else None
+                _image_url_for_item(jellydj_base, lr.jellyfin_album_id)
+                if (jellydj_base and lr.jellyfin_album_id) else None
             ),
             affinity_score=score_map.get(lr.album_name, {}).get("affinity_score", 0.0),
             global_popularity=score_map.get(lr.album_name, {}).get("global_popularity"),
@@ -742,6 +793,7 @@ def library_genres(
 
 @router.get("/library/tracks", response_model=list[MobileLibraryTrack])
 def library_tracks(
+    request: Request,
     q: Optional[str] = Query(default=None, min_length=1, max_length=120),
     artist: Optional[str] = Query(default=None),
     album: Optional[str] = Query(default=None),
@@ -752,8 +804,7 @@ def library_tracks(
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    base_url = _try_jellyfin_connection(db)
-    jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     query = (
         db.query(
@@ -816,7 +867,7 @@ def library_tracks(
 
     rows = query.limit(limit).all()
     return [
-        _build_library_track(r, base_url, user.user_id, jellyfin_token)
+        _build_library_track(r, jellydj_base)
         for r in rows
         if r.jellyfin_item_id
     ]
@@ -825,6 +876,7 @@ def library_tracks(
 @router.get("/library/artists/{artist_name}/tracks", response_model=list[MobileLibraryTrack])
 def library_artist_tracks(
     artist_name: str,
+    request: Request,
     sort: str = Query(default="personal"),
     q: Optional[str] = Query(default=None, min_length=1, max_length=120),
     limit: int = Query(default=250, ge=1, le=1000),
@@ -832,6 +884,7 @@ def library_artist_tracks(
     db: Session = Depends(get_db),
 ):
     return library_tracks(
+        request=request,
         q=q,
         artist=artist_name,
         album=None,
@@ -847,11 +900,11 @@ def library_artist_tracks(
 @router.get("/library/artists/{artist_name}/detail", response_model=MobileArtistDetail)
 def library_artist_detail(
     artist_name: str,
+    request: Request,
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    base_url = _try_jellyfin_connection(db)
-    jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
+    jellydj_base = _jellydj_base_url(request)
 
     lib_row = (
         db.query(
@@ -866,11 +919,11 @@ def library_artist_detail(
     )
 
     image_url: Optional[str] = None
-    if base_url and jellyfin_token and lib_row:
+    if lib_row:
         if lib_row.jellyfin_artist_id:
-            image_url = _image_url_for_item(base_url, jellyfin_token, lib_row.jellyfin_artist_id)
+            image_url = _image_url_for_item(jellydj_base, lib_row.jellyfin_artist_id)
         elif lib_row.fallback_item_id:
-            image_url = _image_url_for_item(base_url, jellyfin_token, lib_row.fallback_item_id)
+            image_url = _image_url_for_item(jellydj_base, lib_row.fallback_item_id)
 
     profile = db.query(ArtistProfile).filter_by(user_id=user.user_id, artist_name=artist_name).first()
     enrichment = db.query(ArtistEnrichment).filter_by(artist_name=artist_name).first()
@@ -954,12 +1007,14 @@ def library_years(
 @router.get("/library/years/{year}/tracks", response_model=list[MobileLibraryTrack])
 def library_year_tracks(
     year: int,
+    request: Request,
     sort: str = Query(default="personal"),
     limit: int = Query(default=500, ge=1, le=1000),
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     return library_tracks(
+        request=request,
         q=None, artist=None, album=None, genre=None,
         year=year, sort=sort, limit=limit,
         user=user, db=db,
@@ -976,6 +1031,7 @@ def library_smart_collections(
 @router.get("/library/smart/{collection_key}/tracks", response_model=list[MobileLibraryTrack])
 def library_smart_tracks(
     collection_key: str,
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -990,25 +1046,26 @@ def library_smart_tracks(
 
     if collection_key in sort_map:
         return library_tracks(
+            request=request,
             q=None, artist=None, album=None, genre=None, year=None,
             sort=sort_map[collection_key], limit=limit,
             user=user, db=db,
         )
 
     if collection_key == "rising_artists":
-        return _library_rising_artist_tracks(limit=limit, user=user, db=db)
+        return _library_rising_artist_tracks(
+            jellydj_base=_jellydj_base_url(request), limit=limit, user=user, db=db
+        )
 
     raise HTTPException(status_code=404, detail=f"Unknown smart collection: {collection_key}")
 
 
 def _library_rising_artist_tracks(
+    jellydj_base: Optional[str],
     limit: int,
     user: UserContext,
     db: Session,
 ) -> list[MobileLibraryTrack]:
-    base_url = _try_jellyfin_connection(db)
-    jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
-
     rows = (
         db.query(
             LibraryTrack.jellyfin_item_id,
@@ -1040,7 +1097,7 @@ def _library_rising_artist_tracks(
     )
 
     return [
-        _build_library_track(r, base_url, user.user_id, jellyfin_token)
+        _build_library_track(r, jellydj_base)
         for r in rows
         if r.jellyfin_item_id
     ]

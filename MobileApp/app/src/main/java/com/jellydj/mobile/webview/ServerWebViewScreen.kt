@@ -2,6 +2,7 @@ package com.jellydj.mobile.webview
 
 import android.annotation.SuppressLint
 import android.net.Uri
+import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -27,6 +28,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+
+// Token bridge exposed to the bootstrap page so the refresh token is never
+// interpolated into a JavaScript string literal (avoids injection via
+// insufficient escaping of unicode line terminators, </script> etc.).
+private class TokenBridge(private val token: String) {
+    @JavascriptInterface
+    fun provide(): String = token
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
@@ -56,9 +65,6 @@ fun ServerWebViewScreen(
                 factory = { ctx ->
                     val parsed = Uri.parse(url)
                     val origin = "${parsed.scheme}://${parsed.authority}"
-                    val escaped = refreshToken
-                        .replace("\\", "\\\\")
-                        .replace("'", "\\'")
 
                     WebView(ctx).apply {
                         settings.javaScriptEnabled = true
@@ -68,7 +74,12 @@ fun ServerWebViewScreen(
                         settings.builtInZoomControls = false
                         settings.displayZoomControls = false
                         settings.cacheMode = WebSettings.LOAD_DEFAULT
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                        // Never load mixed HTTP content inside an HTTPS page.
+                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+
+                        // Expose the refresh token via a JavascriptInterface so it is
+                        // never interpolated into a string literal in the page source.
+                        addJavascriptInterface(TokenBridge(refreshToken), "__jellydjTokenBridge")
 
                         var bootstrapDone = false
                         webViewClient = object : WebViewClient() {
@@ -80,6 +91,20 @@ fun ServerWebViewScreen(
                                 }
 
                                 loading = false
+
+                                // Inject token into storage using the bridge — no string
+                                // interpolation of the token value into JS source.
+                                view.evaluateJavascript(
+                                    "(function(){" +
+                                        "var b=window.__jellydjTokenBridge;" +
+                                        "if(b){" +
+                                            "var t=b.provide();" +
+                                            "try{localStorage.setItem('jellydj_refresh_token',t);}catch(e){}" +
+                                            "try{sessionStorage.setItem('jellydj_refresh_token',t);}catch(e){}" +
+                                        "}" +
+                                    "})()",
+                                    null
+                                )
 
                                 // CSP-safe fix for WebView height collapse:
                                 // inject a .h-screen override through CSSOM rules,
@@ -108,12 +133,17 @@ fun ServerWebViewScreen(
                             }
                         }
 
+                        // Bootstrap page: sets localStorage via the bridge before navigating
+                        // to the real URL. No token data is embedded in the HTML source.
                         loadDataWithBaseURL(
                             "$origin/",
-                            "<!DOCTYPE html><html><head><script>" +
-                                "localStorage.setItem('jellydj_refresh_token','$escaped');" +
-                                "sessionStorage.setItem('jellydj_refresh_token','$escaped');" +
-                                "</script></head><body></body></html>",
+                            "<!DOCTYPE html><html><body><script>" +
+                                "(function(){var b=window.__jellydjTokenBridge;" +
+                                "if(b){var t=b.provide();" +
+                                "try{localStorage.setItem('jellydj_refresh_token',t);}catch(e){}" +
+                                "try{sessionStorage.setItem('jellydj_refresh_token',t);}catch(e){}}" +
+                                "})();" +
+                                "</script></body></html>",
                             "text/html",
                             "UTF-8",
                             null

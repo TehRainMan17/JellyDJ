@@ -15,7 +15,7 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 object JellyDjApiClientFactory {
     private val schemePrefix = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
-    fun create(sessionStore: SessionStore): JellyDjApi {
+    fun createClient(sessionStore: SessionStore): OkHttpClient {
         val authInterceptor = Interceptor { chain ->
             val request = chain.request()
             val token = sessionStore.read()?.accessToken
@@ -37,7 +37,7 @@ object JellyDjApiClientFactory {
             val normalized = if (schemePrefix.containsMatchIn(configured)) {
                 configured
             } else {
-                "http://$configured"
+                "https://$configured"
             }
 
             val targetBase = normalized.trimEnd('/').plus('/').toHttpUrlOrNull()
@@ -63,19 +63,25 @@ object JellyDjApiClientFactory {
             }
         }
 
-        val client = OkHttpClient.Builder()
+        val builder = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
             .addInterceptor(baseUrlOverrideInterceptor)
             .addInterceptor(authInterceptor)
-            .addInterceptor(
-                HttpLoggingInterceptor().apply {
-                    level = HttpLoggingInterceptor.Level.BASIC
-                }
-            )
-            .build()
 
+        if (BuildConfig.DEBUG) {
+            builder.addInterceptor(
+                HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
+            )
+        }
+
+        return builder.build()
+    }
+
+    fun create(sessionStore: SessionStore): JellyDjApi = create(createClient(sessionStore))
+
+    fun create(client: OkHttpClient): JellyDjApi {
         val moshi = Moshi.Builder()
             .add(KotlinJsonAdapterFactory())
             .build()
