@@ -1,6 +1,9 @@
 package com.jellydj.mobile.library
 
+import android.util.Log
 import com.jellydj.mobile.core.model.ArtistDetail
+import com.jellydj.mobile.core.model.CatalogAlbum
+import com.jellydj.mobile.core.model.CatalogData
 import com.jellydj.mobile.core.model.GenreWeight
 import com.jellydj.mobile.core.model.LibraryAlbum
 import com.jellydj.mobile.core.model.LibraryArtist
@@ -12,6 +15,8 @@ import com.jellydj.mobile.core.model.SmartCollection
 import com.jellydj.mobile.core.model.Track
 import com.jellydj.mobile.core.network.JellyDjApi
 import retrofit2.HttpException
+
+private const val TAG = "LibraryRepository"
 
 interface LibraryRepository {
     suspend fun recentlyPlayed(): List<Track>
@@ -37,11 +42,16 @@ interface LibraryRepository {
     suspend fun yearTracks(year: Int, sort: String = "personal"): List<Track>
     suspend fun smartCollections(): List<SmartCollection>
     suspend fun smartCollectionTracks(key: String): List<Track>
+    /** Check if the backend catalog version changed and download it if so. Returns true if updated. */
+    suspend fun refreshCatalogIfNeeded(): Boolean
+    /** Return the locally cached catalog, or null if not yet populated. */
+    fun getCachedCatalog(): CatalogData?
 }
 
 class JellyDjLibraryRepository(
     private val api: JellyDjApi,
-    private val refreshSession: suspend () -> Boolean
+    private val refreshSession: suspend () -> Boolean,
+    private val catalogStore: AlbumCatalogStore? = null
 ) : LibraryRepository {
 
     override suspend fun recentlyPlayed(): List<Track> = withRefresh {
@@ -82,22 +92,34 @@ class JellyDjLibraryRepository(
         }
     }
 
-    override suspend fun libraryAlbums(query: String, artist: String?, sort: String, limit: Int): List<LibraryAlbum> = withRefresh {
-        api.libraryAlbums(
-            query = query.takeIf { it.isNotBlank() },
-            artist = artist,
-            sort = sort,
-            limit = limit
-        ).map {
-            LibraryAlbum(
-                id = it.id,
-                name = it.name,
-                artist = it.artist,
-                imageUrl = it.image_url,
-                affinityScore = it.affinity_score,
-                globalPopularity = it.global_popularity,
-                trackCount = it.track_count
-            )
+    override suspend fun libraryAlbums(query: String, artist: String?, sort: String, limit: Int): List<LibraryAlbum> {
+        // Use local catalog when available and the caller isn't filtering/sorting by user-specific criteria
+        // that requires a live API call (e.g. affinity sort needs server-side user data).
+        // For artist-filtered or query-filtered calls we always go live for accuracy.
+        val catalog = getCachedCatalog()
+        if (catalog != null && query.isBlank() && artist == null && sort != "affinity" && sort != "recent") {
+            return catalog.albums
+                .sortedByDescending { it.avgPopularity ?: 0f }
+                .take(limit)
+                .map { it.toLibraryAlbum() }
+        }
+        return withRefresh {
+            api.libraryAlbums(
+                query = query.takeIf { it.isNotBlank() },
+                artist = artist,
+                sort = sort,
+                limit = limit
+            ).map {
+                LibraryAlbum(
+                    id = it.id,
+                    name = it.name,
+                    artist = it.artist,
+                    imageUrl = it.image_url,
+                    affinityScore = it.affinity_score,
+                    globalPopularity = it.global_popularity,
+                    trackCount = it.track_count
+                )
+            }
         }
     }
 
@@ -187,6 +209,29 @@ class JellyDjLibraryRepository(
         api.smartCollectionTracks(key).map { it.toDomain() }
     }
 
+    override fun getCachedCatalog(): CatalogData? = catalogStore?.loadCatalog()
+
+    override suspend fun refreshCatalogIfNeeded(): Boolean {
+        if (catalogStore == null) return false
+        return try {
+            val remote = withRefresh { api.catalogVersion() }
+            val localVersion = catalogStore.getStoredVersion()
+            if (remote.version == localVersion) {
+                Log.d(TAG, "Catalog up-to-date (version=${remote.version})")
+                return false
+            }
+            Log.i(TAG, "Catalog version changed $localVersion → ${remote.version}, downloading…")
+            val full = withRefresh { api.catalogFull() }
+            val catalogData = full.toCatalogData()
+            catalogStore.saveCatalog(full.version, catalogData)
+            Log.i(TAG, "Catalog saved: ${catalogData.albums.size} albums")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Catalog refresh failed (stale cache will be used): ${e.message}")
+            false
+        }
+    }
+
     private suspend fun <T> withRefresh(block: suspend () -> T): T {
         return try {
             block()
@@ -198,6 +243,35 @@ class JellyDjLibraryRepository(
             }
         }
     }
+}
+
+private fun com.jellydj.mobile.core.network.FullCatalogDto.toCatalogData(): CatalogData {
+    return CatalogData(
+        version = version,
+        albums = albums.map { dto ->
+            CatalogAlbum(
+                key = dto.key,
+                name = dto.name,
+                artist = dto.artist,
+                jellyfinAlbumIds = dto.jellyfin_album_ids,
+                trackIds = dto.track_ids,
+                trackCount = dto.track_count,
+                avgPopularity = dto.avg_popularity
+            )
+        }
+    )
+}
+
+private fun CatalogAlbum.toLibraryAlbum(): LibraryAlbum {
+    return LibraryAlbum(
+        id = jellyfinAlbumIds.firstOrNull() ?: key,
+        name = name,
+        artist = artist,
+        imageUrl = null,  // not stored in catalog; image loaded on demand by Jellyfin URL
+        affinityScore = 0f,
+        globalPopularity = avgPopularity,
+        trackCount = trackCount
+    )
 }
 
 private fun com.jellydj.mobile.core.network.MobileTrackDto.toDomain(): Track {

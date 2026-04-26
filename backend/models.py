@@ -891,3 +891,40 @@ class ImportAPIKey(Base):
     created_at   = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
     is_active    = Column(Boolean, nullable=False, default=True)
+
+
+# ── Album Catalog Cache (mobile fast-load) ────────────────────────────────────
+
+class CatalogVersion(Base):
+    """
+    Single-row table tracking the current state of the pre-built album catalog.
+    version is incremented each time the catalog is rebuilt (i.e. library changed).
+    The mobile app checks this tiny endpoint on startup and re-downloads the full
+    catalog only when version differs from its local copy.
+    """
+    __tablename__ = "catalog_version"
+    id           = Column(Integer, primary_key=True, default=1)
+    version      = Column(Integer, default=0, nullable=False)
+    content_hash = Column(String, nullable=True)   # SHA-256 of sorted (item_id, album, artist) tuples
+    updated_at   = Column(DateTime, nullable=True)
+    total_albums = Column(Integer, default=0)
+    total_tracks = Column(Integer, default=0)
+
+
+class AlbumCatalogEntry(Base):
+    """
+    One row per canonical album in the library.
+    Tracks that share the same normalized (artist, album) key are grouped here,
+    merging duplicate Jellyfin album IDs caused by metadata inconsistencies.
+    Rebuilt in full each time the library scan detects a content hash change.
+    """
+    __tablename__ = "album_catalog_entries"
+    id                = Column(Integer, primary_key=True, index=True)
+    canonical_key     = Column(String, unique=True, index=True)  # "{norm_artist}::{norm_album}"
+    display_album     = Column(String, nullable=False)
+    display_artist    = Column(String, nullable=False)
+    jellyfin_album_ids = Column(Text, nullable=True)   # JSON list — may contain multiple IDs
+    track_ids         = Column(Text, nullable=True)    # JSON list of jellyfin_item_id
+    track_count       = Column(Integer, default=0)
+    avg_popularity    = Column(Float, nullable=True)
+    updated_at        = Column(DateTime, nullable=True)

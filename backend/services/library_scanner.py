@@ -287,6 +287,12 @@ def scan_library(db: Session, items: list[dict]) -> dict:
     stats["holiday_breakdown"] = holiday_stats["breakdown"]
     log.info(f"  Holiday tagger: {holiday_stats['tagged']} holiday tracks tagged")
 
+    # Rebuild the pre-computed album catalog used by the mobile app for fast loading.
+    # check_and_rebuild_catalog() is a no-op when the library hash hasn't changed.
+    from services.catalog_builder import check_and_rebuild_catalog
+    catalog_changed = check_and_rebuild_catalog(db)
+    stats["catalog_rebuilt"] = catalog_changed
+
     return stats
 
 

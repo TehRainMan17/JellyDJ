@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from auth import UserContext, get_current_user
 from crypto import decrypt
 from database import get_db
-from models import ArtistEnrichment, ArtistProfile, ConnectionSettings, GenreProfile, LibraryTrack, RefreshToken, TrackScore
+from models import AlbumCatalogEntry, ArtistEnrichment, ArtistProfile, CatalogVersion, ConnectionSettings, GenreProfile, LibraryTrack, RefreshToken, TrackScore
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/mobile", tags=["mobile"])
@@ -522,6 +522,109 @@ def library_albums(
     base_url = _try_jellyfin_connection(db)
     jellyfin_token = _try_active_jellyfin_user_token(user.user_id, db)
 
+    # Use the pre-built catalog when available — it dedups tracks that share the
+    # same logical album but have different jellyfin_album_ids (Jellyfin metadata
+    # inconsistency), preventing the same album from appearing multiple times.
+    catalog_entries = db.query(AlbumCatalogEntry)
+    if q:
+        catalog_entries = catalog_entries.filter(AlbumCatalogEntry.display_album.ilike(f"%{q}%"))
+    if artist:
+        catalog_entries = catalog_entries.filter(AlbumCatalogEntry.display_artist.ilike(f"%{artist}%"))
+    catalog_rows = catalog_entries.all()
+
+    if not catalog_rows:
+        # Catalog not built yet — fall back to the raw LibraryTrack query (no dedup).
+        return _library_albums_fallback(q, artist, sort, limit, user, db, base_url, jellyfin_token)
+
+    # Gather all track IDs across all catalog entries so we can fetch scores in one query.
+    all_track_ids: list[str] = []
+    entry_track_ids: dict[str, list[str]] = {}
+    for ce in catalog_rows:
+        try:
+            tids = json.loads(ce.track_ids or "[]")
+        except (ValueError, TypeError):
+            tids = []
+        entry_track_ids[ce.canonical_key] = tids
+        all_track_ids.extend(tids)
+
+    # Single score query for all relevant tracks — 2 queries total regardless of album count.
+    score_rows = (
+        db.query(
+            TrackScore.jellyfin_item_id,
+            cast(TrackScore.artist_affinity, Float).label("affinity"),
+            TrackScore.global_popularity,
+            TrackScore.last_played,
+        )
+        .filter(
+            TrackScore.user_id == user.user_id,
+            TrackScore.jellyfin_item_id.in_(all_track_ids),
+        )
+        .all()
+    ) if all_track_ids else []
+
+    score_by_id: dict[str, dict] = {
+        r.jellyfin_item_id: {
+            "affinity": float(r.affinity or 0.0),
+            "popularity": float(r.global_popularity) if r.global_popularity is not None else None,
+            "last_played": r.last_played,
+        }
+        for r in score_rows
+    }
+
+    from datetime import datetime as _dt
+    # Build albums and keep a parallel list of max_last_played for "recent" sort.
+    albums: list[MobileLibraryAlbum] = []
+    last_played_per_album: list[Optional[_dt]] = []
+
+    for ce in catalog_rows:
+        tids = entry_track_ids.get(ce.canonical_key, [])
+        scores = [score_by_id[t] for t in tids if t in score_by_id]
+
+        affinity = sum(s["affinity"] for s in scores) / len(scores) if scores else 0.0
+        pop_vals = [s["popularity"] for s in scores if s["popularity"] is not None]
+        popularity = sum(pop_vals) / len(pop_vals) if pop_vals else ce.avg_popularity
+        lp_vals = [s["last_played"] for s in scores if s["last_played"] is not None]
+        max_last_played = max(lp_vals) if lp_vals else None
+
+        try:
+            album_ids: list[str] = json.loads(ce.jellyfin_album_ids or "[]")
+        except (ValueError, TypeError):
+            album_ids = []
+
+        primary_album_id = next((aid for aid in album_ids if aid), None)
+
+        albums.append(MobileLibraryAlbum(
+            id=primary_album_id or ce.canonical_key,
+            name=ce.display_album,
+            artist=ce.display_artist,
+            image_url=(
+                _image_url_for_item(base_url, jellyfin_token, primary_album_id)
+                if (base_url and jellyfin_token and primary_album_id)
+                else None
+            ),
+            affinity_score=affinity,
+            global_popularity=popularity,
+            track_count=ce.track_count,
+        ))
+        last_played_per_album.append(max_last_played)
+
+    if sort == "recent":
+        paired = sorted(
+            zip(albums, last_played_per_album),
+            key=lambda x: x[1] or _dt.min,
+            reverse=True,
+        )
+        albums = [a for a, _ in paired]
+    elif sort == "popular":
+        albums.sort(key=lambda a: a.global_popularity or 0.0, reverse=True)
+    else:
+        albums.sort(key=lambda a: a.affinity_score, reverse=True)
+
+    return albums[:limit]
+
+
+def _library_albums_fallback(q, artist, sort, limit, user, db, base_url, jellyfin_token):
+    """Original LibraryTrack-based query used when catalog hasn't been built yet."""
     lib_q = db.query(
         LibraryTrack.album_name.label("album_name"),
         LibraryTrack.jellyfin_album_id.label("jellyfin_album_id"),
@@ -552,10 +655,7 @@ def library_albums(
             func.count(TrackScore.jellyfin_item_id).label("score_track_count"),
             func.max(TrackScore.last_played).label("max_last_played"),
         )
-        .filter(
-            TrackScore.user_id == user.user_id,
-            TrackScore.album_name.in_(album_names),
-        )
+        .filter(TrackScore.user_id == user.user_id, TrackScore.album_name.in_(album_names))
         .group_by(TrackScore.album_name)
         .all()
     )
@@ -568,7 +668,6 @@ def library_albums(
         }
         for r in score_rows
     }
-
     albums = [
         MobileLibraryAlbum(
             id=lr.jellyfin_album_id or f"__{lr.album_name}",
@@ -581,16 +680,13 @@ def library_albums(
             ),
             affinity_score=score_map.get(lr.album_name, {}).get("affinity_score", 0.0),
             global_popularity=score_map.get(lr.album_name, {}).get("global_popularity"),
-            track_count=max(
-                int(lr.lib_track_count or 0),
-                score_map.get(lr.album_name, {}).get("score_track_count", 0),
-            ),
+            track_count=max(int(lr.lib_track_count or 0), score_map.get(lr.album_name, {}).get("score_track_count", 0)),
         )
         for lr in lib_rows
     ]
-
+    from datetime import datetime as _dt
     if sort == "recent":
-        albums.sort(key=lambda a: score_map.get(a.name, {}).get("max_last_played") or "", reverse=True)
+        albums.sort(key=lambda a: score_map.get(a.name, {}).get("max_last_played") or _dt.min, reverse=True)
     elif sort == "popular":
         albums.sort(key=lambda a: a.global_popularity or 0.0, reverse=True)
     else:
@@ -948,3 +1044,86 @@ def _library_rising_artist_tracks(
         for r in rows
         if r.jellyfin_item_id
     ]
+
+
+# ── Album catalog cache endpoints ─────────────────────────────────────────────
+
+class CatalogVersionResponse(BaseModel):
+    version: int
+    updated_at: Optional[str] = None
+    total_albums: int = 0
+    total_tracks: int = 0
+
+
+class CatalogAlbumEntry(BaseModel):
+    key: str
+    name: str
+    artist: str
+    jellyfin_album_ids: list[str]
+    track_ids: list[str]
+    track_count: int
+    avg_popularity: Optional[float] = None
+
+
+class FullCatalogResponse(BaseModel):
+    version: int
+    albums: list[CatalogAlbumEntry]
+
+
+@router.get("/catalog/version", response_model=CatalogVersionResponse)
+def catalog_version(
+    user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Lightweight version-check endpoint (~200 bytes). Returns a single integer
+    that increments each time the album catalog is rebuilt after a library change.
+    The mobile app calls this on startup; if version matches its cached value,
+    no further download is needed.
+    """
+    row = db.query(CatalogVersion).filter_by(id=1).first()
+    if row is None:
+        return CatalogVersionResponse(version=0)
+    return CatalogVersionResponse(
+        version=row.version,
+        updated_at=row.updated_at.isoformat() if row.updated_at else None,
+        total_albums=row.total_albums or 0,
+        total_tracks=row.total_tracks or 0,
+    )
+
+
+@router.get("/catalog/full", response_model=FullCatalogResponse)
+def catalog_full(
+    user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Full album catalog download. Returns all pre-computed AlbumCatalogEntry rows.
+    Only triggered when the mobile app detects a version mismatch.
+    The catalog is user-agnostic; per-user affinity is fetched live when needed.
+    """
+    version_row = db.query(CatalogVersion).filter_by(id=1).first()
+    version = version_row.version if version_row else 0
+
+    entries = db.query(AlbumCatalogEntry).all()
+    albums = []
+    for e in entries:
+        try:
+            album_ids = json.loads(e.jellyfin_album_ids or "[]")
+        except (ValueError, TypeError):
+            album_ids = []
+        try:
+            track_ids = json.loads(e.track_ids or "[]")
+        except (ValueError, TypeError):
+            track_ids = []
+        albums.append(CatalogAlbumEntry(
+            key=e.canonical_key,
+            name=e.display_album,
+            artist=e.display_artist,
+            jellyfin_album_ids=album_ids,
+            track_ids=track_ids,
+            track_count=e.track_count,
+            avg_popularity=e.avg_popularity,
+        ))
+
+    return FullCatalogResponse(version=version, albums=albums)

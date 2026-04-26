@@ -82,3 +82,18 @@ data class SmartCollection(
     val description: String,
     val iconHint: String
 )
+
+data class CatalogAlbum(
+    val key: String,
+    val name: String,
+    val artist: String,
+    val jellyfinAlbumIds: List<String>,
+    val trackIds: List<String>,
+    val trackCount: Int,
+    val avgPopularity: Float?
+)
+
+data class CatalogData(
+    val version: Int,
+    val albums: List<CatalogAlbum>
+)

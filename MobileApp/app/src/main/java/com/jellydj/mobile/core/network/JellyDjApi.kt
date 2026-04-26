@@ -135,6 +135,28 @@ data class MobileSmartCollectionDto(
     val icon_hint: String
 )
 
+data class CatalogVersionDto(
+    val version: Int,
+    val updated_at: String?,
+    val total_albums: Int,
+    val total_tracks: Int
+)
+
+data class CatalogAlbumEntryDto(
+    val key: String,
+    val name: String,
+    val artist: String,
+    val jellyfin_album_ids: List<String>,
+    val track_ids: List<String>,
+    val track_count: Int,
+    val avg_popularity: Float?
+)
+
+data class FullCatalogDto(
+    val version: Int,
+    val albums: List<CatalogAlbumEntryDto>
+)
+
 interface JellyDjApi {
     @GET("api/health")
     suspend fun health(): HealthResponse
@@ -229,4 +251,10 @@ interface JellyDjApi {
         @Path("collectionKey") collectionKey: String,
         @Query("limit") limit: Int = 100
     ): List<MobileLibraryTrackDto>
+
+    @GET("api/mobile/catalog/version")
+    suspend fun catalogVersion(): CatalogVersionDto
+
+    @GET("api/mobile/catalog/full")
+    suspend fun catalogFull(): FullCatalogDto
 }

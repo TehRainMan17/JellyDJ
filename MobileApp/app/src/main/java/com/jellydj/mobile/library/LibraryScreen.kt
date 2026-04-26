@@ -143,8 +143,16 @@ fun LibraryScreen(
     val smartCollections = remember { mutableStateListOf<SmartCollection>() }
     var tileImages by remember { mutableStateOf(TileImages()) }
 
-    // Load tile background images once on first composition
+    // Load tile background images once on first composition.
+    // Also kick off a catalog version check in the background so subsequent
+    // album list loads can serve from the local cache if the version is current.
     LaunchedEffect(Unit) {
+        // Catalog check runs concurrently with tile image loading — it's a tiny
+        // network call (~200 bytes) and a file write only when version changes.
+        launch {
+            runCatching { container.libraryRepository.refreshCatalogIfNeeded() }
+                .onFailure { Log.w(tag, "Catalog refresh failed silently", it) }
+        }
         runCatching {
             coroutineScope {
                 val artistsDef = async {

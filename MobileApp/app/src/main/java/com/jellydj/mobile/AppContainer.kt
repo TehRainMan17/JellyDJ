@@ -11,6 +11,7 @@ import com.jellydj.mobile.auth.JellyDjAuthRepository
 import com.jellydj.mobile.core.network.JellyDjApi
 import com.jellydj.mobile.core.network.JellyDjApiClientFactory
 import com.jellydj.mobile.core.session.SessionStore
+import com.jellydj.mobile.library.AlbumCatalogStore
 import com.jellydj.mobile.library.JellyDjLibraryRepository
 import com.jellydj.mobile.library.LibraryRepository
 import com.jellydj.mobile.player.JellyDjPlayerController
@@ -35,6 +36,7 @@ class AppContainer(
     private val api: JellyDjApi = JellyDjApiClientFactory.create(sessionStore)
 
     val settingsStore = SettingsStore(context)
+    val albumCatalogStore = AlbumCatalogStore(context)
     val audioSettingsFlow = MutableStateFlow(settingsStore.load())
     val eqBandInfoFlow = MutableStateFlow<List<EqBand>>(emptyList())
 
@@ -55,7 +57,7 @@ class AppContainer(
     }
 
     val authRepository: AuthRepository = JellyDjAuthRepository(api, sessionStore)
-    val libraryRepository: LibraryRepository = JellyDjLibraryRepository(api) { authRepository.refreshSession() }
+    val libraryRepository: LibraryRepository = JellyDjLibraryRepository(api, { authRepository.refreshSession() }, albumCatalogStore)
     val searchRepository: SearchRepository = JellyDjSearchRepository(api) { authRepository.refreshSession() }
     val socialRepository: SocialRepository = FakeSocialRepository()
     val vibeRepository: VibeRepository = FakeVibeRepository()
