@@ -161,6 +161,31 @@ async def trigger_library_scan(_: UserContext = Depends(require_admin), db: Sess
     return result
 
 
+@router.post("/reconcile-stale-ids")
+def reconcile_stale_ids(
+    dry_run: bool = True,
+    delete_orphans: bool = False,
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Repair the database after a Jellyfin server migration.
+
+    The library scanner soft-deletes every old Jellyfin item ID and inserts
+    new rows for the new IDs, which leaves dependent tables (plays, scores,
+    enrichments, etc.) referencing IDs Jellyfin no longer recognises. This
+    endpoint matches each soft-deleted track to its new ID by name/artist/
+    album and remaps every dependent row.
+
+    Run with dry_run=true first to inspect the planned remap. Then call
+    again with dry_run=false to apply. Pass delete_orphans=true to also
+    hard-delete the missing LibraryTrack rows that could NOT be matched
+    (truly removed tracks) — otherwise they remain marked missing.
+    """
+    from services.library_reconcile import reconcile
+    return reconcile(db, dry_run=dry_run, delete_orphans=delete_orphans)
+
+
 @router.get("/library-stats")
 def library_stats(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return library size stats for the dashboard."""

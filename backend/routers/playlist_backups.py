@@ -338,10 +338,18 @@ def _resolve_track_ids(
 
     # Pre-load the set of currently-valid Jellyfin IDs so we can validate
     # stored IDs without a per-track query.
+    #
+    # CRITICAL: filter out soft-deleted rows (missing_since IS NOT NULL).
+    # After a Jellyfin server migration, the indexer marks every old ID as
+    # missing and inserts new rows for the new IDs. If we don't filter here,
+    # we happily "validate" stored backup IDs against stale rows and Jellyfin
+    # silently drops them on the restore POST.
     valid_ids: set[str] = set()
     if strategy in ("auto", "id_only"):
         valid_ids = {
-            row[0] for row in db.query(LibraryTrack.jellyfin_item_id).all() if row[0]
+            row[0] for row in db.query(LibraryTrack.jellyfin_item_id)
+            .filter(LibraryTrack.missing_since.is_(None))
+            .all() if row[0]
         }
 
     resolved: list[str] = []
@@ -365,6 +373,7 @@ def _resolve_track_ids(
                 if artist:
                     row = (
                         db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(LibraryTrack.missing_since.is_(None))
                         .filter(func.lower(LibraryTrack.track_name) == name)
                         .filter(func.lower(LibraryTrack.artist_name) == artist)
                         .first()
@@ -374,6 +383,7 @@ def _resolve_track_ids(
                 if not row and album:
                     row = (
                         db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(LibraryTrack.missing_since.is_(None))
                         .filter(func.lower(LibraryTrack.track_name) == name)
                         .filter(func.lower(LibraryTrack.album_name) == album)
                         .first()
@@ -383,6 +393,7 @@ def _resolve_track_ids(
                 if not row:
                     row = (
                         db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(LibraryTrack.missing_since.is_(None))
                         .filter(func.lower(LibraryTrack.track_name) == name)
                         .first()
                     )
