@@ -355,6 +355,7 @@ async def analyze_new_tracks(
                       current_track=current_track, status_line=status_line)
 
     pending = db.query(LibraryTrack).filter(
+        LibraryTrack.missing_since.is_(None),
         or_(
             LibraryTrack.audio_analyzed_at.is_(None),
             LibraryTrack.audio_analysis_version < version,

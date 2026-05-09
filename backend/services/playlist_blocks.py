@@ -963,7 +963,10 @@ def execute_bpm_range_block(
     harmonic = bool(params.get("harmonic", False))
     played_filter = params.get("played_filter", "all")
 
-    q = db.query(LibraryTrack.jellyfin_item_id).filter(LibraryTrack.bpm.isnot(None))
+    q = db.query(LibraryTrack.jellyfin_item_id).filter(
+        LibraryTrack.missing_since.is_(None),
+        LibraryTrack.bpm.isnot(None),
+    )
 
     if harmonic:
         half_min = max(20, bpm_min // 2)
@@ -1013,7 +1016,10 @@ def execute_musical_key_block(
     notes        = params.get("notes", [])     # [] = all roots; ["C", "G"] = specific
     played_filter = params.get("played_filter", "all")
 
-    q = db.query(LibraryTrack.jellyfin_item_id).filter(LibraryTrack.musical_key.isnot(None))
+    q = db.query(LibraryTrack.jellyfin_item_id).filter(
+        LibraryTrack.missing_since.is_(None),
+        LibraryTrack.musical_key.isnot(None),
+    )
 
     if mode == "major":
         q = q.filter(LibraryTrack.musical_key.like("% Major"))
@@ -1058,6 +1064,7 @@ def execute_energy_block(
     played_filter = params.get("played_filter", "all")
 
     q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.missing_since.is_(None))
            .filter(LibraryTrack.energy.isnot(None))
            .filter(LibraryTrack.energy.between(energy_min, energy_max)))
     item_ids = {row[0] for row in q.all() if row[0]}
@@ -1084,6 +1091,7 @@ def execute_loudness_db_block(
     played_filter = params.get("played_filter", "all")
 
     q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.missing_since.is_(None))
            .filter(LibraryTrack.loudness_db.isnot(None))
            .filter(LibraryTrack.loudness_db.between(loudness_min, loudness_max)))
     item_ids = {row[0] for row in q.all() if row[0]}
@@ -1110,6 +1118,7 @@ def execute_beat_strength_block(
     played_filter = params.get("played_filter", "all")
 
     q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.missing_since.is_(None))
            .filter(LibraryTrack.beat_strength.isnot(None))
            .filter(LibraryTrack.beat_strength.between(beat_min, beat_max)))
     item_ids = {row[0] for row in q.all() if row[0]}
@@ -1138,6 +1147,7 @@ def execute_time_signature_block(
         return set()
 
     q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.missing_since.is_(None))
            .filter(LibraryTrack.time_signature.isnot(None))
            .filter(LibraryTrack.time_signature.in_(time_sigs)))
     item_ids = {row[0] for row in q.all() if row[0]}
@@ -1164,6 +1174,7 @@ def execute_acousticness_block(
     played_filter    = params.get("played_filter", "all")
 
     q = (db.query(LibraryTrack.jellyfin_item_id)
+           .filter(LibraryTrack.missing_since.is_(None))
            .filter(LibraryTrack.acousticness.isnot(None))
            .filter(LibraryTrack.acousticness.between(acousticness_min, acousticness_max)))
     item_ids = {row[0] for row in q.all() if row[0]}

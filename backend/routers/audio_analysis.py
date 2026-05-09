@@ -36,15 +36,21 @@ def list_keys(_: UserContext = Depends(get_current_user), db: Session = Depends(
 
 @router.get("/stats")
 def analysis_stats(_: UserContext = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Return analysis coverage stats and a BPM histogram."""
-    total = db.query(LibraryTrack).count()
-    analyzed = db.query(LibraryTrack).filter(LibraryTrack.audio_analyzed_at.isnot(None)).count()
+    """Return analysis coverage stats and a BPM histogram.
+
+    Excludes soft-deleted (missing_since) tracks so counts reflect the
+    currently-present library, not stale rows orphaned by a prior Jellyfin
+    DB issue.
+    """
+    present = db.query(LibraryTrack).filter(LibraryTrack.missing_since.is_(None))
+    total = present.count()
+    analyzed = present.filter(LibraryTrack.audio_analyzed_at.isnot(None)).count()
     pending = total - analyzed
 
     # BPM histogram (10-BPM buckets)
     bpm_rows = (
         db.query(LibraryTrack.bpm)
-        .filter(LibraryTrack.bpm.isnot(None))
+        .filter(LibraryTrack.missing_since.is_(None), LibraryTrack.bpm.isnot(None))
         .all()
     )
     histogram: dict[str, int] = {}
@@ -55,7 +61,7 @@ def analysis_stats(_: UserContext = Depends(get_current_user), db: Session = Dep
     # Key distribution
     key_rows = (
         db.query(LibraryTrack.musical_key, func.count(LibraryTrack.id))
-        .filter(LibraryTrack.musical_key.isnot(None))
+        .filter(LibraryTrack.missing_since.is_(None), LibraryTrack.musical_key.isnot(None))
         .group_by(LibraryTrack.musical_key)
         .order_by(func.count(LibraryTrack.id).desc())
         .all()

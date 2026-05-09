@@ -289,20 +289,38 @@ def get_tracked_users(_: UserContext = Depends(require_admin), db: Session = Dep
     # Get JellyDJ-managed users
     managed = {u.jellyfin_user_id: u for u in db.query(ManagedUser).all()}
 
-    # Return only activated JellyDJ users (those with a ManagedUser record)
+    # Return every Jellyfin user with their JellyDJ activation status.
+    # Untracked Jellyfin users still appear here so the admin can "Add to JellyDJ".
     result = []
-    for jf_id, mu in managed.items():
-        jf_name = jellyfin_users.get(jf_id, mu.username or jf_id)
+    seen_ids: set[str] = set()
+    for jf_id, jf_name in jellyfin_users.items():
+        mu = managed.get(jf_id)
         result.append({
             "jellyfin_user_id": jf_id,
             "jellyfin_username": jf_name,
+            "jellydj_username": mu.username if mu else None,
+            "has_activated": bool(mu and mu.has_activated),
+            "is_admin": bool(mu and mu.is_admin),
+            "last_login_at": mu.last_login_at if mu else None,
+        })
+        seen_ids.add(jf_id)
+
+    # Surface managed users whose Jellyfin ID no longer matches the live /Users
+    # response (e.g. after a Jellyfin DB migration minted new IDs). They still
+    # have JellyDJ data the admin may want to clean up.
+    for jf_id, mu in managed.items():
+        if jf_id in seen_ids:
+            continue
+        result.append({
+            "jellyfin_user_id": jf_id,
+            "jellyfin_username": mu.username or jf_id,
             "jellydj_username": mu.username,
-            "has_activated": mu.has_activated,
-            "is_admin": mu.is_admin,
+            "has_activated": bool(mu.has_activated),
+            "is_admin": bool(mu.is_admin),
             "last_login_at": mu.last_login_at,
         })
 
-    return sorted(result, key=lambda x: x["jellyfin_username"])
+    return sorted(result, key=lambda x: x["jellyfin_username"].lower())
 
 
 @router.delete("/jellyfin/users/{jellyfin_user_id}")
