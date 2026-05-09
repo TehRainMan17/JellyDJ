@@ -885,6 +885,21 @@ async def restore_revision(
         playlist_id = await _create_jellyfin_playlist(base_url, api_key, target_name, track_ids, uid)
         action = "created"
 
+    # Re-anchor the backup row to whichever Jellyfin playlist it now corresponds
+    # to. Without this, a post-migration restore creates a brand-new Jellyfin
+    # playlist (new ID) but PlaylistBackup.jellyfin_playlist_id still holds the
+    # stale pre-migration ID — so:
+    #   - the available-to-backup list never matches it again
+    #   - the next backup fetches tracks for the dead ID, gets 404, and writes
+    #     a 0-track revision over the previous good snapshot
+    if playlist_id and playlist_id != b.jellyfin_playlist_id:
+        log.info(
+            "Re-anchoring backup %d ('%s'): jellyfin_playlist_id %s → %s",
+            backup_id, target_name, b.jellyfin_playlist_id, playlist_id,
+        )
+        b.jellyfin_playlist_id = playlist_id
+        db.commit()
+
     by_source: dict[str, int] = {}
     for m in matched:
         by_source[m["source"]] = by_source.get(m["source"], 0) + 1

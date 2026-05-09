@@ -28,7 +28,7 @@ from database import Base
 import models  # registers all ORM models with Base.metadata
 from models import (
     LibraryTrack, Play, TrackEnrichment, TrackScore,
-    SkipPenalty, PlaylistBackupTrack,
+    SkipPenalty, PlaylistBackupTrack, ImportedPlaylistTrack,
 )
 from services.library_reconcile import build_remap, reconcile
 
@@ -163,6 +163,32 @@ def test_playlist_backup_tracks_are_not_remapped(db):
 
     # Backup snapshot still references the old ID — preserved as historical record.
     assert db.query(PlaylistBackupTrack).filter_by(jellyfin_item_id="old1").count() == 1
+
+
+def test_imported_playlist_tracks_remap_via_matched_item_id(db):
+    """ImportedPlaylistTrack uses the column name `matched_item_id`, not
+    `jellyfin_item_id`. Without explicit handling, reconcile would silently
+    skip it and imported playlists would push stale IDs to Jellyfin (which
+    silently drops them, producing an empty playlist on the Jellyfin side)."""
+    _seed_migration(db)
+    db.add(ImportedPlaylistTrack(
+        playlist_id=1, position=0,
+        track_name="Song One", artist_name="Artist A", album_name="Album X",
+        match_status="matched", matched_item_id="old1",
+    ))
+    db.add(ImportedPlaylistTrack(
+        playlist_id=1, position=1,
+        track_name="Song Two", artist_name="Artist B", album_name="Album X",
+        match_status="matched", matched_item_id="old2",
+    ))
+    db.commit()
+
+    reconcile(db, dry_run=False)
+
+    assert db.query(ImportedPlaylistTrack).filter_by(matched_item_id="new1").count() == 1
+    assert db.query(ImportedPlaylistTrack).filter_by(matched_item_id="new2").count() == 1
+    assert db.query(ImportedPlaylistTrack).filter_by(matched_item_id="old1").count() == 0
+    assert db.query(ImportedPlaylistTrack).filter_by(matched_item_id="old2").count() == 0
 
 
 def test_idempotent_when_no_missing_rows(db):

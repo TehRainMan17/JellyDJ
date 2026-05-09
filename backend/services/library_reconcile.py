@@ -44,17 +44,24 @@ from models import LibraryTrack
 log = logging.getLogger(__name__)
 
 
-# Tables that hold a jellyfin_item_id pointing at LibraryTrack.
-# (table_name, has_unique_on_item_id)
-DEPENDENT_TABLES: list[tuple[str, bool]] = [
-    ("plays",                False),
-    ("playback_events",      False),
-    ("skip_penalties",       False),
-    ("track_scores",         False),
-    ("track_enrichments",    True),   # UNIQUE on jellyfin_item_id
-    ("user_replay_signals",  False),
-    ("track_cooldowns",      False),
-    ("billboard_chart_entries", False),
+# Tables that hold a Jellyfin item ID pointing at LibraryTrack.
+# (table_name, column_name, has_unique_on_column)
+#
+# The column is usually named jellyfin_item_id, but a few tables use a
+# domain-specific name (e.g. imported_playlist_tracks.matched_item_id) and
+# would be silently skipped if we only matched on the standard name —
+# imported playlists then push to Jellyfin with stale IDs and no tracks
+# appear.
+DEPENDENT_TABLES: list[tuple[str, str, bool]] = [
+    ("plays",                     "jellyfin_item_id", False),
+    ("playback_events",           "jellyfin_item_id", False),
+    ("skip_penalties",            "jellyfin_item_id", False),
+    ("track_scores",              "jellyfin_item_id", False),
+    ("track_enrichments",         "jellyfin_item_id", True),   # UNIQUE on jellyfin_item_id
+    ("user_replay_signals",       "jellyfin_item_id", False),
+    ("track_cooldowns",           "jellyfin_item_id", False),
+    ("billboard_chart_entries",   "jellyfin_item_id", False),
+    ("imported_playlist_tracks",  "matched_item_id",  False),
 ]
 
 
@@ -173,7 +180,7 @@ def apply_remap(db: Session, remap: dict[str, str]) -> dict:
     items = list(remap.items())
     chunk_size = 200
 
-    for table, has_unique in DEPENDENT_TABLES:
+    for table, column, has_unique in DEPENDENT_TABLES:
         u_total = 0
         d_total = 0
         for i in range(0, len(items), chunk_size):
@@ -185,7 +192,7 @@ def apply_remap(db: Session, remap: dict[str, str]) -> dict:
                 placeholders = ", ".join(f":id{j}" for j in range(len(old_ids)))
                 params = {f"id{j}": old for j, old in enumerate(old_ids)}
                 res = db.execute(
-                    text(f"DELETE FROM {table} WHERE jellyfin_item_id IN ({placeholders})"),
+                    text(f"DELETE FROM {table} WHERE {column} IN ({placeholders})"),
                     params,
                 )
                 d_total += res.rowcount or 0
@@ -193,8 +200,8 @@ def apply_remap(db: Session, remap: dict[str, str]) -> dict:
                 for old, new in chunk:
                     res = db.execute(
                         text(
-                            f"UPDATE {table} SET jellyfin_item_id = :new "
-                            f"WHERE jellyfin_item_id = :old"
+                            f"UPDATE {table} SET {column} = :new "
+                            f"WHERE {column} = :old"
                         ),
                         {"old": old, "new": new},
                     )
