@@ -770,11 +770,22 @@ async def write_jellyfin_playlist(
     playlist_id: int,
     owner_jellyfin_user_id: str,
     db: Session,
+    force_rewrite: bool = False,
 ) -> Optional[str]:
     """
     Create or update the Jellyfin playlist for an ImportedPlaylist.
-    Adds all matched tracks in position order.
-    Returns the Jellyfin playlist ID.
+
+    Default mode: incremental — only push tracks that aren't yet flagged as
+    added_to_playlist. Cheap on Jellyfin but assumes the matched_item_id
+    values stored on those tracks are still valid.
+
+    force_rewrite=True: clear the existing Jellyfin playlist and re-add every
+    matched track from scratch. Required after a force_all re-match: the
+    matched_item_id values have just been overwritten with current-library
+    IDs, but added_to_playlist is still True from the original import — the
+    incremental path would short-circuit and never push the new IDs, so the
+    Jellyfin playlist would stay populated with stale IDs (which Jellyfin
+    silently drops, leaving the playlist empty).
     """
     import httpx
     from models import ImportedPlaylist, ImportedPlaylistTrack, ConnectionSettings
@@ -826,31 +837,74 @@ async def write_jellyfin_playlist(
             db.commit()
             return jf_id
 
-        else:
-            # Playlist exists — add only tracks not yet added
-            not_added = [t for t in matched_tracks if not t.added_to_playlist]
-            if not not_added:
-                return playlist.jellyfin_playlist_id
-
-            add_ids = [t.matched_item_id for t in not_added if t.matched_item_id]
-            if add_ids:
-                resp = await client.post(
+        # Playlist already exists in Jellyfin.
+        if force_rewrite:
+            # Clear the playlist so we can rewrite it from scratch with the
+            # freshly-matched (post-migration) IDs.
+            try:
+                cur = await client.get(
                     f"{base_url}/Playlists/{playlist.jellyfin_playlist_id}/Items",
                     headers=headers,
-                    params={"Ids": ",".join(add_ids), "UserId": owner_jellyfin_user_id},
+                    params={"UserId": owner_jellyfin_user_id, "Limit": 10000},
                 )
-                if resp.status_code in (200, 204):
-                    for track in not_added:
-                        track.added_to_playlist = True
-                    db.commit()
-                    log.info(
-                        "Added %d tracks to Jellyfin playlist %s",
-                        len(add_ids), playlist.jellyfin_playlist_id,
-                    )
-                else:
-                    log.error("Failed to add tracks to playlist: %s", resp.text)
+                if cur.status_code == 200:
+                    existing = cur.json().get("Items") or []
+                    eids = [
+                        str(x.get("PlaylistItemId") or x.get("Id", ""))
+                        for x in existing
+                        if x.get("PlaylistItemId") or x.get("Id")
+                    ]
+                    if eids:
+                        await client.delete(
+                            f"{base_url}/Playlists/{playlist.jellyfin_playlist_id}/Items",
+                            headers=headers,
+                            params={"EntryIds": ",".join(eids)},
+                        )
+            except Exception as exc:
+                log.warning(
+                    "force_rewrite: could not clear playlist %s before re-add: %s",
+                    playlist.jellyfin_playlist_id, exc,
+                )
 
+            # Reset added_to_playlist so the add-batch loop below sends every track
+            for t in matched_tracks:
+                t.added_to_playlist = False
+            db.commit()
+
+        # Add tracks not yet flagged as pushed (after force_rewrite that's all of them).
+        not_added = [t for t in matched_tracks if not t.added_to_playlist]
+        if not not_added:
             return playlist.jellyfin_playlist_id
+
+        add_ids = [t.matched_item_id for t in not_added if t.matched_item_id]
+        # Batch to avoid huge query strings — Jellyfin's POST /Items takes
+        # a comma-separated Ids param and chokes on hundreds of GUIDs at once.
+        BATCH = 100
+        all_ok = True
+        for i in range(0, len(add_ids), BATCH):
+            batch = add_ids[i : i + BATCH]
+            resp = await client.post(
+                f"{base_url}/Playlists/{playlist.jellyfin_playlist_id}/Items",
+                headers=headers,
+                params={"Ids": ",".join(batch), "UserId": owner_jellyfin_user_id},
+            )
+            if resp.status_code not in (200, 204):
+                log.error(
+                    "Failed to add batch %d-%d to playlist %s: %s",
+                    i, i + len(batch), playlist.jellyfin_playlist_id, resp.text,
+                )
+                all_ok = False
+
+        if all_ok:
+            for track in not_added:
+                track.added_to_playlist = True
+            db.commit()
+            log.info(
+                "Pushed %d tracks to Jellyfin playlist %s (force_rewrite=%s)",
+                len(add_ids), playlist.jellyfin_playlist_id, force_rewrite,
+            )
+
+        return playlist.jellyfin_playlist_id
 
 
 # ── Webhook handler: called when Jellyfin indexes a new item ──────────────────

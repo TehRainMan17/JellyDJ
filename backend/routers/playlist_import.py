@@ -515,7 +515,14 @@ async def _run_full_import(playlist_id: int, owner_user_id: str, force_all: bool
             await build_album_suggestions(playlist_id, db)
         else:
             log.info("Import job: skipping album suggestions (force_all rematch)")
-        await write_jellyfin_playlist(playlist_id, owner_user_id, db)
+        # In force_all mode the matched_item_id values just got rewritten —
+        # the existing Jellyfin playlist is full of stale IDs and the
+        # incremental push path would short-circuit on added_to_playlist=True
+        # without sending the new IDs. force_rewrite clears + re-adds.
+        await write_jellyfin_playlist(
+            playlist_id, owner_user_id, db,
+            force_rewrite=force_all,
+        )
 
         # Mark playlist active
         pl = db.query(ImportedPlaylist).filter_by(id=playlist_id).first()
