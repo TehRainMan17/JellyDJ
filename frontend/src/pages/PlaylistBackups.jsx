@@ -772,6 +772,11 @@ export default function PlaylistBackups() {
   }
 
   function handleBackupUpdated(updated) {
+    // Some callers (restore success, label save) invoke this with no argument
+    // just to signal "something changed, refresh." Without this guard, accessing
+    // `updated.id` throws and React unmounts the page — symptom is the page
+    // going blank after a successful restore until you reload.
+    if (!updated) { load(); return }
     setBackups(prev => prev.map(b => b.id === updated.id ? updated : b))
   }
 

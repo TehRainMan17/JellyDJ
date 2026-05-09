@@ -161,6 +161,90 @@ async def trigger_library_scan(_: UserContext = Depends(require_admin), db: Sess
     return result
 
 
+@router.get("/library-duplicates")
+def library_duplicates(
+    limit: int = 30,
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Diagnostic: group active LibraryTrack rows by (track_name, artist_name,
+    album_name) and report how many rows have more than one Jellyfin item
+    ID for the same metadata triple.
+
+    If almost every song has 2 IDs, Jellyfin's database is holding duplicate
+    BaseItem rows for the same file — typically a leftover from a migration
+    where the old library's rows weren't purged before the new library was
+    scanned in.
+    """
+    from models import LibraryTrack
+    from sqlalchemy import func
+
+    rows = (
+        db.query(
+            LibraryTrack.track_name,
+            LibraryTrack.artist_name,
+            LibraryTrack.album_name,
+            func.count(LibraryTrack.id).label("n"),
+            func.group_concat(LibraryTrack.jellyfin_item_id, "|").label("ids"),
+        )
+        .filter(LibraryTrack.missing_since.is_(None))
+        .group_by(
+            LibraryTrack.track_name,
+            LibraryTrack.artist_name,
+            LibraryTrack.album_name,
+        )
+        .having(func.count(LibraryTrack.id) > 1)
+        .order_by(func.count(LibraryTrack.id).desc())
+        .limit(limit)
+        .all()
+    )
+
+    total_active = (
+        db.query(func.count(LibraryTrack.id))
+        .filter(LibraryTrack.missing_since.is_(None))
+        .scalar() or 0
+    )
+    distinct_metadata = (
+        db.query(
+            LibraryTrack.track_name,
+            LibraryTrack.artist_name,
+            LibraryTrack.album_name,
+        )
+        .filter(LibraryTrack.missing_since.is_(None))
+        .distinct()
+        .count()
+    )
+    duplicate_groups = (
+        db.query(LibraryTrack.id)
+        .filter(LibraryTrack.missing_since.is_(None))
+        .group_by(
+            LibraryTrack.track_name,
+            LibraryTrack.artist_name,
+            LibraryTrack.album_name,
+        )
+        .having(func.count(LibraryTrack.id) > 1)
+        .count()
+    )
+
+    return {
+        "total_active_rows": total_active,
+        "distinct_metadata_triples": distinct_metadata,
+        "duplicate_groups": duplicate_groups,
+        "ratio": round(total_active / distinct_metadata, 2) if distinct_metadata else None,
+        "sample": [
+            {
+                "track_name":  r.track_name,
+                "artist_name": r.artist_name,
+                "album_name":  r.album_name,
+                "id_count":    r.n,
+                "ids":         (r.ids or "").split("|"),
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.post("/reconcile-stale-ids")
 def reconcile_stale_ids(
     dry_run: bool = True,
