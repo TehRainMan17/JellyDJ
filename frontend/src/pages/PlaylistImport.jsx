@@ -542,6 +542,8 @@ export default function PlaylistImport() {
   const navigate = useNavigate()
   const [playlists, setPlaylists] = useState([])
   const [loading, setLoading]     = useState(true)
+  const [rematchingAll, setRematchingAll] = useState(false)
+  const [rematchAllNotice, setRematchAllNotice] = useState(null)
 
   const loadPlaylists = useCallback(async () => {
     try {
@@ -550,6 +552,27 @@ export default function PlaylistImport() {
     } catch { /* ignore */ }
     setLoading(false)
   }, [])
+
+  async function handleRematchAll() {
+    if (!window.confirm(
+      'Re-match every imported playlist against the current Jellyfin library and re-push to Jellyfin?\n\n' +
+      'Use this after a Jellyfin server migration or library rebuild — it replaces stale Jellyfin item IDs ' +
+      "stored on each imported track with the IDs from your current library, then rewrites each playlist on Jellyfin.\n\n" +
+      'Tracks that no longer exist in the library will be reset to "missing".'
+    )) return
+    setRematchingAll(true)
+    setRematchAllNotice(null)
+    try {
+      const res = await api.post('/api/import/playlists/rematch-all?force=true')
+      setRematchAllNotice({ type: 'success', msg: res.message || 'Re-match started.' })
+      // Refresh shortly so the matching → active status flips through
+      setTimeout(loadPlaylists, 1500)
+    } catch (e) {
+      setRematchAllNotice({ type: 'error', msg: e.message || 'Re-match failed to start.' })
+    } finally {
+      setRematchingAll(false)
+    }
+  }
 
   useEffect(() => {
     loadPlaylists()
@@ -572,13 +595,38 @@ export default function PlaylistImport() {
             Bring your playlists from Spotify, Tidal, or YouTube Music into Jellyfin.
           </p>
         </div>
-        <button
-          onClick={() => navigate('/import/setup')}
-          className="btn-secondary text-xs flex items-center gap-1.5"
-        >
-          <Settings2 size={11} /> Extension Setup
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={handleRematchAll}
+            disabled={rematchingAll || playlists.length === 0}
+            title="Re-match every imported playlist against the current library and re-push to Jellyfin. Use after a Jellyfin migration or library rebuild."
+            className="btn-secondary text-xs flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {rematchingAll
+              ? <Loader2 size={11} className="animate-spin" />
+              : <RefreshCw size={11} />}
+            Re-match all
+          </button>
+          <button
+            onClick={() => navigate('/import/setup')}
+            className="btn-secondary text-xs flex items-center gap-1.5"
+          >
+            <Settings2 size={11} /> Extension Setup
+          </button>
+        </div>
       </div>
+
+      {rematchAllNotice && (
+        <div
+          className={`text-sm rounded-lg border px-3 py-2 ${
+            rematchAllNotice.type === 'success'
+              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+              : 'bg-red-500/10 border-red-500/30 text-red-300'
+          }`}
+        >
+          {rematchAllNotice.msg}
+        </div>
+      )}
 
       {/* Import form */}
       <div className="anim-fade-up" style={{ animationDelay: '50ms' }}>
