@@ -231,24 +231,46 @@ function NameEditor({ backup, onUpdated }) {
 
 function RevisionRow({ backupId, revision, isLatest, totalRevisions, onRestored, onDeleted, onLabeled }) {
   const [restoring, setRestoring] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [editingLabel, setEditingLabel] = useState(false)
   const [labelValue, setLabelValue] = useState(revision.label || '')
   const [savingLabel, setSavingLabel] = useState(false)
   const [restoreResult, setRestoreResult] = useState(null)
+  const [previewResult, setPreviewResult] = useState(null)
+  const [matchStrategy, setMatchStrategy] = useState('auto')
   const [error, setError] = useState(null)
+
+  async function handlePreview() {
+    setPreviewing(true); setError(null); setPreviewResult(null); setRestoreResult(null)
+    try {
+      const res = await api.get(
+        `/api/playlist-backups/${backupId}/revisions/${revision.id}/resolve-preview` +
+        `?match_strategy=${matchStrategy}`
+      )
+      setPreviewResult(res)
+    } catch (e) { setError(e.message) }
+    finally { setPreviewing(false) }
+  }
 
   async function handleRestore() {
     const name = revision.label ? `"${revision.label}"` : `revision #${revision.revision_number}`
+    const stratLine = matchStrategy === 'auto'
+      ? 'Stored Jellyfin IDs will be used where still valid; misses are name-matched against your library.'
+      : matchStrategy === 'id_only'
+        ? 'Only stored Jellyfin IDs that still exist in your library will be used (no name matching).'
+        : 'Stored IDs are ignored — every track is re-matched by name/artist/album.'
     if (!window.confirm(
       `Restore ${name} to Jellyfin?\n\n` +
-      `This will write ${revision.track_count} track(s) into the playlist.\n` +
-      `If the playlist already exists in Jellyfin it will be overwritten.`
+      `This will write up to ${revision.track_count} track(s) into the playlist.\n` +
+      `If the playlist already exists in Jellyfin it will be overwritten.\n\n` +
+      `Match strategy: ${matchStrategy}\n${stratLine}`
     )) return
-    setRestoring(true); setError(null); setRestoreResult(null)
+    setRestoring(true); setError(null); setRestoreResult(null); setPreviewResult(null)
     try {
       const res = await api.post(
-        `/api/playlist-backups/${backupId}/revisions/${revision.id}/restore`
+        `/api/playlist-backups/${backupId}/revisions/${revision.id}/restore` +
+        `?match_strategy=${matchStrategy}`
       )
       setRestoreResult(res); onRestored?.()
     } catch (e) { setError(e.message) }
@@ -336,6 +358,31 @@ function RevisionRow({ backupId, revision, isLatest, totalRevisions, onRestored,
             </div>
           )}
 
+          {/* Match strategy selector */}
+          <select
+            value={matchStrategy}
+            onChange={e => { setMatchStrategy(e.target.value); setPreviewResult(null) }}
+            disabled={restoring || previewing}
+            title="How to map backup tracks to current Jellyfin item IDs.
+auto: stored ID, fall back to name match (recommended after a server migration)
+id_only: stored IDs only — legacy behaviour
+name_only: ignore stored IDs, always re-match by name/artist/album"
+            className="px-2 py-1 rounded border text-xs"
+            style={{ background: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--text-primary)' }}>
+            <option value="auto">auto</option>
+            <option value="id_only">id only</option>
+            <option value="name_only">name only</option>
+          </select>
+
+          {/* Preview match */}
+          <button onClick={handlePreview} disabled={previewing || restoring}
+            title="Preview how many tracks resolve under the chosen strategy without writing"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 hover:bg-white/10"
+            style={{ color: 'var(--text-primary)', borderColor: 'var(--border)' }}>
+            {previewing ? <Spinner size={11} /> : <Eye size={11} />}
+            Preview
+          </button>
+
           {/* Restore */}
           <button onClick={handleRestore} disabled={restoring}
             title="Restore this revision to Jellyfin"
@@ -356,10 +403,56 @@ function RevisionRow({ backupId, revision, isLatest, totalRevisions, onRestored,
         </div>
       </div>
 
+      {previewResult && (
+        <Notice type={previewResult.unmatched_count === 0 ? 'success' : 'warning'}>
+          Preview ({previewResult.match_strategy}): {previewResult.matched_count}/{previewResult.total} would resolve
+          {previewResult.unmatched_count > 0 && (
+            <>, {previewResult.unmatched_count} unmatched</>
+          )}
+          {previewResult.matched_by_source && Object.keys(previewResult.matched_by_source).length > 0 && (
+            <> — by source: {Object.entries(previewResult.matched_by_source).map(([k, v]) => `${k}=${v}`).join(', ')}</>
+          )}
+          {previewResult.unmatched_count > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-xs">show unmatched</summary>
+              <ul className="text-xs mt-1 max-h-40 overflow-auto">
+                {previewResult.unmatched.slice(0, 100).map(u => (
+                  <li key={u.position}>[{u.position}] {u.track_name} — {u.artist_name}</li>
+                ))}
+                {previewResult.unmatched.length > 100 && (
+                  <li>… and {previewResult.unmatched.length - 100} more</li>
+                )}
+              </ul>
+            </details>
+          )}
+        </Notice>
+      )}
       {restoreResult && (
-        <Notice type="success">
+        <Notice type={restoreResult.unmatched_count > 0 ? 'warning' : 'success'}>
           Restored to Jellyfin — "{restoreResult.playlist_name}" {restoreResult.action}
-          with {restoreResult.track_count} tracks.
+          with {restoreResult.track_count}/{restoreResult.requested_count} tracks
+          {restoreResult.unmatched_count > 0 && (
+            <> ({restoreResult.unmatched_count} could not be matched)</>
+          )}
+          .
+          {restoreResult.matched_by_source && Object.keys(restoreResult.matched_by_source).length > 0 && (
+            <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+              Match sources: {Object.entries(restoreResult.matched_by_source).map(([k, v]) => `${k}=${v}`).join(', ')}
+            </div>
+          )}
+          {restoreResult.unmatched_count > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-xs">show unmatched</summary>
+              <ul className="text-xs mt-1 max-h-40 overflow-auto">
+                {restoreResult.unmatched.slice(0, 100).map(u => (
+                  <li key={u.position}>[{u.position}] {u.track_name} — {u.artist_name}</li>
+                ))}
+                {restoreResult.unmatched.length > 100 && (
+                  <li>… and {restoreResult.unmatched.length - 100} more</li>
+                )}
+              </ul>
+            </details>
+          )}
         </Notice>
       )}
       {error && <Notice type="error">{error}</Notice>}

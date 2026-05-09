@@ -50,20 +50,33 @@ class AppContainer(
     val audioSettingsFlow = MutableStateFlow(settingsStore.load())
     val eqBandInfoFlow = MutableStateFlow<List<EqBand>>(emptyList())
 
-    val simpleCache: SimpleCache? = run {
-        val settings = settingsStore.load()
-        if (!settings.cacheEnabled) return@run null
-        try {
-            val cacheDir = File(context.cacheDir, "jellydj_audio")
-            val maxBytes = settings.cacheSizeMb.toLong() * 1024L * 1024L
-            SimpleCache(
-                cacheDir,
-                LeastRecentlyUsedCacheEvictor(maxBytes),
-                StandaloneDatabaseProvider(context)
-            )
-        } catch (e: Exception) {
-            null
-        }
+    // SimpleCache construction does a synchronous disk scan and SQLite open. On a cold start
+    // triggered by Android Auto's service bind, that ran on the main thread and could exceed
+    // AA's bind timeout — AA gave up before the service's onCreate ever returned, so the
+    // service never started and AA showed a permanent loading throbber.
+    // We now build the cache on a background thread. If a player is built before the cache is
+    // ready, it falls through to the upstream-only data source factory — playback works,
+    // it's just not cached for that session.
+    @Volatile
+    var simpleCache: SimpleCache? = null
+        private set
+
+    init {
+        Thread({
+            try {
+                val settings = settingsStore.load()
+                if (!settings.cacheEnabled) return@Thread
+                val cacheDir = File(context.cacheDir, "jellydj_audio")
+                val maxBytes = settings.cacheSizeMb.toLong() * 1024L * 1024L
+                simpleCache = SimpleCache(
+                    cacheDir,
+                    LeastRecentlyUsedCacheEvictor(maxBytes),
+                    StandaloneDatabaseProvider(context)
+                )
+            } catch (_: Exception) {
+                // Leave simpleCache null — playback falls back to upstream-only.
+            }
+        }, "jellydj-cache-init").start()
     }
 
     val authRepository: AuthRepository = JellyDjAuthRepository(api, sessionStore)

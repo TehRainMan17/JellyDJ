@@ -34,33 +34,40 @@ class PlaybackResumeStore(context: Context) {
         val index = prefs.getInt(KEY_INDEX, 0)
         val positionMs = prefs.getLong(KEY_POSITION_MS, 0L)
 
-        val parsed = JSONArray(raw)
-        val items = mutableListOf<MediaItem>()
-        for (i in 0 until parsed.length()) {
-            val obj = parsed.getJSONObject(i)
-            val uri = obj.optString("uri", "")
-            if (uri.isBlank()) continue
+        return try {
+            val parsed = JSONArray(raw)
+            val items = mutableListOf<MediaItem>()
+            for (i in 0 until parsed.length()) {
+                val obj = parsed.getJSONObject(i)
+                val uri = obj.optString("uri", "")
+                if (uri.isBlank()) continue
 
-            val artworkUriStr = obj.optString("artwork", "")
-            items += MediaItem.Builder()
-                .setMediaId(obj.optString("id", "item-$i"))
-                .setUri(uri)
-                .setMediaMetadata(
-                    MediaMetadata.Builder()
-                        .setTitle(obj.optString("title", ""))
-                        .setArtist(obj.optString("artist", ""))
-                        .setAlbumTitle(obj.optString("album", ""))
-                        .setIsPlayable(true)
-                        .setArtworkUri(if (artworkUriStr.isNotBlank()) android.net.Uri.parse(artworkUriStr) else null)
-                        .build()
-                )
-                .build()
+                val artworkUriStr = obj.optString("artwork", "")
+                items += MediaItem.Builder()
+                    .setMediaId(obj.optString("id", "item-$i"))
+                    .setUri(uri)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle(obj.optString("title", ""))
+                            .setArtist(obj.optString("artist", ""))
+                            .setAlbumTitle(obj.optString("album", ""))
+                            .setIsPlayable(true)
+                            .setArtworkUri(if (artworkUriStr.isNotBlank()) android.net.Uri.parse(artworkUriStr) else null)
+                            .build()
+                    )
+                    .build()
+            }
+
+            if (items.isEmpty()) return null
+
+            val safeIndex = index.coerceIn(0, items.lastIndex)
+            ResumeState(items = items, index = safeIndex, positionMs = positionMs)
+        } catch (e: Exception) {
+            // Corrupt data would crash-loop the service — clear it and return null.
+            android.util.Log.w("PlaybackResumeStore", "Corrupt resume state, clearing: ${e.message}")
+            prefs.edit().clear().apply()
+            null
         }
-
-        if (items.isEmpty()) return null
-
-        val safeIndex = index.coerceIn(0, items.lastIndex)
-        return ResumeState(items = items, index = safeIndex, positionMs = positionMs)
     }
 
     data class ResumeState(

@@ -40,6 +40,7 @@ from routers.playlist_backups import router as playlist_backups_router
 from routers.playlist_import import router as playlist_import_router
 from routers.youtube_rip import router as youtube_rip_router
 from routers.audio_analysis import router as audio_analysis_router
+from routers.debug_aa import router as debug_aa_router
 
 
 def _run_migrations():
@@ -687,6 +688,7 @@ app.include_router(playlist_backups_router)    # /api/playlist-backups   — pla
 app.include_router(playlist_import_router)     # /api/import             — external playlist import
 app.include_router(youtube_rip_router)         # /api/import/youtube-rip — YouTube audio → MP3 → Jellyfin
 app.include_router(audio_analysis_router)      # /api/audio-analysis    — media paths, stats, key list
+app.include_router(debug_aa_router)            # /api/debug             — Android Auto telemetry sink
 
 
 @app.get("/api/health")

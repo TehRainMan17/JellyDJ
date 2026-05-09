@@ -22,6 +22,7 @@ POST /api/playlist-backups/backup
 POST /api/playlist-backups/backup-all
 GET  /api/playlist-backups/{backup_id}/revisions
 GET  /api/playlist-backups/{backup_id}/revisions/{revision_id}/tracks
+GET  /api/playlist-backups/{backup_id}/revisions/{revision_id}/resolve-preview
 POST /api/playlist-backups/{backup_id}/revisions/{revision_id}/restore
 POST /api/playlist-backups/{backup_id}/revisions/{revision_id}/label
 DELETE /api/playlist-backups/{backup_id}/revisions/{revision_id}
@@ -46,10 +47,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from sqlalchemy import func
+
 from auth import require_admin, UserContext
 from database import get_db
 from models import (
     ConnectionSettings,
+    LibraryTrack,
     ManagedUser,
     PlaylistBackup,
     PlaylistBackupRevision,
@@ -292,6 +296,119 @@ def _write_revision(
     max_rev = backup.max_revisions if (backup.max_revisions and backup.max_revisions > 0) else DEFAULT_MAX_REVISIONS
     _prune_old_revisions(db, backup.id, max_rev)
     return rev
+
+
+# ── Track ID resolution (post-migration restore) ──────────────────────────────
+#
+# After a Jellyfin server migration the stored jellyfin_item_ids in a backup
+# revision are stale — Jellyfin's POST /Playlists/{id}/Items endpoint silently
+# drops unknown IDs and returns 200/204, which is why a "successful" restore
+# could end up producing an empty playlist.
+#
+# We always validate stored IDs against the local LibraryTrack table (rebuilt
+# by the indexer with current Jellyfin IDs). Misses are re-resolved by name +
+# artist, then name + album, then name only. This keeps restores correct
+# whether or not the Jellyfin item IDs changed.
+
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+
+def _resolve_track_ids(
+    db: Session,
+    tracks: list[PlaylistBackupTrack],
+    strategy: str = "auto",
+) -> tuple[list[str], list[dict], list[dict]]:
+    """
+    Resolve backup track rows to currently-valid Jellyfin item IDs.
+
+    strategy:
+      - "auto"      → use stored ID if it still exists in LibraryTrack,
+                      otherwise fall back to name/artist/album matching
+      - "id_only"   → only use the stored IDs that still exist in LibraryTrack
+                      (safe variant of the legacy behaviour)
+      - "name_only" → ignore stored IDs entirely; always re-match by metadata
+
+    Returns (ordered_resolved_ids, matched_details, unmatched_details).
+    matched_details items: {position, track_name, artist_name, jellyfin_item_id, source}
+    unmatched_details items: {position, track_name, artist_name, album_name}
+    """
+    if strategy not in ("auto", "id_only", "name_only"):
+        raise HTTPException(400, f"Invalid match_strategy '{strategy}'")
+
+    # Pre-load the set of currently-valid Jellyfin IDs so we can validate
+    # stored IDs without a per-track query.
+    valid_ids: set[str] = set()
+    if strategy in ("auto", "id_only"):
+        valid_ids = {
+            row[0] for row in db.query(LibraryTrack.jellyfin_item_id).all() if row[0]
+        }
+
+    resolved: list[str] = []
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+
+    for t in tracks:
+        new_id: Optional[str] = None
+        source = ""
+
+        if strategy != "name_only" and t.jellyfin_item_id and t.jellyfin_item_id in valid_ids:
+            new_id = t.jellyfin_item_id
+            source = "stored_id"
+
+        if not new_id and strategy != "id_only":
+            name = _norm(t.track_name)
+            artist = _norm(t.artist_name)
+            album = _norm(t.album_name)
+            if name:
+                row = None
+                if artist:
+                    row = (
+                        db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(func.lower(LibraryTrack.track_name) == name)
+                        .filter(func.lower(LibraryTrack.artist_name) == artist)
+                        .first()
+                    )
+                    if row:
+                        source = "name_artist"
+                if not row and album:
+                    row = (
+                        db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(func.lower(LibraryTrack.track_name) == name)
+                        .filter(func.lower(LibraryTrack.album_name) == album)
+                        .first()
+                    )
+                    if row:
+                        source = "name_album"
+                if not row:
+                    row = (
+                        db.query(LibraryTrack.jellyfin_item_id)
+                        .filter(func.lower(LibraryTrack.track_name) == name)
+                        .first()
+                    )
+                    if row:
+                        source = "name_only"
+                if row and row[0]:
+                    new_id = row[0]
+
+        if new_id:
+            resolved.append(new_id)
+            matched.append({
+                "position": t.position,
+                "track_name": t.track_name,
+                "artist_name": t.artist_name,
+                "jellyfin_item_id": new_id,
+                "source": source,
+            })
+        else:
+            unmatched.append({
+                "position": t.position,
+                "track_name": t.track_name,
+                "artist_name": t.artist_name,
+                "album_name": t.album_name,
+            })
+
+    return resolved, matched, unmatched
 
 
 # ── Backup write ──────────────────────────────────────────────────────────────
@@ -653,34 +770,92 @@ def get_revision_tracks(
     }
 
 
-@router.post("/{backup_id}/revisions/{revision_id}/restore")
-async def restore_revision(
-    backup_id: int,
-    revision_id: int,
-    _: UserContext = Depends(require_admin),
-    db: Session = Depends(get_db),
-):
-    """
-    Restore a specific revision to Jellyfin.
-    Creates the playlist if it doesn't exist; overwrites if it does.
-    """
+def _load_revision_tracks(db: Session, backup_id: int, revision_id: int) -> tuple[PlaylistBackup, PlaylistBackupRevision, list[PlaylistBackupTrack]]:
     b = db.query(PlaylistBackup).filter_by(id=backup_id).first()
     if not b:
         raise HTTPException(404, "Backup not found")
     rev = db.query(PlaylistBackupRevision).filter_by(id=revision_id, backup_id=backup_id).first()
     if not rev:
         raise HTTPException(404, "Revision not found")
-
     tracks = (
         db.query(PlaylistBackupTrack)
         .filter_by(revision_id=revision_id)
         .order_by(PlaylistBackupTrack.position)
         .all()
     )
+    return b, rev, tracks
+
+
+@router.get("/{backup_id}/revisions/{revision_id}/resolve-preview")
+def resolve_preview(
+    backup_id: int,
+    revision_id: int,
+    match_strategy: str = Query(default="auto"),
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Dry-run a restore: report which tracks would resolve to a current
+    Jellyfin item ID under the given strategy, and which would not.
+
+    Useful after a Jellyfin migration to see how many tracks of a backup
+    can be name-matched before actually writing the playlist.
+    """
+    _, rev, tracks = _load_revision_tracks(db, backup_id, revision_id)
+    if not tracks:
+        raise HTTPException(409, "This revision contains no tracks.")
+
+    resolved, matched, unmatched = _resolve_track_ids(db, tracks, match_strategy)
+    by_source: dict[str, int] = {}
+    for m in matched:
+        by_source[m["source"]] = by_source.get(m["source"], 0) + 1
+    return {
+        "revision_number": rev.revision_number,
+        "match_strategy": match_strategy,
+        "total": len(tracks),
+        "matched_count": len(resolved),
+        "unmatched_count": len(unmatched),
+        "matched_by_source": by_source,
+        "unmatched": unmatched,
+    }
+
+
+@router.post("/{backup_id}/revisions/{revision_id}/restore")
+async def restore_revision(
+    backup_id: int,
+    revision_id: int,
+    match_strategy: str = Query(
+        default="auto",
+        description="auto = stored ID with name-match fallback (post-migration safe); "
+                    "id_only = stored IDs validated against LibraryTrack only; "
+                    "name_only = always re-match by track/artist/album",
+    ),
+    _: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Restore a specific revision to Jellyfin.
+    Creates the playlist if it doesn't exist; overwrites if it does.
+
+    Stored Jellyfin item IDs are always validated against the local
+    LibraryTrack index before being sent to Jellyfin — this prevents the
+    silent-drop failure mode where Jellyfin accepts a POST containing IDs
+    that no longer exist (e.g. after a server migration) and produces an
+    empty playlist with no error.
+    """
+    b, rev, tracks = _load_revision_tracks(db, backup_id, revision_id)
     if not tracks:
         raise HTTPException(409, "This revision contains no tracks — nothing to restore.")
 
-    track_ids = [t.jellyfin_item_id for t in tracks]
+    track_ids, matched, unmatched = _resolve_track_ids(db, tracks, match_strategy)
+    if not track_ids:
+        raise HTTPException(
+            409,
+            f"None of the {len(tracks)} backup tracks could be resolved to current "
+            f"Jellyfin items (strategy={match_strategy}). Re-run the library indexer "
+            f"to refresh LibraryTrack, or try match_strategy=name_only.",
+        )
+
     target_name = b.display_name or b.jellyfin_playlist_name
 
     base_url, api_key = _jellyfin_creds(db)
@@ -699,15 +874,26 @@ async def restore_revision(
         playlist_id = await _create_jellyfin_playlist(base_url, api_key, target_name, track_ids, uid)
         action = "created"
 
+    by_source: dict[str, int] = {}
+    for m in matched:
+        by_source[m["source"]] = by_source.get(m["source"], 0) + 1
+
     log.info(
-        "Restored backup %d revision #%d ('%s') to Jellyfin: %d tracks, action=%s",
-        backup_id, rev.revision_number, target_name, len(track_ids), action,
+        "Restored backup %d revision #%d ('%s') to Jellyfin: %d/%d tracks resolved "
+        "(strategy=%s, by_source=%s, unmatched=%d), action=%s",
+        backup_id, rev.revision_number, target_name,
+        len(track_ids), len(tracks), match_strategy, by_source, len(unmatched), action,
     )
     return {
         "restored": True,
         "playlist_name": target_name,
         "jellyfin_playlist_id": playlist_id,
         "track_count": len(track_ids),
+        "requested_count": len(tracks),
+        "unmatched_count": len(unmatched),
+        "matched_by_source": by_source,
+        "unmatched": unmatched,
+        "match_strategy": match_strategy,
         "revision_number": rev.revision_number,
         "action": action,
     }
