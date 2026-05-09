@@ -930,3 +930,98 @@ class TestBuildAlbumSuggestionsLidarrFallback:
         album_names = [s.album_name for s in suggestions]
         assert "Artist not in Lidarr" not in album_names
         db.close()
+
+
+# ── force_all rematch (post-Jellyfin-migration recovery) ─────────────────────
+
+class TestRunMatchPassForceAll:
+    """
+    After a Jellyfin migration, every imported track has match_status='matched'
+    but matched_item_id points at a stale ID. The default run_match_pass skips
+    these (only re-matches 'missing'), so the next push to Jellyfin sends stale
+    IDs and Jellyfin silently drops them — playlist appears empty on Jellyfin.
+    force_all=True must re-match every track regardless of status.
+    """
+
+    def _seed(self, db):
+        from models import ImportedPlaylist, ImportedPlaylistTrack
+        from services.playlist_import import run_match_pass
+
+        # New library has the song but with a NEW Jellyfin ID
+        db.add(_library_track("new_id_1", track_name="Hello", artist_name="Adele"))
+        db.add(_library_track("new_id_2", track_name="Yesterday", artist_name="Beatles"))
+
+        pl = ImportedPlaylist(
+            owner_user_id="u1", source_platform="spotify",
+            source_url="x", name="Test", track_count=2,
+        )
+        db.add(pl); db.flush()
+
+        # Both tracks already "matched" with stale (pre-migration) IDs
+        db.add(ImportedPlaylistTrack(
+            playlist_id=pl.id, position=0,
+            track_name="Hello", artist_name="Adele", album_name="25",
+            match_status="matched", matched_item_id="OLD_STALE_ID_1",
+        ))
+        db.add(ImportedPlaylistTrack(
+            playlist_id=pl.id, position=1,
+            track_name="Yesterday", artist_name="Beatles", album_name="Help!",
+            match_status="matched", matched_item_id="OLD_STALE_ID_2",
+        ))
+        db.commit()
+        return pl, run_match_pass
+
+    def test_default_skips_already_matched_tracks(self, db):
+        from models import ImportedPlaylistTrack
+        pl, run_match_pass = self._seed(db)
+
+        run_match_pass(pl.id, db)
+
+        # Stale IDs untouched — this is the bug a migration triggers
+        ids = {t.matched_item_id for t in db.query(ImportedPlaylistTrack).all()}
+        assert ids == {"OLD_STALE_ID_1", "OLD_STALE_ID_2"}
+
+    def test_force_all_remaps_to_current_library_ids(self, db):
+        from models import ImportedPlaylistTrack
+        pl, run_match_pass = self._seed(db)
+
+        run_match_pass(pl.id, db, force_all=True)
+
+        ids = {t.matched_item_id for t in db.query(ImportedPlaylistTrack).all()}
+        assert ids == {"new_id_1", "new_id_2"}
+
+    def test_force_all_resets_status_when_track_no_longer_in_library(self, db):
+        from models import ImportedPlaylist, ImportedPlaylistTrack
+        from services.playlist_import import run_match_pass
+
+        # Library has only one of the two songs now
+        db.add(_library_track("new_id_1", track_name="Hello", artist_name="Adele"))
+
+        pl = ImportedPlaylist(
+            owner_user_id="u1", source_platform="spotify",
+            source_url="x", name="Test", track_count=2,
+        )
+        db.add(pl); db.flush()
+
+        db.add(ImportedPlaylistTrack(
+            playlist_id=pl.id, position=0,
+            track_name="Hello", artist_name="Adele", album_name="25",
+            match_status="matched", matched_item_id="OLD_STALE_ID_1",
+        ))
+        db.add(ImportedPlaylistTrack(
+            playlist_id=pl.id, position=1,
+            track_name="GoneSong", artist_name="GoneArtist", album_name="X",
+            match_status="matched", matched_item_id="OLD_STALE_ID_2",
+        ))
+        db.commit()
+
+        run_match_pass(pl.id, db, force_all=True)
+
+        good = db.query(ImportedPlaylistTrack).filter_by(position=0).first()
+        gone = db.query(ImportedPlaylistTrack).filter_by(position=1).first()
+
+        assert good.match_status == "matched"
+        assert good.matched_item_id == "new_id_1"
+        # The track that's truly gone must be reset, not left holding a stale ID
+        assert gone.match_status == "missing"
+        assert gone.matched_item_id is None

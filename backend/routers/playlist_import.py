@@ -492,16 +492,19 @@ async def _rename_jellyfin_playlist(
 
 # ── Background job ────────────────────────────────────────────────────────────
 
-async def _run_full_import(playlist_id: int, owner_user_id: str):
+async def _run_full_import(playlist_id: int, owner_user_id: str, force_all: bool = False):
     """
     Background task: match tracks, build suggestions, create Jellyfin playlist.
     Runs after the ImportedPlaylist and ImportedPlaylistTrack rows exist.
+
+    force_all: re-match every track (not just 'missing'). Use after a Jellyfin
+    migration to invalidate stale matched_item_id values.
     """
     from database import SessionLocal
     db = SessionLocal()
     try:
-        log.info("Import job starting for playlist %d", playlist_id)
-        run_match_pass(playlist_id, db)
+        log.info("Import job starting for playlist %d (force_all=%s)", playlist_id, force_all)
+        run_match_pass(playlist_id, db, force_all=force_all)
         await build_album_suggestions(playlist_id, db)
         await write_jellyfin_playlist(playlist_id, owner_user_id, db)
 
@@ -687,6 +690,12 @@ async def rename_imported_playlist(
 async def rematch_playlist(
     playlist_id: int,
     background_tasks: BackgroundTasks,
+    force: bool = Query(
+        default=False,
+        description="If true, re-match every track instead of only 'missing' "
+                    "ones. Use after a Jellyfin migration where the stored "
+                    "matched_item_id values reference IDs that no longer exist.",
+    ),
     current_user: UserContext = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -701,8 +710,47 @@ async def rematch_playlist(
     pl.status = "matching"
     db.commit()
 
-    background_tasks.add_task(_run_full_import, playlist_id, current_user.user_id)
-    return {"ok": True, "message": "Re-match started in background."}
+    background_tasks.add_task(_run_full_import, playlist_id, current_user.user_id, force)
+    return {"ok": True, "message": "Re-match started in background.", "force": force}
+
+
+@router.post("/playlists/rematch-all", status_code=202)
+async def rematch_all_playlists(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(default=True),
+    current_user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-match and re-push every imported playlist owned by the current user.
+
+    Intended for post-migration recovery — runs the same re-match flow as
+    /rematch with force=true on each playlist sequentially in the background.
+    """
+    playlists = db.query(ImportedPlaylist).filter_by(
+        owner_user_id=current_user.user_id
+    ).all()
+    if not playlists:
+        return {"ok": True, "message": "No imported playlists to rematch.", "count": 0}
+
+    for pl in playlists:
+        pl.status = "matching"
+    db.commit()
+
+    async def _run_all():
+        for pl in playlists:
+            try:
+                await _run_full_import(pl.id, current_user.user_id, force)
+            except Exception as exc:
+                log.exception("rematch-all failed for playlist %d: %s", pl.id, exc)
+
+    background_tasks.add_task(_run_all)
+    return {
+        "ok": True,
+        "message": f"Re-matching {len(playlists)} playlist(s) in the background.",
+        "count": len(playlists),
+        "force": force,
+    }
 
 
 # ── Manual match helpers ───────────────────────────────────────────────────────

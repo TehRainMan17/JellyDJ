@@ -253,11 +253,16 @@ def build_library_index(db: Session) -> list[dict]:
 
 # ── Import matching orchestrator ───────────────────────────────────────────────
 
-def run_match_pass(playlist_id: int, db: Session) -> dict:
+def run_match_pass(playlist_id: int, db: Session, force_all: bool = False) -> dict:
     """
-    Match all 'missing' tracks in the playlist against the library.
-    Updates ImportedPlaylistTrack rows in place.
-    Returns summary stats.
+    Match tracks in the playlist against the library.
+
+    Default: only re-matches tracks currently flagged 'missing'.
+    force_all=True: re-matches *every* track in the playlist regardless of
+    current status. Use this after a Jellyfin migration where stored
+    matched_item_id values reference IDs that no longer exist — without
+    force_all, run_match_pass skips them as already-matched and the next
+    push to Jellyfin sends stale IDs that Jellyfin silently drops.
     """
     from models import ImportedPlaylistTrack, ImportedPlaylist
 
@@ -265,16 +270,19 @@ def run_match_pass(playlist_id: int, db: Session) -> dict:
     if not playlist:
         raise ValueError(f"ImportedPlaylist {playlist_id} not found")
 
-    tracks = db.query(ImportedPlaylistTrack).filter_by(
-        playlist_id=playlist_id,
-        match_status="missing",
-    ).all()
+    q = db.query(ImportedPlaylistTrack).filter_by(playlist_id=playlist_id)
+    if not force_all:
+        q = q.filter_by(match_status="missing")
+    tracks = q.all()
 
     if not tracks:
         log.info("Playlist %d: no missing tracks to match", playlist_id)
         return {"matched": 0, "still_missing": 0}
 
-    log.info("Playlist %d: matching %d missing tracks against library…", playlist_id, len(tracks))
+    log.info(
+        "Playlist %d: matching %d %s tracks against library…",
+        playlist_id, len(tracks), "all" if force_all else "missing",
+    )
     library_index = build_library_index(db)
 
     newly_matched = 0
@@ -291,6 +299,14 @@ def run_match_pass(playlist_id: int, db: Session) -> dict:
             newly_matched += 1
             log.info("  matched: '%s' by '%s' (score=%.2f)", track.track_name, track.artist_name, score)
         else:
+            # In force_all mode, a track that previously matched may now miss
+            # (song removed from library). Reset status so we don't keep
+            # pushing a stale matched_item_id to Jellyfin.
+            if force_all and track.match_status == "matched":
+                track.match_status = "missing"
+                track.match_score = None
+                track.matched_item_id = None
+                track.resolved_at = None
             log.info("  MISS: '%s' by '%s' (norm: '%s' / '%s')",
                      track.track_name, track.artist_name,
                      _normalise(track.track_name), _normalise(track.artist_name))
