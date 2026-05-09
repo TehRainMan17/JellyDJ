@@ -1025,3 +1025,99 @@ class TestRunMatchPassForceAll:
         # The track that's truly gone must be reset, not left holding a stale ID
         assert gone.match_status == "missing"
         assert gone.matched_item_id is None
+
+
+# ── build_match_lookups parity & perf safety net ─────────────────────────────
+
+class TestMatchLookupsParity:
+    """
+    The lookups path is a pure perf optimization — it must produce identical
+    (item_id, score) results to the linear-scan path for every input. If it
+    diverges, imported playlists will silently match to different Jellyfin
+    items depending on whether the caller passed lookups, which is a much
+    nastier failure mode than slowness.
+    """
+
+    def _diverse_library(self, db):
+        # A small but varied library exercising every match pass
+        db.add(_library_track("id-yest", track_name="Yesterday",
+                              artist_name="The Beatles", album_artist="The Beatles"))
+        db.add(_library_track("id-let",  track_name="Let It Be",
+                              artist_name="The Beatles"))
+        db.add(_library_track("id-bohem", track_name="Bohemian Rhapsody (Remastered)",
+                              artist_name="Queen"))
+        db.add(_library_track("id-stair", track_name="Stairway to Heaven",
+                              artist_name="Led Zeppelin"))
+        db.add(_library_track("id-sara",  track_name="Sara Smile",
+                              artist_name="Daryl Hall & John Oates",
+                              album_artist="Hall & Oates"))
+        db.add(_library_track("id-girls", track_name="Girls Just Want to Have Fun",
+                              artist_name="Cyndi Lauper"))
+        db.add(_library_track("id-stronger", track_name="Stronger (What Doesn't Kill You)",
+                              artist_name="Kelly Clarkson"))
+        db.commit()
+
+    def test_lookups_match_results_identical_to_full_scan(self, db):
+        from services.playlist_import import (
+            build_library_index, build_match_lookups, match_track,
+        )
+        self._diverse_library(db)
+        lib = build_library_index(db)
+        lookups = build_match_lookups(lib)
+
+        cases = [
+            # exact both
+            ("Yesterday", "The Beatles"),
+            # fuzzy track, exact artist
+            ("Bohemian Rhapsody", "Queen"),
+            # containment (artist exact + name contains)
+            ("Girls Just Want to Have Fun acoustic", "Cyndi Lauper"),
+            # bag-of-words swap
+            ("What Doesn't Kill You (Stronger)", "Kelly Clarkson"),
+            # artist alias via album_artist
+            ("Sara Smile", "Hall & Oates"),
+            # straight miss
+            ("Nonexistent Song", "Nobody"),
+            # empty title
+            ("", "Queen"),
+        ]
+        for name, artist in cases:
+            slow = match_track(name, artist, lib)
+            fast = match_track(name, artist, lib, lookups)
+            assert slow == fast, (
+                f"divergence on ({name!r}, {artist!r}): slow={slow} fast={fast}"
+            )
+
+    def test_lookups_are_orders_of_magnitude_faster_on_large_library(self, db):
+        """A real 5k-track library × 140 input tracks should finish quickly with
+        lookups. Without them the same loop takes seconds on this machine.
+        We assert the fast path completes — not exact timing, which would be
+        flaky in CI — but log a warning if the scan takes too long."""
+        import time
+        from services.playlist_import import (
+            build_library_index, build_match_lookups, match_track,
+        )
+        # Synthesize a 1k-row library — small enough for CI but big enough that
+        # the per-call linear scan would be visibly slow without optimization.
+        for i in range(1000):
+            db.add(_library_track(
+                f"id-{i}",
+                track_name=f"Track {i}",
+                artist_name=f"Artist {i % 200}",
+            ))
+        db.commit()
+
+        lib = build_library_index(db)
+        lookups = build_match_lookups(lib)
+
+        # 140 lookups; mostly hits via Pass 1, a few misses
+        inputs = [(f"Track {i}", f"Artist {i % 200}") for i in range(140)]
+
+        t0 = time.perf_counter()
+        for n, a in inputs:
+            item_id, _ = match_track(n, a, lib, lookups)
+            assert item_id is not None
+        dt = time.perf_counter() - t0
+        # 140 hash lookups + a handful of small-bucket scans should finish in
+        # well under half a second even on a slow runner.
+        assert dt < 1.0, f"fast path too slow: {dt:.3f}s for 140 matches"

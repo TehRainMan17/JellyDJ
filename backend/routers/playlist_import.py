@@ -505,7 +505,16 @@ async def _run_full_import(playlist_id: int, owner_user_id: str, force_all: bool
     try:
         log.info("Import job starting for playlist %d (force_all=%s)", playlist_id, force_all)
         run_match_pass(playlist_id, db, force_all=force_all)
-        await build_album_suggestions(playlist_id, db)
+        # Album suggestions hit Lidarr per-artist with a 30s timeout. On a
+        # 140-track playlist with many unmatched artists that's easily 10+
+        # minutes of sequential network round trips — and the force_all path
+        # exists to re-anchor IDs after a migration, not to rediscover
+        # download candidates. Skip suggestions here; users can rebuild them
+        # by clicking the per-playlist Re-match (without force) afterwards.
+        if not force_all:
+            await build_album_suggestions(playlist_id, db)
+        else:
+            log.info("Import job: skipping album suggestions (force_all rematch)")
         await write_jellyfin_playlist(playlist_id, owner_user_id, db)
 
         # Mark playlist active
