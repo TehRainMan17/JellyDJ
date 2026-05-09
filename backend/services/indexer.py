@@ -613,10 +613,20 @@ async def run_full_index(_lock_already_held: bool = False):
         log.info("Step 1: Running full library scan...")
         scan_result = await run_library_scan(db)
         if scan_result.get("ok"):
-            n_tracks  = scan_result.get("total_in_db", 0)
-            n_added   = scan_result.get("added", 0)
-            n_missing = scan_result.get("marked_missing", 0)
-            log.info(f"  Library scan: {n_tracks} tracks (+{n_added} new, {n_missing} missing)")
+            n_tracks    = scan_result.get("total_in_db", 0)
+            n_added     = scan_result.get("added", 0)
+            n_updated   = scan_result.get("updated", 0)
+            # NOTE: scan_library returns the soft-delete count under "soft_deleted",
+            # not "marked_missing" — historic key mismatch silently logged "0 missing"
+            # for every scan regardless of how many tracks Jellyfin had actually
+            # removed, masking post-migration ID drift.
+            n_missing   = scan_result.get("soft_deleted", 0)
+            n_jellyfin  = scan_result.get("total_in_jellyfin", 0)
+            log.info(
+                f"  Library scan: Jellyfin returned {n_jellyfin} items → "
+                f"DB now {n_tracks} active (+{n_added} new, {n_updated} updated, "
+                f"{n_missing} marked missing)"
+            )
             _set_job(True, "Library scanned",
                      f"{n_tracks:,} tracks (+{n_added} new{f', {n_missing} removed' if n_missing else ''})",
                      18)

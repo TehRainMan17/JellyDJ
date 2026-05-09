@@ -39,6 +39,7 @@ from services.library_scanner import (
     _extract_genre,
     _extract_artist,
     _extract_artist_id,
+    _fetch_all_audio_items,
     scan_library,
 )
 
@@ -53,6 +54,75 @@ def db():
     session = Session()
     yield session
     session.close()
+
+
+# ── _fetch_all_audio_items dedup ──────────────────────────────────────────────
+#
+# Real-world bug: server-wide /Items returns the same audio item once per
+# AlbumArtist credit on multi-artist tracks (Jellyfin JOIN-without-DISTINCT
+# quirk). TotalRecordCount inflates with the joined count, so pagination
+# follows along and LibraryTrack ends up with ~2× the real row count after
+# a re-index. The fetch helper must deduplicate by Id.
+
+import pytest as _pytest
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, pages):
+        # pages: list of (items, total) tuples returned in order
+        self._pages = pages
+        self._call = 0
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    async def get(self, url, headers=None, params=None):
+        items, total = self._pages[self._call]
+        self._call += 1
+        return _FakeResponse({"Items": items, "TotalRecordCount": total})
+
+
+@_pytest.mark.asyncio
+async def test_fetch_dedupes_repeated_ids_from_join_quirk(monkeypatch):
+    """A track with two AlbumArtist credits comes back twice; result must dedupe."""
+    pages = [(
+        [
+            {"Id": "a1", "Name": "Song A"},
+            {"Id": "a1", "Name": "Song A"},   # duplicate from JOIN
+            {"Id": "b2", "Name": "Song B"},
+            {"Id": "c3", "Name": "Song C"},
+            {"Id": "c3", "Name": "Song C"},   # duplicate from JOIN
+        ],
+        5,  # inflated TotalRecordCount matches the duped item count
+    )]
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeClient(pages))
+
+    items = await _fetch_all_audio_items("http://x", "key")
+    ids = [i["Id"] for i in items]
+    assert ids == ["a1", "b2", "c3"]
+
+
+@_pytest.mark.asyncio
+async def test_fetch_passes_through_when_no_duplicates(monkeypatch):
+    pages = [(
+        [{"Id": "x1"}, {"Id": "x2"}, {"Id": "x3"}],
+        3,
+    )]
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeClient(pages))
+    items = await _fetch_all_audio_items("http://x", "key")
+    assert [i["Id"] for i in items] == ["x1", "x2", "x3"]
 
 
 # ── _parse_date ───────────────────────────────────────────────────────────────

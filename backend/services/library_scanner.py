@@ -91,7 +91,33 @@ async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
             # starved.  Small libraries (≤1 page) never hit this.
             await asyncio.sleep(_PAGE_SLEEP_SECS)
 
-    return all_items
+    # Deduplicate by Id. The server-wide /Items endpoint can return the same
+    # audio item more than once when sorting by AlbumArtist on multi-artist
+    # tracks — Jellyfin joins the album_artists association without DISTINCT,
+    # and TotalRecordCount inflates with the joined count, so pagination
+    # happily walks past the real item count. Symptom: LibraryTrack ends up
+    # with ~2× the real number of rows after a re-index.
+    #
+    # Keeping the first occurrence is fine — the duplicates are byte-for-byte
+    # identical apart from the join row.
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for item in all_items:
+        jid = item.get("Id")
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        deduped.append(item)
+
+    if len(deduped) != len(all_items):
+        log.warning(
+            "  Library fetch: Jellyfin returned %d rows but only %d unique IDs "
+            "(%d duplicates dropped). This is the multi-artist /Items JOIN quirk; "
+            "switching the scanner to /Users/{adminId}/Items would avoid it.",
+            len(all_items), len(deduped), len(all_items) - len(deduped),
+        )
+
+    return deduped
 
 
 def _parse_date(raw: Optional[str]) -> Optional[datetime]:
