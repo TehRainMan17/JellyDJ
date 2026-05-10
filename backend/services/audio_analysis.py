@@ -133,15 +133,12 @@ async def _get_jellyfin_context(db: Session) -> tuple[str, str] | None:
     is not configured or unreachable.  Call once per batch; do not call per-track.
     """
     import httpx
-    from models import ConnectionSettings
-    from crypto import decrypt
+    from services.jellyfin_client import get_jellyfin_creds_or_none
 
-    conn = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
-    if not conn or not conn.base_url:
+    creds = get_jellyfin_creds_or_none(db)
+    if creds is None:
         return None
-
-    base_url = conn.base_url.rstrip("/")
-    api_key = decrypt(conn.api_key_encrypted)
+    base_url, api_key = creds
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:

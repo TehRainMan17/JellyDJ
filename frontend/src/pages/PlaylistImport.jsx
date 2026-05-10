@@ -18,44 +18,8 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api.js'
 import PlatformIcon from '../components/PlatformIcon.jsx'
-
-// ── Platform badge ──────────────────────────────────────────────────────────
-
-const PLATFORM_LABELS = {
-  spotify:       { label: 'Spotify',       color: '#1db954' },
-  tidal:         { label: 'Tidal',         color: '#00ffff' },
-  youtube_music: { label: 'YouTube Music', color: '#ff0000' },
-  unknown:       { label: 'Unknown',       color: '#888' },
-}
-
-function PlatformBadge({ platform }) {
-  const { label, color } = PLATFORM_LABELS[platform] || PLATFORM_LABELS.unknown
-  return (
-    <span
-      className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
-      style={{ background: `${color}22`, color, border: `1px solid ${color}44` }}
-    >
-      {label}
-    </span>
-  )
-}
-
-// ── Progress bar ────────────────────────────────────────────────────────────
-
-function MatchBar({ matched, total }) {
-  const pct = total > 0 ? Math.round((matched / total) * 100) : 0
-  const color = pct >= 80 ? 'var(--accent)' : pct >= 50 ? '#fbbf24' : 'var(--danger)'
-  return (
-    <div className="flex items-center gap-2">
-      <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.08)' }}>
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: color }} />
-      </div>
-      <span className="text-[10px] font-mono flex-shrink-0" style={{ color: 'var(--text-muted)' }}>
-        {matched}/{total}
-      </span>
-    </div>
-  )
-}
+import PlatformBadge from '../components/PlatformBadge.jsx'
+import MatchBar from '../components/MatchBar.jsx'
 
 // ── URL paste form ──────────────────────────────────────────────────────────
 

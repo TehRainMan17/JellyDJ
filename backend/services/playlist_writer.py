@@ -31,11 +31,7 @@ from crypto import decrypt
 log = logging.getLogger(__name__)
 
 
-def _jellyfin_creds(db: Session) -> tuple[str, str]:
-    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
-    if not row or not row.base_url or not row.api_key_encrypted:
-        raise RuntimeError("Jellyfin not configured")
-    return row.base_url.rstrip("/"), decrypt(row.api_key_encrypted)
+from services.jellyfin_client import get_jellyfin_creds as _jellyfin_creds  # noqa: E402
 
 
 

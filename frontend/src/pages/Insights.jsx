@@ -12,29 +12,7 @@ import MusicUniverseMap from '../components/MusicUniverseMap.jsx'
 import { useJellyfinUrl } from '../hooks/useJellyfinUrl.js'
 import JellyfinIcon from '../components/JellyfinIcon.jsx'
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function fmtDate(iso) {
-  if (!iso) return '—'
-  const d = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
-  return new Date(d).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  })
-}
-function fmtDateShort(iso) {
-  if (!iso) return '—'
-  const d2 = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
-  return new Date(d2).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
-}
-
-function daysUntil(iso) {
-  if (!iso) return null
-  const d = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
-  const ms = new Date(d) - Date.now()
-  if (ms <= 0) return null
-  return Math.ceil(ms / 86400000)
-}
+import { formatDate as fmtDate, formatDateOnly as fmtDateShort, daysUntil } from '../lib/dateUtils.js'
 
 function ScoreBar({ value, max = 100, color = 'var(--accent)' }) {
   const pct = Math.min(100, Math.max(0, (value / max) * 100))

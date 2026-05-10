@@ -13,50 +13,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { api } from '../lib/api.js'
-
-// ── Platform badge ──────────────────────────────────────────────────────────
-
-const PLATFORM_LABELS = {
-  spotify:       { label: 'Spotify',       color: '#1db954' },
-  tidal:         { label: 'Tidal',         color: '#00ffff' },
-  youtube_music: { label: 'YouTube Music', color: '#ff0000' },
-  unknown:       { label: 'Unknown',       color: '#888' },
-}
-
-function PlatformBadge({ platform }) {
-  const { label, color } = PLATFORM_LABELS[platform] || PLATFORM_LABELS.unknown
-  return (
-    <span style={{
-      display: 'inline-block',
-      padding: '2px 8px',
-      borderRadius: 4,
-      fontSize: 11,
-      fontWeight: 600,
-      border: `1px solid ${color}40`,
-      color,
-      background: `${color}18`,
-    }}>
-      {label}
-    </span>
-  )
-}
-
-// ── Progress bar ────────────────────────────────────────────────────────────
-
-function MatchBar({ matched, total }) {
-  const pct = total > 0 ? Math.round((matched / total) * 100) : 0
-  const color = pct >= 80 ? '#4ade80' : pct >= 50 ? '#facc15' : '#f87171'
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <div style={{ flex: 1, height: 8, background: 'var(--color-border-tertiary)', borderRadius: 4, overflow: 'hidden' }}>
-        <div style={{ width: `${pct}%`, height: '100%', background: color, borderRadius: 4, transition: 'width 0.4s' }} />
-      </div>
-      <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', minWidth: 80 }}>
-        {matched}/{total} ({pct}%)
-      </span>
-    </div>
-  )
-}
+import PlatformBadge from '../components/PlatformBadge.jsx'
+import MatchBar from '../components/MatchBar.jsx'
 
 // ── Status colors ───────────────────────────────────────────────────────────
 
@@ -713,7 +671,7 @@ export default function PlaylistImportDetail() {
                 </button>
               </div>
             )}
-            <MatchBar matched={detail.matched_count} total={detail.track_count} />
+            <MatchBar matched={detail.matched_count} total={detail.track_count} showPercent />
           </div>
         </div>
 

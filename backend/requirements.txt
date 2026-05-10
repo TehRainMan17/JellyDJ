@@ -19,6 +19,7 @@ git+https://github.com/guoguo12/billboard-charts.git
 numpy>=1.26.0
 # Testing
 pytest>=8.0.0
+pytest-asyncio>=0.23.0
 # Auth Phase 1 — JWT issuance and verification
 python-jose[cryptography]>=3.3.0
 # Playlist Import — metadata fetch from Spotify/Tidal/YouTube Music without API keys

@@ -575,7 +575,7 @@ class TestBuildAlbumSuggestionsLidarrFailure:
         return resp
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_lidarr_non200_does_not_produce_artist_not_in_lidarr(self):
         """
@@ -742,7 +742,7 @@ class TestRenameImportedPlaylist:
         from routers.playlist_import import _rename_jellyfin_playlist
         pl = _make_imported_playlist(db, name="Test - alice", user_id="user-1",
                                      jellyfin_id="old-jf-id")
-        success, err = asyncio.get_event_loop().run_until_complete(
+        success, err = asyncio.run(
             _rename_jellyfin_playlist(pl, "New Name - alice", db)
         )
         assert success is False
@@ -783,7 +783,7 @@ class TestRenameImportedPlaylist:
             mock_client.delete = AsyncMock(return_value=mock_del_resp)
             mock_cls.return_value = mock_client
 
-            success, err = asyncio.get_event_loop().run_until_complete(
+            success, err = asyncio.run(
                 _rename_jellyfin_playlist(pl, "New Name - alice", db)
             )
 
@@ -831,7 +831,7 @@ class TestRenameImportedPlaylist:
             mock_client.post = AsyncMock(return_value=mock_resp)
             mock_cls.return_value = mock_client
 
-            success, err = asyncio.get_event_loop().run_until_complete(
+            success, err = asyncio.run(
                 _rename_jellyfin_playlist(pl, "New - alice", db)
             )
 
@@ -874,7 +874,7 @@ class TestBuildAlbumSuggestionsLidarrFallback:
             mock_client.get = mock_get
             mock_client_class.return_value = mock_client
 
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 build_album_suggestions(playlist_id, db)
             )
 
@@ -920,7 +920,7 @@ class TestBuildAlbumSuggestionsLidarrFallback:
             mock_client.get = _mock_get
             mock_client_class.return_value = mock_client
 
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 build_album_suggestions(playlist_id, db)
             )
 

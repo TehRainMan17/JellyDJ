@@ -6,22 +6,7 @@ import {
   Trash2, Activity, RotateCcw,
 } from 'lucide-react'
 
-// Normalise any ISO datetime string to UTC for reliable cross-browser parsing.
-const utc = s => {
-  if (!s) return s
-  const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, '')
-  return bare + 'Z'
-}
-
-// Format a UTC timestamp in the server's configured timezone.
-const fmtTime = (ts, tz) => {
-  if (!ts) return null
-  try {
-    return new Date(utc(ts)).toLocaleString(undefined, tz ? { timeZone: tz } : undefined)
-  } catch {
-    return new Date(utc(ts)).toLocaleString()
-  }
-}
+import { toUtcIso as utc, formatInTz as fmtTime } from '../lib/dateUtils.js'
 
 function Toggle({ enabled, onChange }) {
   return (

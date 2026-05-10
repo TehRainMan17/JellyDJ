@@ -20,27 +20,8 @@ import BlockEditor from '../components/playlist/BlockEditor.jsx'
 import { useJellyfinUrl } from '../hooks/useJellyfinUrl.js'
 import JellyfinIcon from '../components/JellyfinIcon.jsx'
 import PlatformIcon from '../components/PlatformIcon.jsx'
-
-// ── Platform badge (matches PlaylistImport.jsx) ──────────────────────────────
-
-const PLATFORM_LABELS = {
-  spotify:       { label: 'Spotify',       color: '#1db954' },
-  tidal:         { label: 'Tidal',         color: '#00ffff' },
-  youtube_music: { label: 'YouTube Music', color: '#ff0000' },
-  unknown:       { label: 'Unknown',       color: '#888' },
-}
-
-function PlatformBadge({ platform }) {
-  const { label, color } = PLATFORM_LABELS[platform] || PLATFORM_LABELS.unknown
-  return (
-    <span
-      className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full"
-      style={{ background: `${color}22`, color, border: `1px solid ${color}44` }}
-    >
-      {label}
-    </span>
-  )
-}
+import PlatformBadge from '../components/PlatformBadge.jsx'
+import { toUtcIso as utc } from '../lib/dateUtils.js'
 
 // ── Imported Playlist Row ────────────────────────────────────────────────────
 
@@ -128,7 +109,7 @@ function ImportedPlaylistRow({ playlist, onDelete, onRematched }) {
             )}
           </div>
           <div className="flex items-center gap-2 mt-1">
-            <PlatformBadge platform={playlist.source_platform} />
+            <PlatformBadge platform={playlist.source_platform} size="sm" />
             {isBusy && (
               <span className="flex items-center gap-1 text-[10px]" style={{ color: '#fbbf24' }}>
                 <Loader2 size={9} className="animate-spin" />
@@ -213,9 +194,6 @@ function ImportedPlaylistRow({ playlist, onDelete, onRematched }) {
   )
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
 
 // ── Run History components ────────────────────────────────────────────────────
 

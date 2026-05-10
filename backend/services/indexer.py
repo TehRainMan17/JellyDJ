@@ -171,16 +171,10 @@ def _set_job(running: bool, phase: str = "", detail: str = "",
 
 
 
-def _get_jellyfin_creds(db: Session) -> tuple[str, str]:
-    """Return (base_url, api_key) or raise if not configured."""
-    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
-    if not row or not row.base_url or not row.api_key_encrypted:
-        raise RuntimeError("Jellyfin not configured")
-    return row.base_url.rstrip("/"), decrypt(row.api_key_encrypted)
-
-
-def _jellyfin_headers(api_key: str) -> dict:
-    return {"X-Emby-Token": api_key}
+from services.jellyfin_client import (  # noqa: E402
+    get_jellyfin_creds as _get_jellyfin_creds,
+    jellyfin_headers as _jellyfin_headers,
+)
 
 
 async def _fetch_played_items(

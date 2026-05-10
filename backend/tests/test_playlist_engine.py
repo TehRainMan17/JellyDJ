@@ -614,12 +614,12 @@ class TestNewForYouV10Structure:
         from services.prefab_seeder import _blocks_new_for_you
         return _blocks_new_for_you()
 
-    def test_has_four_blocks(self):
-        """v10 design has 4 blocks (was 3 in v9)."""
+    def test_has_five_blocks(self):
+        """v13 design has 5 blocks (was 4 in v10)."""
         blocks = self._get_blocks()
-        assert len(blocks) == 4, (
-            f"Expected 4 blocks in 'New For You' v10, got {len(blocks)}. "
-            "Block 3 (Popular Discoveries) may be missing."
+        assert len(blocks) == 5, (
+            f"Expected 5 blocks in 'New For You' v13, got {len(blocks)}. "
+            "Block 3 (artist_catalog_popularity) or Block 4 (global_popularity) may be missing."
         )
 
     def test_weights_sum_to_100(self):
@@ -627,17 +627,33 @@ class TestNewForYouV10Structure:
         total = sum(b["weight"] for b in blocks)
         assert total == 100, f"Block weights sum to {total}, expected 100."
 
-    def test_block3_is_global_popularity(self):
-        """Block 3 must use global_popularity as the root filter type."""
+    def test_block4_is_global_popularity(self):
+        """Block 4 (last block) must use global_popularity — the unenriched-artist fallback."""
+        blocks = self._get_blocks()
+        import json
+        b4 = blocks[4]
+        assert b4["block_type"] == "global_popularity", (
+            f"Block 4 block_type is '{b4['block_type']}', expected 'global_popularity'."
+        )
+        tree = json.loads(b4["params"])["filter_tree"]
+        assert tree[0]["filter_type"] == "global_popularity"
+        assert tree[0]["params"]["played_filter"] == "unplayed"
+
+    def test_block3_is_artist_catalog_popularity(self):
+        """Block 3 surfaces an artist's #1–2 hits regardless of genre (v13)."""
         blocks = self._get_blocks()
         import json
         b3 = blocks[3]
-        assert b3["block_type"] == "global_popularity", (
-            f"Block 3 block_type is '{b3['block_type']}', expected 'global_popularity'."
+        assert b3["block_type"] == "artist_catalog_popularity", (
+            f"Block 3 block_type is '{b3['block_type']}', expected 'artist_catalog_popularity'."
         )
         tree = json.loads(b3["params"])["filter_tree"]
-        assert tree[0]["filter_type"] == "global_popularity"
-        assert tree[0]["params"]["played_filter"] == "unplayed"
+        assert tree[0]["filter_type"] == "artist_catalog_popularity"
+        # catalog_min >= 60 ≈ "top 3-4 in the artist's catalog" (per filterTypes.js tiers)
+        catalog_min = tree[0]["params"]["catalog_min"]
+        assert catalog_min >= 60, (
+            f"catalog_min={catalog_min} is too low for the 'best of artist' block."
+        )
 
     def test_block3_has_discovery_child(self):
         """Block 3's discovery child must restrict to stranger+acquaintance (familiar_pct=0)."""
@@ -652,24 +668,26 @@ class TestNewForYouV10Structure:
             "Block 3 discovery should exclude familiar artists (familiar_pct=0)."
         )
 
-    def test_block3_popularity_threshold_is_meaningful(self):
-        """The popularity_min must be >= 60 to filter out obscure tracks."""
+    def test_block4_popularity_threshold_is_meaningful(self):
+        """popularity_min must be >= 60 — Block 4 should surface bangers, not obscurities."""
         blocks = self._get_blocks()
         import json
-        b3 = blocks[3]
-        tree = json.loads(b3["params"])["filter_tree"]
+        b4 = blocks[4]
+        tree = json.loads(b4["params"])["filter_tree"]
         pop_min = tree[0]["params"]["popularity_min"]
         assert pop_min >= 60, (
             f"popularity_min={pop_min} is too low — Popular Discoveries would surface "
             "obscure unplayed tracks instead of genuine bangers."
         )
 
-    def test_genre_affinity_min_is_25(self):
+    def test_genre_affinity_min_is_at_least_25(self):
         """
-        v11: genre_affinity_min must be 25 (was 40).  The old value excluded
-        secondary liked genres — e.g. a user with 500 pop plays and 150 classic
-        rock plays has classic rock at g_aff=30, which failed the 40 threshold.
-        Lowering to 25 includes any genre with at least 25% of peak engagement.
+        Blocks 0 and 1 must have a genre_affinity_min floor — but the exact value
+        is a tuning knob. v11 lowered it to 25; v13 raised it back to 40 because the
+        catalog_pop AND-chain narrowing made the wider net unnecessary.
+
+        This test guards the floor: must not drop below 25 or secondary liked
+        genres get excluded entirely.
         """
         blocks = self._get_blocks()
         import json
@@ -677,9 +695,10 @@ class TestNewForYouV10Structure:
             b = blocks[i]
             tree = json.loads(b["params"])["filter_tree"]
             aff_min = tree[0]["params"].get("genre_affinity_min")
-            assert aff_min <= 25, (
-                f"Block {i} genre_affinity_min={aff_min}, expected <= 25. "
-                "A higher value excludes secondary liked genres from discovery."
+            assert aff_min is not None, f"Block {i} missing genre_affinity_min"
+            assert aff_min >= 25, (
+                f"Block {i} genre_affinity_min={aff_min}, expected >= 25 floor. "
+                "Lower values let in noise; this assertion guards against accidental zeroing."
             )
 
     def test_block0_and_block1_use_discovery_with_children(self):

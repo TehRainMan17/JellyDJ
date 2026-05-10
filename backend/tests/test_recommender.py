@@ -191,10 +191,17 @@ class TestRecommendLibraryTracks:
             assert 0.0 <= r.score <= 1.05, f"Score out of range: {r.score}"
 
     def test_favorite_gets_bonus(self):
+        # Pin random so mid-tier jitter (±15%) can't swamp the +0.05 favorite bonus.
+        # Without this, when both tracks land in the jittered band (0.40–0.74),
+        # plain can randomly out-score fav even though fav has the bonus.
+        import random
+        from unittest.mock import patch
+
         fav   = _make_play(item_id="fav",    artist="X", play_count=1, is_favorite=True)
         plain = _make_play(item_id="plain",  artist="X", play_count=1, is_favorite=False)
         db = _make_db([fav, plain], artist_affinity={"X": 50.0})
-        results = recommend_library_tracks("user1", "for_you", 10, db)
+        with patch.object(random, "uniform", return_value=0.0):
+            results = recommend_library_tracks("user1", "for_you", 10, db)
         fav_result   = next(r for r in results if r.jellyfin_item_id == "fav")
         plain_result = next(r for r in results if r.jellyfin_item_id == "plain")
         assert fav_result.score > plain_result.score

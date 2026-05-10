@@ -14,26 +14,7 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api.js'
 
-// ── Date helpers ──────────────────────────────────────────────────────────────
-const utc = s => {
-  if (!s) return s
-  if (/([+-]\d{2}:\d{2}|Z)$/.test(s)) return s
-  return s + 'Z'
-}
-function fmt(dt) {
-  if (!dt) return '—'
-  return new Date(utc(dt)).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  })
-}
-function fmtShort(dt) {
-  if (!dt) return '—'
-  return new Date(utc(dt)).toLocaleString(undefined, {
-    month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  })
-}
+import { toUtcIso as utc, formatDate as fmt, formatDateShort as fmtShort } from '../lib/dateUtils.js'
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 

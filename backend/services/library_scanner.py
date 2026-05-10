@@ -37,11 +37,7 @@ BATCH_SIZE = 500
 _PAGE_SLEEP_SECS = 0.5
 
 
-def _get_jellyfin_creds(db: Session) -> tuple[str, str]:
-    row = db.query(ConnectionSettings).filter_by(service="jellyfin").first()
-    if not row or not row.base_url or not row.api_key_encrypted:
-        raise RuntimeError("Jellyfin not configured")
-    return row.base_url.rstrip("/"), decrypt(row.api_key_encrypted)
+from services.jellyfin_client import get_jellyfin_creds as _get_jellyfin_creds  # noqa: E402
 
 
 async def _fetch_all_audio_items(base_url: str, api_key: str) -> list[dict]:
@@ -194,7 +190,19 @@ def _extract_artist_id(item: dict) -> Optional[str]:
     if real_album:
         return real_album[0].get("Id") or None
 
-    # Last resort: take whatever is there (e.g. Various Artists compilation)
+    # AlbumArtists yielded nothing real — try ArtistItems if present.
+    # Note: the live fetcher does NOT request ArtistItems (it forces Jellyfin
+    # to load full BaseItemDto objects per artist, which can crash large
+    # servers), so this branch only fires when callers happen to include it.
+    artist_items: list[dict] = item.get("ArtistItems") or []
+    real_items = [
+        a for a in artist_items
+        if isinstance(a, dict) and (a.get("Name") or "").strip().lower() not in _VARIOUS_ARTISTS
+    ]
+    if real_items:
+        return real_items[0].get("Id") or None
+
+    # Last resort: take whatever AlbumArtists has (e.g. Various Artists compilation)
     if album_artists and isinstance(album_artists[0], dict):
         return album_artists[0].get("Id") or None
 

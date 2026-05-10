@@ -82,3 +82,30 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def session_scope():
+    """
+    Context manager for background jobs and threads (anywhere outside a request).
+
+    Use this instead of bare `SessionLocal()` + `try/finally db.close()` —
+    it guarantees the session is closed even if a non-Exception error
+    (e.g. SystemExit from job cancellation) bypasses a finally block.
+
+    Usage:
+        from database import session_scope
+
+        def _job_something():
+            with session_scope() as db:
+                ...do work...
+                db.commit()
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

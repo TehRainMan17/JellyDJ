@@ -37,13 +37,30 @@ _STUB_MODS = [
     "pydantic",
     "auth", "database", "models", "crypto",
     "routers.playlist_import",
-    # httpx is used inside the helpers but may not be installed locally;
-    # stub it so import succeeds and individual tests can control its behaviour.
-    "httpx",
 ]
+
+
+def _is_importable(mod: str) -> bool:
+    """Return True if the named module can actually be imported in this env."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except Exception:
+        return False
+
+
+# Only stub when the real module isn't installed (i.e. running outside the
+# container). Inside the container, every _STUB_MODS entry is real, and stubbing
+# them out clobbers downstream tests' lazy imports — e.g. test_playlist_import
+# imports routers.playlist_import inside its test methods, and would receive
+# a MagicMock instead of the real module if we stubbed eagerly here.
 for _m in _STUB_MODS:
-    if _m not in sys.modules:
+    if _m not in sys.modules and not _is_importable(_m):
         sys.modules[_m] = MagicMock()
+
+# httpx is real here (and used by other test files in the same run). Each test
+# in TestFetchCoverArt patches `httpx.get` via unittest.mock.patch instead of
+# clobbering sys.modules — that approach polluted other tests.
 
 # pydantic.BaseModel must survive as a real base class — use object as fallback
 _pydantic = sys.modules["pydantic"]
@@ -172,9 +189,8 @@ class TestCropToSquare:
 
 class TestFetchCoverArt:
     """
-    _fetch_cover_art does `import httpx` inside the function body.
-    We control httpx behaviour by patching sys.modules['httpx'].get directly,
-    which is what the function resolves to after our stub is in place.
+    _fetch_cover_art does `import httpx` inside the function body, so we patch
+    `httpx.get` directly — this works regardless of import order.
 
     Signature: _fetch_cover_art(release_mbid, release_group_mbid, thumbnail_url)
     """
@@ -188,32 +204,34 @@ class TestFetchCoverArt:
     def test_uses_release_caa_when_release_mbid_present(self):
         from routers.youtube_rip import _fetch_cover_art
         fake_art = b"JPEG_BYTES"
-        sys.modules["httpx"].get.return_value = self._mock_response(200, fake_art)
-        result = _fetch_cover_art("some-release-mbid", None, "http://thumbnail.jpg")
-        assert result == fake_art
-        call_url = sys.modules["httpx"].get.call_args[0][0]
-        assert "coverartarchive.org/release/some-release-mbid" in call_url
+        with patch("httpx.get") as mock_get:
+            mock_get.return_value = self._mock_response(200, fake_art)
+            result = _fetch_cover_art("some-release-mbid", None, "http://thumbnail.jpg")
+            assert result == fake_art
+            call_url = mock_get.call_args[0][0]
+            assert "coverartarchive.org/release/some-release-mbid" in call_url
 
     def test_falls_back_to_release_group_caa_when_release_404(self):
         from routers.youtube_rip import _fetch_cover_art
         fake_art = b"RELEASE_GROUP_ART"
-        sys.modules["httpx"].get.side_effect = [
-            self._mock_response(404, b""),           # release MBID → 404
-            self._mock_response(200, fake_art),      # release-group MBID → 200
-        ]
-        result = _fetch_cover_art("rel-mbid", "rg-mbid", "http://thumbnail.jpg")
-        assert result == fake_art
-        # Second call should target the release-group endpoint
-        second_url = sys.modules["httpx"].get.call_args_list[1][0][0]
-        assert "coverartarchive.org/release-group/rg-mbid" in second_url
-        sys.modules["httpx"].get.side_effect = None
+        with patch("httpx.get") as mock_get:
+            mock_get.side_effect = [
+                self._mock_response(404, b""),           # release MBID → 404
+                self._mock_response(200, fake_art),      # release-group MBID → 200
+            ]
+            result = _fetch_cover_art("rel-mbid", "rg-mbid", "http://thumbnail.jpg")
+            assert result == fake_art
+            # Second call should target the release-group endpoint
+            second_url = mock_get.call_args_list[1][0][0]
+            assert "coverartarchive.org/release-group/rg-mbid" in second_url
 
     def test_falls_back_to_thumbnail_when_no_mbids(self):
         pytest.importorskip("PIL")
         from routers.youtube_rip import _fetch_cover_art
         thumbnail_bytes = _make_jpeg_bytes(1280, 720)
-        sys.modules["httpx"].get.return_value = self._mock_response(200, thumbnail_bytes)
-        result = _fetch_cover_art(None, None, "http://thumbnail.jpg")
+        with patch("httpx.get") as mock_get:
+            mock_get.return_value = self._mock_response(200, thumbnail_bytes)
+            result = _fetch_cover_art(None, None, "http://thumbnail.jpg")
         assert result is not None
         from PIL import Image
         img = Image.open(io.BytesIO(result))
@@ -223,21 +241,21 @@ class TestFetchCoverArt:
         pytest.importorskip("PIL")
         from routers.youtube_rip import _fetch_cover_art
         thumbnail_bytes = _make_jpeg_bytes(1280, 720)
-        sys.modules["httpx"].get.side_effect = [
-            self._mock_response(404, b""),           # release → 404
-            self._mock_response(404, b""),           # release-group → 404
-            self._mock_response(200, thumbnail_bytes),
-        ]
-        result = _fetch_cover_art("rel-mbid", "rg-mbid", "http://thumbnail.jpg")
+        with patch("httpx.get") as mock_get:
+            mock_get.side_effect = [
+                self._mock_response(404, b""),           # release → 404
+                self._mock_response(404, b""),           # release-group → 404
+                self._mock_response(200, thumbnail_bytes),
+            ]
+            result = _fetch_cover_art("rel-mbid", "rg-mbid", "http://thumbnail.jpg")
         assert result is not None
-        sys.modules["httpx"].get.side_effect = None
 
     def test_returns_none_when_all_sources_fail(self):
         from routers.youtube_rip import _fetch_cover_art
-        sys.modules["httpx"].get.side_effect = Exception("network error")
-        result = _fetch_cover_art("some-mbid", "rg-mbid", "http://thumbnail.jpg")
+        with patch("httpx.get") as mock_get:
+            mock_get.side_effect = Exception("network error")
+            result = _fetch_cover_art("some-mbid", "rg-mbid", "http://thumbnail.jpg")
         assert result is None
-        sys.modules["httpx"].get.side_effect = None
 
     def test_returns_none_when_no_sources(self):
         from routers.youtube_rip import _fetch_cover_art
@@ -248,10 +266,11 @@ class TestFetchCoverArt:
         """If only release_mbid is present and succeeds, release-group is never called."""
         from routers.youtube_rip import _fetch_cover_art
         fake_art = b"ART"
-        sys.modules["httpx"].get.return_value = self._mock_response(200, fake_art)
-        result = _fetch_cover_art("rel-mbid", None, "http://thumbnail.jpg")
-        assert result == fake_art
-        assert sys.modules["httpx"].get.call_count == 1
+        with patch("httpx.get") as mock_get:
+            mock_get.return_value = self._mock_response(200, fake_art)
+            result = _fetch_cover_art("rel-mbid", None, "http://thumbnail.jpg")
+            assert result == fake_art
+            assert mock_get.call_count == 1
 
 
 # ---------------------------------------------------------------------------

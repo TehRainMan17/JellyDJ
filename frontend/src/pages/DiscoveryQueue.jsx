@@ -7,8 +7,7 @@ import {
   Sparkles, Filter, History,
 } from 'lucide-react'
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
+import { toUtcIso as utc } from '../lib/dateUtils.js'
 
 const STATUS_TABS = [
   { key:'pending',       label:'Pending',        color:'#fbbf24' },

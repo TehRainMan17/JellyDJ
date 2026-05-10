@@ -121,3 +121,53 @@ To reschedule a job at runtime, call the appropriate `reschedule_*` helper in `s
 - **Lidarr** — Sends approved discovery albums for download
 - **Billboard** — Hot 100 scraper (`services/popularity/billboard_adapter.py`)
 - **yt-dlp** — YouTube ripping and external playlist fetching
+
+## Quick-find file map
+
+For deep architecture see `ARCHITECTURE.md`. For known refactor opportunities see `AUDIT_FINDINGS.md`. Per-area READMEs: `backend/services/README.md`, `backend/routers/README.md`, `frontend/src/README.md`.
+
+### "Where does X live?"
+
+| You want to change… | Look at |
+|---|---|
+| Schema (add/alter column) | `backend/main.py:46-281` (`_run_migrations`) **and** `backend/models.py` |
+| Scoring weights / formula | `backend/services/scoring_engine.py` |
+| Recommendation logic (paths A–D) | `backend/services/recommender.py` (1,642 LOC — monolithic, see audit B8) |
+| Playlist filter block executor | `backend/services/playlist_blocks.py` (`BLOCK_REGISTRY`) |
+| Filter tree evaluation (AND/OR) | `backend/services/playlist_engine.py` |
+| Last.fm / MusicBrainz fetch | `backend/services/enrichment.py` |
+| Spotify / Billboard popularity | `backend/services/popularity/` |
+| Push playlist to Jellyfin | `backend/services/playlist_writer.py` |
+| Import external playlist | `backend/services/external_playlist_fetcher.py` + `playlist_import.py` |
+| Fuzzy library matching | `backend/services/library_dedup.py` |
+| Library scan | `backend/services/library_scanner.py` |
+| Audio analysis (BPM/key) | `backend/services/audio_analysis.py` |
+| Holiday tagging | `backend/services/holiday.py` |
+| Add a scheduler job | `backend/scheduler.py` (register + add to `reschedule_automation_jobs`) |
+| Add an endpoint | new file in `backend/routers/`, mount in `backend/main.py:671-691` |
+| Auth / JWT / refresh | `backend/routers/auth.py` |
+| Jellyfin webhook handler | `backend/routers/webhooks.py` |
+| Frontend route | `frontend/src/App.jsx` |
+| Frontend API call | `frontend/src/lib/api.js` (use `api.get/post/put/delete`) |
+| Auth state / token refresh (FE) | `frontend/src/contexts/AuthContext.jsx` |
+| Job progress UI | `frontend/src/components/JobProgress.jsx` |
+| Job polling | `frontend/src/hooks/useJobStatus.js` |
+| Sidebar / breadcrumb | `frontend/src/components/Layout.jsx` |
+| Filter editor UI | `frontend/src/components/playlist/BlockEditor.jsx` (FILTER_TYPES catalog) |
+| Visualization (network) | `frontend/src/components/MusicUniverseMap.jsx` + `NetworkGraph.jsx` |
+| Insights charts | `frontend/src/pages/Insights.jsx` (2,270 LOC — split candidate) |
+
+### Largest files (worth knowing before opening blind)
+
+Backend: `recommender.py` 1,642 · `enrichment.py` 1,363 · `indexer.py` 1,361 · `scoring_engine.py` 1,297 · `automation.py` 1,120 · `playlist_blocks.py` 1,033 · `playlist_backups.py` 1,020 · `discovery.py` 1,030 · `webhooks.py` 970 · `playlist_import.py` 974.
+
+Frontend: `Insights.jsx` 2,270 · `BlockEditor.jsx` 1,586 · `MusicUniverseMap.jsx` 1,375 · `BlockCard.jsx` 972 · `Connections.jsx` 966 · `PlaylistBackups.jsx` 956 · `PlaylistImportDetail.jsx` 841 · `Playlists.jsx` 810 · `Dashboard.jsx` 773 · `BlockChainEditor.jsx` 775.
+
+### Cross-cutting helpers (currently duplicated — see audit B1/B2/B3)
+
+| Need | Today's reality | Future |
+|---|---|---|
+| Jellyfin creds | 5+ copies of decrypt-and-return | `services/jellyfin_client.py` |
+| Text normalization | 8 variants, intentionally different | `services/text_utils.py` (named per purpose) |
+| httpx client | 14 inline constructors with random timeouts | `services/http_client.py` factories |
+| DB session in jobs | bare `SessionLocal()` + manual close | `with_session()` context manager |

@@ -11,17 +11,7 @@ import JobProgress from '../components/JobProgress.jsx'
 import { api } from '../lib/api.js'
 import { useAuth } from '../contexts/AuthContext.jsx'
 import UserAvatar from '../components/UserAvatar.jsx'
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-const utc = s => { if (!s) return s; const bare = s.replace(/([+-]\d{2}:\d{2}|Z)$/, ''); return bare + 'Z' }
-function timeAgo(dateStr) {
-  if (!dateStr) return ''
-  const diff = (Date.now() - new Date(utc(dateStr))) / 1000
-  if (diff < 60) return 'just now'
-  if (diff < 3600) return `${Math.floor(diff/60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`
-  return `${Math.floor(diff/86400)}d ago`
-}
+import { formatTimeAgo as timeAgo, toUtcIso as utc } from '../lib/dateUtils.js'
 
 const EVENT_META = {
   index_complete:      { icon: Database,     color: '#00d4aa', label: 'Index complete' },
